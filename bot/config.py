@@ -9,6 +9,38 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_groq_chat_model() -> str:
+    """
+    Определяем модель чата Groq с учётом разных имён переменных окружения.
+    Приоритет:
+    1) GROQ_CHAT_MODEL
+    2) MODEL_NAME (как в Render на скриншоте)
+    3) Безопасный дефолт: llama-3.1-8b-instant
+    """
+    env_model = (
+        os.getenv("GROQ_CHAT_MODEL")
+        or os.getenv("MODEL_NAME")
+        or ""
+    ).strip()
+
+    if env_model:
+        return env_model
+
+    # Дефолтная модель — быстрая и дёшево обходится
+    return "llama-3.1-8b-instant"
+
+
+def _get_groq_vision_model() -> str:
+    """
+    Модель для vision-запросов.
+    Можно переопределить через GROQ_VISION_MODEL.
+    """
+    env_model = (os.getenv("GROQ_VISION_MODEL") or "").strip()
+    if env_model:
+        return env_model
+    return "llama-3.2-11b-vision-preview"
+
+
 @dataclass
 class Settings:
     # Telegram
@@ -17,14 +49,13 @@ class Settings:
     # Groq
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip())
     groq_base_url: str = field(
-        default_factory=lambda: os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+        default_factory=lambda: os.getenv(
+            "GROQ_BASE_URL",
+            "https://api.groq.com/openai/v1",
+        ).rstrip("/")
     )
-    groq_chat_model: str = field(
-        default_factory=lambda: os.getenv("GROQ_CHAT_MODEL", "llama-3.1-70b-versatile")
-    )
-    groq_vision_model: str = field(
-        default_factory=lambda: os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
-    )
+    groq_chat_model: str = field(default_factory=_get_groq_chat_model)
+    groq_vision_model: str = field(default_factory=_get_groq_vision_model)
 
     # Файлы
     log_file: str = field(default_factory=lambda: os.getenv("LOG_FILE", "bot.log"))
