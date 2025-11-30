@@ -1,4 +1,1 @@
-# bot/__init__.py
-"""
-Пакет бота AI Medicine.
-"""
+# AI Medicine bot package
