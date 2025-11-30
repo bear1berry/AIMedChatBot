@@ -8,14 +8,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass
 class Settings:
-    """
-    Centralised configuration loader.
-
-    Reads from environment variables so the same code can run
-    locally and on Render.
-    """
     # Telegram
     bot_token: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", "").strip())
 
@@ -45,6 +52,10 @@ class Settings:
     # Logging
     log_file: str = field(default_factory=lambda: os.getenv("LOG_FILE", "bot.log"))
     query_log_file: str = field(default_factory=lambda: os.getenv("QUERY_LOG_FILE", "queries.log"))
+
+    # Rate limiting
+    rate_limit_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 20))
+    rate_limit_per_day: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_DAY", 500))
 
     def __post_init__(self) -> None:
         allowed_raw = os.getenv("ALLOWED_USERNAMES", "").strip()
