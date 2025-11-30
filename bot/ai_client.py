@@ -1,8 +1,7 @@
-# bot/ai_client.py
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import httpx
 
@@ -13,39 +12,36 @@ from .memory import get_history, save_message
 logger = logging.getLogger(__name__)
 
 
-async def ask_ai(
-    user_id: int,
-    mode: str,
-    user_message: str,
-) -> str:
+async def ask_ai(user_id: int, mode: str, user_message: str) -> str:
     """
-    Запрос к Groq (chat.completions) с учётом режима и истории диалога.
+    Основной запрос к Groq / gpt-oss-120b.
     """
     if not settings.groq_api_key:
-        return "❗️ GROQ_API_KEY не задан в переменных окружения. Укажи ключ и перезапусти сервис."
+        return (
+            "❗️ Не настроен ключ GROQ_API_KEY.\n"
+            "Добавь его в переменные окружения на Render и перезапусти сервис."
+        )
 
     system_prompt = build_system_prompt(user_id, mode)
-
     history = get_history(user_id, limit=12)
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt}
-    ]
-
-    for item in history:
-        # в базе храним только user/assistant
-        role = "assistant" if item["role"] == "assistant" else "user"
-        messages.append({"role": role, "content": item["content"]})
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for m in history:
+        # В БД роли только 'user'/'assistant'
+        role = m["role"]
+        if role not in ("user", "assistant"):
+            role = "user"
+        messages.append({"role": role, "content": m["content"]})
 
     messages.append({"role": "user", "content": user_message})
 
-    url = settings.groq_base_url.rstrip("/") + "/chat/completions"
+    url = settings.groq_base_url + "/chat/completions"
 
     logger.info(
-        "Sending request to Groq for user %s in mode %s with model %s",
+        "Sending request to Groq model=%s user=%s mode=%s",
+        settings.groq_chat_model,
         user_id,
         mode,
-        settings.groq_chat_model,
     )
 
     try:
@@ -59,55 +55,44 @@ async def ask_ai(
                 json={
                     "model": settings.groq_chat_model,
                     "messages": messages,
-                    "temperature": 0.4,
-                    "max_tokens": 1024,
+                    "temperature": 0.35,
+                    "max_tokens": 1200,
                 },
             )
-
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             body = e.response.text if e.response is not None else ""
             logger.error(
-                "HTTP error from Groq: %s\nStatus: %s\nBody: %s",
+                "HTTP error from Groq: %s status=%s body=%s",
                 e,
                 e.response.status_code if e.response else "unknown",
                 body,
             )
             return (
-                f"❗️ Ошибка при запросе к Groq: {e.response.status_code if e.response else '???'}.\n"
+                f"❗️ Ошибка при обращении к модели ({e.response.status_code if e.response else '??'}).\n"
                 f"URL: {url}\n"
-                f"Детали: {body}\n"
-                "Проверь модель, ключ API и доступность сервиса."
+                f"Ответ сервера: {body[:800]}"
             )
 
-        # Нормальный ответ
-        try:
-            data = resp.json()
-            reply = data["choices"][0]["message"]["content"]
-        except Exception as e:
-            logger.exception("Unexpected Groq response format: %s; body=%s", e, resp.text)
-            return (
-                "❗️ Сервис Groq вернул неожиданный ответ. "
-                "Попробуй ещё раз чуть позже."
-            )
-
+        data = resp.json()
+        reply = data["choices"][0]["message"]["content"]
     except Exception as e:
-        logger.exception("Error while requesting Groq: %s", e)
-        return f"❗️ Внутренняя ошибка при запросе к Groq: {e}"
+        logger.exception("Unhandled error calling Groq: %s", e)
+        return f"❗️ Внутренняя ошибка при запросе к модели: {e}"
 
-    # Логируем в БД и файл
+    # Логируем в БД
     save_message(user_id, "user", user_message, mode)
     save_message(user_id, "assistant", reply, mode)
 
+    # При желании — лог в файл
     if settings.query_log_file:
         try:
             with open(settings.query_log_file, "a", encoding="utf-8") as f:
                 f.write(
-                    f"USER_ID={user_id} MODE={mode}\n"
-                    f"USER: {user_message}\n"
-                    f"ASSISTANT: {reply[:800]}\n"
-                    "----------------------------------------\n"
+                    f"\n=== USER {user_id} MODE {mode} ===\n"
+                    f"Q: {user_message}\n\nA: {reply}\n"
+                    "-----------------------------\n"
                 )
         except Exception as e:
             logger.warning("Failed to write query log: %s", e)
