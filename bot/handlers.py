@@ -1,4 +1,3 @@
-# bot/handlers.py
 from __future__ import annotations
 
 import logging
@@ -6,21 +5,31 @@ from typing import Dict
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message
 
-from .config import settings
 from .ai_client import ask_ai
+from .config import settings
+from .keyboards import main_menu_keyboard, modes_keyboard, answer_with_modes_keyboard
+from .memory import (
+    create_conversation,
+    get_history,
+    get_profile,
+    get_stats,
+    list_conversations,
+    register_user,
+    save_message,
+    set_profile,
+)
 from .modes import MODES, detect_mode
-from .memory import register_user, get_stats, save_message
 from .vision import analyze_image
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="main")
 
-# Память по режимам (в рамках процесса)
+# Текущее текстовое режимное состояние в памяти процесса
 _user_modes: Dict[int, str] = {}
 
 
@@ -42,16 +51,17 @@ def _is_allowed(username: str | None) -> bool:
     return username.lstrip("@") in settings.allowed_users
 
 
-def _modes_keyboard(current_mode: str) -> InlineKeyboardBuilder:
-    kb = InlineKeyboardBuilder()
-    for code, cfg in MODES.items():
-        mark = "✅" if code == current_mode else "⚪️"
-        kb.button(
-            text=f"{mark} {cfg['short_name']}",
-            callback_data=f"set_mode:{code}",
-        )
-    kb.adjust(2)
-    return kb
+# ====== FSM для профиля ======
+class ProfileStates(StatesGroup):
+    waiting_profile = State()
+
+
+# ====== FSM для симптом-чекера ======
+class SymptomStates(StatesGroup):
+    symptom = State()
+    duration = State()
+    details = State()
+    red_flags = State()
 
 
 @router.message(CommandStart())
@@ -62,23 +72,54 @@ async def cmd_start(message: Message) -> None:
 
     if not _is_allowed(user.username):
         await message.answer(
-            "🚫 Доступ к этому боту ограничен.\n"
-            "Если вы считаете, что это ошибка — напишите владельцу бота."
+            "🚫 Этот бот доступен ограниченному кругу пользователей.\n"
+            "Если нужен доступ — напишите владельцу."
         )
         return
 
     register_user(user.id, user.username)
+    create_conversation(user.id, "Диалог")
     _set_user_mode(user.id, "default")
 
     text = (
-        "👋 Привет! Я медицинский AI-бот.\n\n"
-        "Отправь мне свой вопрос — разберёмся по-взрослому.\n\n"
-        "Ниже можешь выбрать профиль работы:"
+        "👋 Привет, я <b>AI Medicine Assistant</b> — твой умный мед-помощник.\n\n"
+        "✨ Что я умею:\n"
+        "• разбирать симптомы и объяснять, что может происходить;\n"
+        "• помогать интерпретировать анализы и заключения;\n"
+        "• подсказывать, к какому врачу и с чем идти;\n"
+        "• помогать тебе как врачу: структурировать случаи, готовить тексты, памятки.\n\n"
+        "Выбери действие ниже или просто напиши свой вопрос 👇"
     )
 
+    await message.answer(text, reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
     await message.answer(
-        text,
-        reply_markup=_modes_keyboard("default").as_markup(),
+        "🧭 <b>Навигация</b>\n\n"
+        "• /mode — выбрать профиль ответа (общий, симптомы, педиатрия и др.)\n"
+        "• /symptoms — запустить пошаговый симптом-чекер\n"
+        "• /profile — настроить твой профиль (пациент / врач / студент и т.п.)\n"
+        "• /new — начать новый «кейс» / диалог\n"
+        "• /cases — список последних кейсов\n"
+        "• /stats — общая статистика (для админа)\n\n"
+        "Или просто напиши свой вопрос — я сам подберу подходящий режим 🤖"
+    )
+
+
+@router.message(Command("mode"))
+async def cmd_mode(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ запрещён.")
+        return
+    current = _get_user_mode(user.id)
+    await message.answer(
+        "Выбери режим работы ИИ 🧠:",
+        reply_markup=modes_keyboard(current),
     )
 
 
@@ -97,122 +138,64 @@ async def cb_set_mode(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный режим", show_alert=True)
         return
 
-    current_mode = _get_user_mode(user.id)
-    if mode == current_mode:
-        # Режим уже выбран — просто покажем подсказку
-        await callback.answer("Этот режим уже выбран ✅")
-        return
-
     _set_user_mode(user.id, mode)
     cfg = MODES[mode]
-
-    # Обновляем клавиатуру, но игнорируем "message is not modified"
     try:
         if callback.message:
             await callback.message.edit_reply_markup(
-                reply_markup=_modes_keyboard(mode).as_markup()
+                reply_markup=modes_keyboard(mode),
             )
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            logger.debug("Ignored Telegram 'message is not modified' for mode=%s", mode)
-        else:
-            raise
+    except Exception as e:
+        logger.debug("edit_reply_markup failed: %s", e)
 
-    await callback.answer(f"Режим: {cfg['title']}")
+    await callback.answer(f"Режим: {cfg['short_name']}")
 
 
-@router.message(Command("mode"))
-async def cmd_mode(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    if not _is_allowed(user.username):
-        await message.answer("🚫 Доступ к этому боту ограничен.")
-        return
+# ==== Главное меню (callback) ====
 
-    current = _get_user_mode(user.id)
-    await message.answer(
-        "Выбери режим работы бота:",
-        reply_markup=_modes_keyboard(current).as_markup(),
-    )
+@router.callback_query(F.data == "menu:symptoms")
+async def cb_menu_symptoms(callback: CallbackQuery, state: FSMContext) -> None:
+    await cmd_symptoms_start(callback.message, state)
+    await callback.answer()
 
 
-@router.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-
-    if settings.admin_username and user.username and user.username.lstrip("@") == settings.admin_username:
-        s = get_stats()
-        await message.answer(
-            f"📊 Статистика:\n"
-            f"Пользователей: <b>{s['users']}</b>\n"
-            f"Сообщений: <b>{s['messages']}</b>"
-        )
-    else:
-        await message.answer("Команда доступна только администратору.")
+@router.callback_query(F.data == "menu:profile")
+async def cb_menu_profile(callback: CallbackQuery, state: FSMContext) -> None:
+    await cmd_profile(callback.message, state)
+    await callback.answer()
 
 
-@router.message(F.photo)
-async def photo_handler(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    if not _is_allowed(user.username):
-        await message.answer("🚫 Доступ к этому боту ограничен.")
-        return
-
-    photo = message.photo[-1]
-
-    # Скачиваем bytes
-    file_obj = await bot.download(photo)
-    image_bytes = file_obj.read()
-
-    await message.answer("🖼 Получил изображение, анализирую...")
-
-    reply = await analyze_image(image_bytes, user_id=user.id)
-    save_message(user.id, "user", "[изображение]", "vision")
-    save_message(user.id, "assistant", reply, "vision")
-
-    await message.answer(reply)
+@router.callback_query(F.data == "menu:cases")
+async def cb_menu_cases(callback: CallbackQuery) -> None:
+    await cmd_cases(callback.message)
+    await callback.answer()
 
 
-@router.message(F.text)
-async def text_handler(message: Message) -> None:
+@router.callback_query(F.data == "menu:ask")
+async def cb_menu_ask(callback: CallbackQuery) -> None:
+    await callback.message.answer("Напиши свой вопрос 👇")
+    await callback.answer()
+
+
+# ===== Профиль =====
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext) -> None:
     user = message.from_user
     if not user:
         return
 
-    if not _is_allowed(user.username):
-        await message.answer("🚫 Доступ к этому боту ограничен.")
-        return
-
-    text = message.text or ""
-    current_mode = _get_user_mode(user.id)
-
-    # Автоопределение режима
-    detected_mode = detect_mode(text, current_mode=current_mode)
-    if detected_mode != current_mode:
-        _set_user_mode(user.id, detected_mode)
-        mode_changed_note = (
-            f"🔁 Автоматически переключился в режим: "
-            f"<b>{MODES[detected_mode]['title']}</b>\n\n"
-        )
-    else:
-        mode_changed_note = ""
-
-    await message.chat.do("typing")
-
-    reply = await ask_ai(
-        user_id=user.id,
-        mode=detected_mode,
-        user_message=text,
-    )
-
-    final_text = mode_changed_note + reply
+    profile = get_profile(user.id)
+    await state.set_state(ProfileStates.waiting_profile)
 
     await message.answer(
-        final_text,
-        reply_markup=_modes_keyboard(detected_mode).as_markup(),
-    )
+        "🧑‍⚕️ <b>Профиль пользователя</b>\n\n"
+        f"Текущие настройки:\n"
+        f"• Роль: <code>{profile['role']}</code>\n"
+        f"• Детализация: <code>{profile['detail_level']}</code>\n"
+        f"• Юрисдикция: <code>{profile['jurisdiction']}</code>\n\n"
+        "Отправь одно сообщение в формате:\n"
+        "<code>роль, детализация, юрисдикция</code>\n\n"
+        "Примеры:\n"
+        "• <i>врач, подробно, РФ</i>\n"
+        "• <i>пациент, стандарт, GLOBAL<
