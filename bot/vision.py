@@ -1,133 +1,74 @@
+# bot/vision.py
+from __future__ import annotations
+
 import base64
 import logging
-from typing import Optional
+from typing import Any, Dict, List
 
 import httpx
 
 from .config import settings
+from .modes import MODES
 
 logger = logging.getLogger(__name__)
 
-# Groq audio (Whisper)
-GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
-# OpenAI endpoints (vision + image generation) — используются только если задан OPENAI_API_KEY
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_IMAGES_URL = "https://api.openai.com/v1/images"
-
-
-def _has_openai() -> bool:
-    return bool(settings.openai_api_key)
-
-
-# === Анализ изображения (vision) =====================================
-
-
-async def analyze_image(image_bytes: bytes) -> str:
+async def analyze_image(image_bytes: bytes, user_id: int | None = None) -> str:
     """
-    Анализ изображения через OpenAI vision (если доступен).
-    Если OPENAI_API_KEY не задан, возвращает заглушку.
+    Анализ изображения с помощью vision-модели Groq.
+    Если что-то пойдёт не так — вернём человекочитаемую ошибку.
     """
-    if not _has_openai():
-        return (
-            "У меня пока нет доступа к vision-модели. "
-            "Могу ответить только по тексту."
-        )
+    if not settings.groq_api_key:
+        return "❗️ GROQ_API_KEY не задан. Укажи ключ и перезапусти сервис."
 
-    img_b64 = base64.b64encode(image_bytes).decode("ascii")
+    system_prompt = MODES["vision"]["system_prompt"]
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Опиши, что видно на изображении, сделай акцент на медицинских деталях, "
-                            "но не ставь диагноз и не давай лечения. Добавь дисклеймер, что это не "
-                            "заменяет консультацию врача."
-                        ),
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    url = settings.groq_base_url.rstrip("/") + "/chat/completions"
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Проанализируй это изображение с медицинской точки зрения. "
+                            "Опиши, что видно, и предположи возможные диагнозы, если это уместно.",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}",
                     },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": 500,
-    }
+                },
+            ],
+        },
+    ]
 
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-    }
+    logger.info("Sending vision request to Groq (user=%s)", user_id)
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(OPENAI_CHAT_URL, json=payload, headers=headers)
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {settings.groq_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.groq_vision_model,
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "max_tokens": 800,
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.exception("Vision request failed: %s", e)
+        return f"❗️ Не удалось проанализировать изображение: {e}"
 
-    resp.raise_for_status()
-    data = resp.json()
-    text = data["choices"][0]["message"]["content"].strip()
-    logger.info("Vision answer length: %s", len(text))
-    return text
-
-
-# === Генерация изображения (DALL·E / gpt-image-1) =====================
-
-
-async def generate_image(prompt: str) -> Optional[str]:
-    """
-    Генерация изображения по текстовому запросу.
-    Возвращает URL картинки или None.
-    """
-    if not _has_openai():
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-    }
-
-    payload = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "size": "1024x1024",
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{OPENAI_IMAGES_URL}/generations", json=payload, headers=headers)
-
-    resp.raise_for_status()
-    data = resp.json()
-    url = data["data"][0].get("url")
-    logger.info("Generated image URL: %s", url)
-    return url
-
-
-# === Распознавание голосовых (Whisper через Groq) =====================
-
-
-async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.ogg") -> str:
-    """
-    Распознаёт голосовое сообщение с помощью Whisper large v3 на Groq.
-    """
-    files = {
-        "file": (filename, audio_bytes, "audio/ogg"),
-        "model": (None, settings.whisper_model),
-        "response_format": (None, "json"),
-        "temperature": (None, "0"),
-    }
-
-    headers = {
-        "Authorization": f"Bearer {settings.groq_api_key}",
-    }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(GROQ_AUDIO_URL, files=files, headers=headers)
-
-    resp.raise_for_status()
-    data = resp.json()
-    text = data.get("text", "").strip()
-    logger.info("Whisper transcription length: %s", len(text))
-    return text
+    return reply
