@@ -1,21 +1,24 @@
+from dataclasses import dataclass, field
 import os
-from dataclasses import dataclass
 
 
 @dataclass
 class Settings:
-    bot_token: str = os.environ["BOT_TOKEN"]
-    groq_api_key: str = os.environ["GROQ_API_KEY"]
-    model_name: str = os.getenv("MODEL_NAME", "openai/gpt-oss-20b")
+    # Ключи и токены
+    bot_token: str = os.getenv("BOT_TOKEN", "")
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
 
-    # список разрешённых пользователей
-    allowed_users: list[str] = os.getenv(
-        "ALLOWED_USERS",
-        "bear1berry,AraBysh"
-    ).split(",")
+    # Модель Groq (рабочая)
+    model_name: str = os.getenv("MODEL_NAME", "llama-3.1-70b-versatile")
 
-    # админ (строго один)
-    admin_user: str = os.getenv("ADMIN_USER", "bear1berry")
-    
+    # Доступные пользователи (исправлено!)
+    allowed_users: list[str] = field(default_factory=lambda: [
+        "bear1berry",
+        "AraBysh"
+    ])
+
+    # Админ
+    admin_user: str = "bear1berry"
+
 
 settings = Settings()
