@@ -1,44 +1,34 @@
-# bot/main.py
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 
 from .config import settings
-from .handlers import router
-from .memory import init_db
+from .handlers import router as main_router
+from .memory import _get_conn  # noqa: F401  # side-effect init DB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+
+logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    # Логирование
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    logger = logging.getLogger(__name__)
-
     if not settings.bot_token:
-        raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+        logger.error("BOT_TOKEN is not set")
+        raise SystemExit("BOT_TOKEN is required")
 
-    # Инициализация БД
-    init_db()
-
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=settings.bot_token, parse_mode="HTML")
     dp = Dispatcher()
-
-    dp.include_router(router)
+    dp.include_router(main_router)
 
     logger.info("Bot started. Waiting for messages...")
-
-    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
