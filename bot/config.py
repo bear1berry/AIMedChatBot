@@ -50,6 +50,9 @@ class Settings:
     groq_chat_model: str = field(
         default_factory=lambda: os.getenv("MODEL_NAME", "openai/gpt-oss-120b").strip()
     )
+    groq_chat_model_light: str = field(
+        default_factory=lambda: os.getenv("GROQ_SECONDARY_MODEL", "").strip()
+    )
     groq_vision_model: str = field(
         default_factory=lambda: os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview").strip()
     )
@@ -71,10 +74,13 @@ class Settings:
     def __post_init__(self) -> None:
         allowed_raw = os.getenv("ALLOWED_USERNAMES", "").strip()
         if allowed_raw:
-            # usernames без @
             self.allowed_users = [u.strip().lstrip("@") for u in allowed_raw.split(",") if u.strip()]
         else:
             self.allowed_users = []
+
+        # Лёгкая модель по умолчанию = основная, если не указана явно
+        if not self.groq_chat_model_light:
+            self.groq_chat_model_light = self.groq_chat_model
 
 
 settings = Settings()
