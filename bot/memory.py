@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .config import settings
 
@@ -55,6 +55,32 @@ def _init_db(conn: sqlite3.Connection) -> None:
         """
     )
 
+    # Saved clinical cases
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cases (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            title      TEXT NOT NULL,
+            summary    TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+
+    # Saved notes
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            title      TEXT NOT NULL,
+            body       TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     cur.close()
 
@@ -90,7 +116,7 @@ def load_conversation_row(user_id: int) -> Optional[Dict[str, Any]]:
 def save_conversation_row(
     user_id: int,
     mode_key: str,
-    history: list[dict],
+    history: List[dict],
     last_question: Optional[str],
     last_answer: Optional[str],
     verbosity: str,
@@ -164,3 +190,102 @@ def clear_history(user_id: int) -> None:
     )
     conn.commit()
     cur.close()
+
+
+def create_case(user_id: int, title: str, summary: str) -> int:
+    """
+    Сохраняет клинический случай и возвращает его ID.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO cases (user_id, title, summary, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, title, summary, now),
+    )
+    conn.commit()
+    case_id = cur.lastrowid
+    cur.close()
+    return case_id
+
+
+def list_cases(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Возвращает список последних сохранённых случаев пользователя.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, summary, created_at
+        FROM cases
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [dict(r) for r in rows]
+
+
+def create_note(user_id: int, title: str, body: str) -> int:
+    """
+    Сохраняет заметку и возвращает её ID.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "INSERT INTO notes (user_id, title, body, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, title, body, now),
+    )
+    conn.commit()
+    note_id = cur.lastrowid
+    cur.close()
+    return note_id
+
+
+def list_notes(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Возвращает последние заметки пользователя.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, body, created_at
+        FROM notes
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [dict(r) for r in rows]
+
+
+def search_notes(user_id: int, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Поиск по заметкам пользователя по подстроке в заголовке или тексте.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    pattern = f"%{query}%"
+    cur.execute(
+        """
+        SELECT id, title, body, created_at
+        FROM notes
+        WHERE user_id = ?
+          AND (title LIKE ? OR body LIKE ?)
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (user_id, pattern, pattern, limit),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [dict(r) for r in rows]
