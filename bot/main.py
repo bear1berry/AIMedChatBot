@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 from .config import settings
 from .handlers import router
@@ -18,7 +19,6 @@ def setup_logging() -> None:
             logging.FileHandler("bot.log", encoding="utf-8"),
         ],
     )
-    # чтобы httpx не спамил debug
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -26,7 +26,11 @@ async def main() -> None:
     setup_logging()
     init_db()
 
-    bot = Bot(settings.bot_token, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+
     dp = Dispatcher()
     dp.include_router(router)
 
