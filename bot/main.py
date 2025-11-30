@@ -1,40 +1,44 @@
+# bot/main.py
+from __future__ import annotations
+
 import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 from .config import settings
 from .handlers import router
 from .memory import init_db
 
 
-def setup_logging() -> None:
+async def main() -> None:
+    # Логирование
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("bot.log", encoding="utf-8"),
-        ],
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    logger = logging.getLogger(__name__)
 
-async def main() -> None:
-    setup_logging()
+    if not settings.bot_token:
+        raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+
+    # Инициализация БД
     init_db()
 
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
     dp = Dispatcher()
+
     dp.include_router(router)
 
-    logging.getLogger(__name__).info("Bot started. Waiting for messages...")
+    logger.info("Bot started. Waiting for messages...")
+
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
