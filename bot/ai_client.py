@@ -14,32 +14,25 @@ SYSTEM_PROMPT = (
 
 
 async def ask_ai(user_message: str) -> str:
-    """
-    Отправляет запрос к Groq Chat Completions и возвращает текст ответа.
-    """
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": 0.4,
-        "max_tokens": 700,
-    }
-
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(GROQ_API_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "user", "content": user_message}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.7
+            }
+        )
 
-    try:
-        content = data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
-        content = "Не удалось получить корректный ответ от ИИ. Попробуйте ещё раз позже."
+    data = r.json()
 
-    return content
+    return data["choices"][0]["message"]["content"]
+
+
