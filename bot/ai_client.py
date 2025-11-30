@@ -1,56 +1,85 @@
 import httpx
-from .config import GROQ_API_KEY, MODEL_NAME
+from .config import settings
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# основная безопасная модель
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+
 SYSTEM_PROMPT = (
-    "Ты — ИИ-помощник в медицинском Telegram-канале. "
-    "Отвечай на вопросы пользователей в формате просветительской информации: "
-    "объясняй термины, процессы, общие подходы к диагностике и лечению, "
-    "но НЕ ставь диагнозы, не назначай лечение, не давай индивидуальных "
-    "медицинских рекомендаций. Всегда добавляй дисклеймер о том, что это не "
-    "является медицинской консультацией и необходимо очно обратиться к врачу."
+    "Ты — ИИ-помощник медицинского Telegram-канала AI.Medicine.\n"
+    "Отвечай коротко, понятным языком для неспециалиста.\n"
+    "Не ставь диагнозы, не назначай лечение, не давай индивидуальных "
+    "медицинских рекомендаций.\n"
+    "Всегда подчеркивай, что информация носит ознакомительный характер "
+    "и не заменяет очную консультацию врача."
 )
 
 
 async def ask_ai(user_message: str) -> str:
     """
-    Главная функция — отправка запроса в Groq и получение ответа.
+    Отправляет запрос к Groq API и возвращает текст ответа.
+    Есть fallback: если выбранная модель не найдена/выведена из оборота –
+    один раз пробуем DEFAULT_MODEL.
     """
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
-        "max_tokens": 600,
-        "temperature": 0.7
+    headers = {
+        "Authorization": f"Bearer {settings.groq_api_key}",
+        "Content-Type": "application/json",
     }
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    async def _request(model_name: str) -> tuple[int, dict]:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": 600,
+            "temperature": 0.6,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(GROQ_API_URL, headers=headers, json=payload)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        return resp.status_code, data
+
+    # модель из окружения или дефолт
+    model_to_use = settings.model_name or DEFAULT_MODEL
 
     try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            response = await client.post(
-                GROQ_API_URL,
-                headers=headers,
-                json=payload
-            )
+        status, data = await _request(model_to_use)
+    except httpx.RequestError:
+        return "Ошибка при обращении к ИИ. Попробуй ещё раз чуть позже."
 
-        # Бросить исключение, если ошибка уровня HTTP
-        response.raise_for_status()
+    # Если модель не найдена / деактивирована – пробуем дефолтную
+    if (
+        status == 404
+        and isinstance(data, dict)
+        and data.get("error", {}).get("code") in {"model_not_found", "model_decommissioned"}
+        and model_to_use != DEFAULT_MODEL
+    ):
+        status, data = await _request(DEFAULT_MODEL)
 
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    # Обработка ошибок API
+    if status >= 400:
+        error_msg = None
+        if isinstance(data, dict):
+            error = data.get("error") or {}
+            error_msg = error.get("message")
 
-    except httpx.HTTPStatusError as e:
-        # Ошибка Groq (400, 401, 404, 500)
-        return f"Groq API error: {e.response.status_code}\n{e.response.text}"
+        if error_msg:
+            # Можно логировать error_msg, а пользователю показывать мягкую фразу
+            return f"Groq API error: {error_msg}"
+        return "Не удалось получить ответ от ИИ (ошибка сервера). Попробуй ещё раз позже."
 
-    except Exception as e:
-        # Любая другая ошибка
-        return f"⚠ Ошибка при запросе к ИИ: {e}"
+    # Достаем текст ответа
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return "Мне не удалось сформировать ответ. Попробуй переформулировать вопрос."
+
+    return content.strip()
