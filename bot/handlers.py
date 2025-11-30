@@ -1,196 +1,203 @@
 # bot/handlers.py
+from __future__ import annotations
+
+import logging
+from typing import Dict
 
 from aiogram import Router, F
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
-from aiogram.filters import CommandStart, Command
-
-import logging
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Bot
 
 from .config import settings
 from .ai_client import ask_ai
+from .modes import MODES, detect_mode
+from .memory import register_user, get_stats, save_message
 from .vision import analyze_image
-from .modes import (
-    MODES,
-    MODES_ORDER,
-    DEFAULT_MODE,
-    build_modes_keyboard,
-    auto_detect_mode,
-    get_modes_human_readable,
-)
-from .memory import register_user, active_users, log_request
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="main")
+
+# Память по режимам (в рамках процесса)
+_user_modes: Dict[int, str] = {}
 
 
-router = Router()
-
-# Храним активный режим пользователя
-user_modes = {}
-
-# ---------------------------------------------------------------------------
-# 🔐 ACCESS CONTROL
-# ---------------------------------------------------------------------------
-
-def check_access(username: str) -> bool:
-    return username.lower() in [u.lower() for u in settings.allowed_users]
+def _get_user_mode(user_id: int) -> str:
+    return _user_modes.get(user_id, "default")
 
 
-def is_admin(username: str) -> bool:
-    return username.lower() == settings.admin_user.lower()
+def _set_user_mode(user_id: int, mode: str) -> None:
+    if mode not in MODES:
+        mode = "default"
+    _user_modes[user_id] = mode
 
 
-# ---------------------------------------------------------------------------
-# /start
-# ---------------------------------------------------------------------------
+def _is_allowed(username: str | None) -> bool:
+    if not settings.allowed_users:
+        return True
+    if not username:
+        return False
+    return username.lstrip("@") in settings.allowed_users
+
+
+def _modes_keyboard(current_mode: str) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for code, cfg in MODES.items():
+        mark = "✅" if code == current_mode else "⚪️"
+        kb.button(
+            text=f"{mark} {cfg['short_name']}",
+            callback_data=f"set_mode:{code}",
+        )
+    kb.adjust(2)
+    return kb
+
 
 @router.message(CommandStart())
-async def start(message: Message):
-    username = (message.from_user.username or "").lower()
+async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
 
-    if not check_access(username):
-        return await message.answer("🚫 У вас нет доступа к этому боту.")
+    if not _is_allowed(user.username):
+        await message.answer(
+            "🚫 Доступ к этому боту ограничен.\n"
+            "Если вы считаете, что это ошибка — напишите владельцу бота."
+        )
+        return
 
-    # регистрируем пользователя
-    register_user(message.from_user.id, username)
-
-    user_modes[message.from_user.id] = DEFAULT_MODE
+    register_user(user.id, user.username)
+    _set_user_mode(user.id, "default")
 
     text = (
-        "<b>Привет!</b> Добро пожаловать в AI Medicine Bot.\n\n"
-        "<b>Доступные режимы:</b>\n"
-        f"{get_modes_human_readable()}\n\n"
-        "Выбери режим 👇 или просто напиши вопрос — бот сам подберёт."
+        "👋 Привет! Я медицинский AI-бот.\n\n"
+        "Отправь мне свой вопрос — разберёмся по-взрослому.\n\n"
+        "Ниже можешь выбрать профиль работы:"
     )
 
     await message.answer(
         text,
-        reply_markup=build_modes_keyboard()
+        reply_markup=_modes_keyboard("default").as_markup(),
     )
 
 
-# ---------------------------------------------------------------------------
-# /users — только администратор
-# ---------------------------------------------------------------------------
+@router.callback_query(F.data.startswith("set_mode:"))
+async def cb_set_mode(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if not user:
+        return
 
-@router.message(Command("users"))
-async def cmd_users(message: Message):
-    username = (message.from_user.username or "").lower()
+    if not _is_allowed(user.username):
+        await callback.answer("Доступ запрещён", show_alert=True)
+        return
 
-    if not is_admin(username):
-        return await message.answer("🚫 Только администратор может выполнять эту команду.")
+    _, mode = callback.data.split(":", 1)
+    if mode not in MODES:
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
 
-    if not active_users:
-        return await message.answer("Пока ещё никто не обращался.")
+    _set_user_mode(user.id, mode)
+    cfg = MODES[mode]
 
-    text = "📋 <b>Подключённые пользователи:</b>\n\n"
-
-    for uid, uname in active_users:
-        text += f"• @{uname} — ID: <code>{uid}</code>\n"
-
-    await message.answer(text)
+    await callback.message.edit_reply_markup(
+        reply_markup=_modes_keyboard(mode).as_markup()
+    )
+    await callback.answer(f"Режим: {cfg['title']}")
 
 
-# ---------------------------------------------------------------------------
-# 📌 Callback-кнопки выбора режима
-# ---------------------------------------------------------------------------
+@router.message(Command("mode"))
+async def cmd_mode(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ к этому боту ограничен.")
+        return
 
-@router.callback_query(F.data.startswith("mode:"))
-async def mode_selected(callback: CallbackQuery):
-    mode_key = callback.data.split(":", 1)[1]
-
-    if mode_key not in MODES:
-        return await callback.answer("Неизвестный режим", show_alert=True)
-
-    user_modes[callback.from_user.id] = mode_key
-    title = MODES[mode_key]["title"]
-    emoji = MODES[mode_key]["emoji"]
-
-    await callback.answer(f"Режим переключён: {emoji} {title}")
-    await callback.message.answer(
-        f"🔄 Режим изменён: <b>{emoji} {title}</b>\n\nМожешь продолжать, я готов!"
+    current = _get_user_mode(user.id)
+    await message.answer(
+        "Выбери режим работы бота:",
+        reply_markup=_modes_keyboard(current).as_markup(),
     )
 
 
-# ---------------------------------------------------------------------------
-# 🖼 ОБРАБОТКА ИЗОБРАЖЕНИЙ
-# ---------------------------------------------------------------------------
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    if settings.admin_username and user.username and user.username.lstrip("@") == settings.admin_username:
+        s = get_stats()
+        await message.answer(
+            f"📊 Статистика:\n"
+            f"Пользователей: <b>{s['users']}</b>\n"
+            f"Сообщений: <b>{s['messages']}</b>"
+        )
+    else:
+        await message.answer("Команда доступна только администратору.")
+
 
 @router.message(F.photo)
-async def photo_handler(message: Message):
-    username = (message.from_user.username or "").lower()
+async def photo_handler(message: Message, bot: Bot) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ к этому боту ограничен.")
+        return
 
-    if not check_access(username):
-        return await message.answer("🚫 Нет доступа.")
+    photo = message.photo[-1]
 
-    register_user(message.from_user.id, username)
+    # Скачиваем bytes
+    file_obj = await bot.download(photo)
+    image_bytes = file_obj.read()
 
-    file_id = message.photo[-1].file_id
-    file_info = await message.bot.get_file(file_id)
-    file_bytes = await message.bot.download_file(file_info.file_path)
+    await message.answer("🖼 Получил изображение, анализирую...")
 
-    await message.answer("🔍 Анализирую изображение…")
+    reply = await analyze_image(image_bytes, user_id=user.id)
+    save_message(user.id, "user", "[изображение]", "vision")
+    save_message(user.id, "assistant", reply, "vision")
 
-    result = await analyze_image(file_bytes.read())
+    await message.answer(reply)
 
-    # Логируем
-    log_request(
-        user_id=message.from_user.id,
-        username=username,
-        mode="vision",
-        query="IMAGE_UPLOADED",
-        reply=result,
-    )
-
-    await message.answer(result)
-
-
-# ---------------------------------------------------------------------------
-# ✉ ТЕКСТОВЫЕ ЗАПРОСЫ
-# ---------------------------------------------------------------------------
 
 @router.message(F.text)
-async def text_handler(message: Message):
-    username = (message.from_user.username or "").lower()
+async def text_handler(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
 
-    if not check_access(username):
-        return await message.answer("🚫 У вас нет доступа.")
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ к этому боту ограничен.")
+        return
 
-    user_id = message.from_user.id
+    text = message.text or ""
+    current_mode = _get_user_mode(user.id)
 
-    # Регистрируем в БД
-    register_user(user_id, username)
+    # Автоопределение режима
+    detected_mode = detect_mode(text, current_mode=current_mode)
+    if detected_mode != current_mode:
+        _set_user_mode(user.id, detected_mode)
+        mode_changed_note = f"🔁 Автоматически переключился в режим: <b>{MODES[detected_mode]['title']}</b>\n\n"
+    else:
+        mode_changed_note = ""
 
-    # Получаем текущий режим
-    current_mode = user_modes.get(user_id, DEFAULT_MODE)
-
-    # Авто-распознавание режима по тексту
-    auto_mode = auto_detect_mode(message.text)
-
-    if auto_mode != DEFAULT_MODE and auto_mode != current_mode:
-        current_mode = auto_mode
-        user_modes[user_id] = current_mode
-        await message.answer(
-            f"🔄 Автоматически выбран режим: <b>{MODES[current_mode]['emoji']} {MODES[current_mode]['title']}</b>"
-        )
-
-    await message.answer("🧠 Думаю над ответом…")
+    await message.chat.do("typing")
 
     reply = await ask_ai(
-        user_id=user_id,
-        mode=current_mode,
-        user_message=message.text
+        user_id=user.id,
+        mode=detected_mode,
+        user_message=text,
     )
 
-    # Логирование
-    log_request(
-        user_id=user_id,
-        username=username,
-        mode=current_mode,
-        query=message.text,
-        reply=reply,
-    )
+    final_text = mode_changed_note + reply
 
-    await message.answer(reply, reply_markup=build_modes_keyboard())
+    await message.answer(
+        final_text,
+        reply_markup=_modes_keyboard(detected_mode).as_markup(),
+    )
