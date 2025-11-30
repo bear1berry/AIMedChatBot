@@ -3,21 +3,24 @@ import logging
 
 from aiogram import Bot, Dispatcher
 
-from .config import BOT_TOKEN
+from .config import settings
 from .handlers import router
 
 
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-    bot = Bot(token=BOT_TOKEN)
+
+async def main() -> None:
+    bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
+
     dp.include_router(router)
 
-    logging.info("Бот запущен и ожидает сообщения...")
+    logger.info("Бот запущен и ожидает сообщения...")
 
     await dp.start_polling(bot)
 
