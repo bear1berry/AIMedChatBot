@@ -11,7 +11,7 @@ from .memory import save_dialog_turn, load_dialog_history
 
 logger = logging.getLogger(__name__)
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/v1/chat/completions"
 
 
 def _build_messages(
@@ -146,3 +146,4 @@ async def ask_ai(
             "❌ Произошла внутренняя ошибка при обращении к модели.\n"
             "Попробуйте ещё раз чуть позже."
         )
+
