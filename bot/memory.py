@@ -3,8 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from .config import settings
 
@@ -51,6 +50,14 @@ def _init_db(conn: sqlite3.Connection) -> None:
             content     TEXT NOT NULL,
             mode        TEXT,
             created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            user_id      INTEGER NOT NULL,
+            scope        TEXT NOT NULL, -- 'minute' / 'day'
+            window_start INTEGER NOT NULL,
+            count        INTEGER NOT NULL,
+            PRIMARY KEY (user_id, scope)
         );
         """
     )
@@ -104,7 +111,6 @@ def get_profile(user_id: int) -> Dict[str, str]:
         cur.execute("SELECT role, detail_level, jurisdiction FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
     if not row:
-        # значения по умолчанию
         return {"role": "пациент", "detail_level": "стандарт", "jurisdiction": "GLOBAL"}
     return {
         "role": row["role"] or "пациент",
@@ -116,7 +122,6 @@ def get_profile(user_id: int) -> Dict[str, str]:
 def create_conversation(user_id: int, title: str) -> int:
     title = title.strip() or "Новый диалог"
     with _cursor() as cur:
-        # деактивируем старые
         cur.execute("UPDATE conversations SET is_active = 0 WHERE user_id = ?", (user_id,))
         cur.execute(
             "INSERT INTO conversations (user_id, title, is_active) VALUES (?, ?, 1)",
@@ -135,7 +140,6 @@ def get_active_conversation(user_id: int) -> int:
         row = cur.fetchone()
     if row:
         return int(row["id"])
-    # создаём по умолчанию
     return create_conversation(user_id, "Диалог")
 
 
@@ -178,7 +182,6 @@ def get_history(user_id: int, limit: int = 12) -> List[Dict[str, str]]:
             (conv_id, limit),
         )
         rows = cur.fetchall()
-    # возвращаем в хронологическом порядке
     return [dict(r) for r in reversed(rows)]
 
 
@@ -189,3 +192,19 @@ def get_stats() -> Dict[str, int]:
         cur.execute("SELECT COUNT(*) AS c FROM messages")
         msgs = cur.fetchone()["c"] or 0
     return {"users": int(users), "messages": int(msgs)}
+
+
+def db_healthcheck() -> bool:
+    """
+    Простая проверка, что БД отвечает.
+    """
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        return True
+    except Exception as e:
+        logger.exception("DB healthcheck failed: %s", e)
+        return False
