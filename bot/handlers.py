@@ -3,18 +3,19 @@ from __future__ import annotations
 import logging
 from typing import Dict
 
-from aiogram import Router, F, Bot
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from .ai_client import ask_ai
+from .ai_client import ask_ai, healthcheck_llm
 from .config import settings
-from .keyboards import main_menu_keyboard, modes_keyboard, answer_with_modes_keyboard
+from .keyboards import answer_with_modes_keyboard, main_menu_keyboard, modes_keyboard
+from .limits import check_rate_limit
 from .memory import (
     create_conversation,
-    get_history,
+    db_healthcheck,
     get_profile,
     get_stats,
     list_conversations,
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="main")
 
-# Текущее текстовое режимное состояние в памяти процесса
 _user_modes: Dict[int, str] = {}
 
 
@@ -51,12 +51,10 @@ def _is_allowed(username: str | None) -> bool:
     return username.lstrip("@") in settings.allowed_users
 
 
-# ====== FSM для профиля ======
 class ProfileStates(StatesGroup):
     waiting_profile = State()
 
 
-# ====== FSM для симптом-чекера ======
 class SymptomStates(StatesGroup):
     symptom = State()
     duration = State()
@@ -103,7 +101,8 @@ async def cmd_help(message: Message) -> None:
         "• /profile — настроить твой профиль (пациент / врач / студент и т.п.)\n"
         "• /new — начать новый «кейс» / диалог\n"
         "• /cases — список последних кейсов\n"
-        "• /stats — общая статистика (для админа)\n\n"
+        "• /stats — общая статистика (для админа)\n"
+        "• /ping — healthcheck бота (для админа)\n\n"
         "Или просто напиши свой вопрос — я сам подберу подходящий режим 🤖"
     )
 
@@ -151,8 +150,6 @@ async def cb_set_mode(callback: CallbackQuery) -> None:
     await callback.answer(f"Режим: {cfg['short_name']}")
 
 
-# ==== Главное меню (callback) ====
-
 @router.callback_query(F.data == "menu:symptoms")
 async def cb_menu_symptoms(callback: CallbackQuery, state: FSMContext) -> None:
     await cmd_symptoms_start(callback.message, state)
@@ -176,8 +173,6 @@ async def cb_menu_ask(callback: CallbackQuery) -> None:
     await callback.message.answer("Напиши свой вопрос 👇")
     await callback.answer()
 
-
-# ===== Профиль =====
 
 @router.message(Command("profile"))
 async def cmd_profile(message: Message, state: FSMContext) -> None:
@@ -222,8 +217,6 @@ async def profile_set(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Профиль обновлён.")
 
 
-# ===== Кейсы / диалоги =====
-
 @router.message(Command("new"))
 async def cmd_new(message: Message) -> None:
     user = message.from_user
@@ -266,7 +259,28 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
-# ===== Симптом-чекер =====
+@router.message(Command("ping"))
+async def cmd_ping(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not settings.admin_username or user.username is None or user.username.lstrip("@") != settings.admin_username:
+        await message.answer("Команда доступна только админу.")
+        return
+
+    db_ok = db_healthcheck()
+    db_line = "✅ БД отвечает" if db_ok else "❌ Проблема с БД (см. логи)"
+
+    llm_ok, llm_msg = await healthcheck_llm()
+
+    text = (
+        "🩺 <b>Healthcheck бота</b>\n\n"
+        f"🗄 База данных: {db_line}\n"
+        f"🧠 Модель: {llm_msg}\n"
+    )
+
+    await message.answer(text)
+
 
 @router.message(Command("symptoms"))
 async def cmd_symptoms_start(message: Message, state: FSMContext) -> None:
@@ -328,6 +342,11 @@ async def symptom_step_red_flags(message: Message, state: FSMContext) -> None:
         "• предложи план действий и вопросы к врачу."
     )
 
+    ok, _, msg = check_rate_limit(user.id)
+    if not ok:
+        await message.answer(msg or "⏳ Лимит запросов, попробуй позже.")
+        return
+
     mode = "symptoms"
     _set_user_mode(user.id, mode)
     reply = await ask_ai(user.id, mode, text)
@@ -337,8 +356,6 @@ async def symptom_step_red_flags(message: Message, state: FSMContext) -> None:
     )
 
 
-# ===== Работа с изображениями =====
-
 @router.message(F.photo)
 async def photo_handler(message: Message, bot: Bot) -> None:
     user = message.from_user
@@ -347,6 +364,11 @@ async def photo_handler(message: Message, bot: Bot) -> None:
 
     if not _is_allowed(user.username):
         await message.answer("🚫 Доступ запрещён.")
+        return
+
+    ok, _, msg = check_rate_limit(user.id)
+    if not ok:
+        await message.answer(msg or "⏳ Лимит запросов, попробуй позже.")
         return
 
     photo = message.photo[-1]
@@ -364,8 +386,6 @@ async def photo_handler(message: Message, bot: Bot) -> None:
     )
 
 
-# ===== Обработка текстов =====
-
 @router.message(F.text)
 async def text_handler(message: Message) -> None:
     user = message.from_user
@@ -374,6 +394,11 @@ async def text_handler(message: Message) -> None:
 
     if not _is_allowed(user.username):
         await message.answer("🚫 Доступ запрещён.")
+        return
+
+    ok, _, msg = check_rate_limit(user.id)
+    if not ok:
+        await message.answer(msg or "⏳ Лимит запросов, попробуй позже.")
         return
 
     text = message.text or ""
@@ -396,13 +421,16 @@ async def text_handler(message: Message) -> None:
     )
 
 
-# ===== Действия над ответом (простая реализация) =====
-
 @router.callback_query(F.data.startswith("act:"))
 async def cb_answer_action(callback: CallbackQuery) -> None:
     user = callback.from_user
     if not user or not callback.message:
         await callback.answer()
+        return
+
+    ok, _, msg = check_rate_limit(user.id)
+    if not ok:
+        await callback.answer(msg or "⏳ Лимит запросов, попробуй позже.", show_alert=True)
         return
 
     original = callback.message.text or ""
