@@ -44,7 +44,43 @@ class RateLimitError(Exception):
         super().__init__(self.message)
 
 
-def _personalize_system_prompt(state: ConversationState, user_name: Optional[str]) -> str:
+def _classify_intent(text: str, mode_key: str) -> Optional[str]:
+    """
+    Примитивная классификация намерения пользователя для подстройки промпта.
+
+    Возвращает:
+        - 'content' — работа с текстом/контентом
+        - None — обычный диалог
+    """
+    t = text.lower()
+    # Явные признаки работы с текстом
+    content_markers = [
+        "сделай пост",
+        "подготовь пост",
+        "сделай текст",
+        "перепиши текст",
+        "перепиши это",
+        "сделай описание",
+        "сделай заголовок",
+        "придумай заголовок",
+        "придумай название",
+        "оформи пост",
+        "для телеграм канала",
+        "для telegram канала",
+        "для tg канала",
+    ]
+    for m in content_markers:
+        if m in t:
+            return "content"
+
+    return None
+
+
+def _personalize_system_prompt(
+    state: ConversationState,
+    user_name: Optional[str],
+    intent: Optional[str] = None,
+) -> str:
     base = build_system_prompt(mode_key=state.mode_key, user_name=user_name)
     extras: List[str] = []
 
@@ -64,6 +100,13 @@ def _personalize_system_prompt(state: ConversationState, user_name: Optional[str
         extras.append("По возможности используй структурированные списки и подзаголовки.")
     elif state.format_pref == "more_text":
         extras.append("Используй больше связного текста, а списки только при необходимости.")
+
+    # Дополнительные подсказки под задачу
+    if intent == "content":
+        extras.append(
+            "Сейчас пользователь просит помочь с созданием или редактированием текста/контента. "
+            "Сконцентрируйся на структуре, формулировках и читабельности результата."
+        )
 
     if extras:
         base += "\n\nДополнительные настройки формата ответа:\n- " + "\n- ".join(extras)
@@ -155,15 +198,18 @@ def update_preferences(
     return state
 
 
-async def _call_llm(messages: List[dict]) -> str:
+async def _call_llm(messages: List[dict], model_name: Optional[str] = None) -> str:
     if _client is None:
         raise RuntimeError("Groq client is not configured (no API key).")
+
+    if model_name is None:
+        model_name = settings.groq_chat_model
 
     loop = asyncio.get_running_loop()
 
     def _do_request() -> str:
         completion = _client.chat.completions.create(
-            model=settings.groq_chat_model,
+            model=model_name,
             messages=messages,
             temperature=0.7,
             top_p=1,
@@ -180,6 +226,45 @@ def _trim_history(state: ConversationState, max_turns: int = 12) -> None:
         state.messages = state.messages[-max_turns * 2 :]
 
 
+async def _maybe_summarize_history(user_id: int, state: ConversationState) -> None:
+    """
+    Если история стала слишком длинной — сжимаем её в краткий конспект,
+    чтобы не терять контекст и не раздувать промпт.
+    """
+    max_turns_before_summary = 20
+    if len(state.messages) <= max_turns_before_summary * 2:
+        return
+
+    # Уже довольно длинный диалог — делаем summary
+    history_json = json.dumps(state.messages, ensure_ascii=False)
+    system_prompt = (
+        "Ты — ассистент, который кратко конспектирует историю диалога между пользователем и ИИ. "
+        "На вход ты получаешь JSON-список сообщений с полями role и content. "
+        "Нужно сделать краткое структурированное резюме на русском языке: "
+        "основные темы, важные решения, ключевые детали. Пиши с подзаголовками и списками."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": history_json},
+    ]
+
+    try:
+        summary = await _call_llm(messages, model_name=settings.groq_chat_model_light)
+    except Exception:
+        logger.exception("Error while summarizing history")
+        return
+
+    state.messages = [
+        {
+            "role": "assistant",
+            "content": "Краткое резюме предыдущего диалога:\n\n" + summary.strip(),
+        }
+    ]
+    state.last_question = None
+    state.last_answer = None
+    _save_state(user_id, state)
+
+
 async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> str:
     """
     Основная точка входа для обычных сообщений пользователя.
@@ -189,14 +274,19 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
         raise RateLimitError(retry_after=retry_after, message=msg)
 
     state = get_state(user_id)
-    system_prompt = _personalize_system_prompt(state, user_name)
+
+    # При необходимости сжимаем историю
+    await _maybe_summarize_history(user_id, state)
+
+    intent = _classify_intent(text, state.mode_key)
+    system_prompt = _personalize_system_prompt(state, user_name, intent=intent)
 
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(state.messages)
     messages.append({"role": "user", "content": text})
 
     try:
-        reply = await _call_llm(messages)
+        reply = await _call_llm(messages, model_name=settings.groq_chat_model)
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion")
         raise
@@ -223,7 +313,10 @@ async def continue_answer(user_id: int, user_name: Optional[str] = None) -> str:
     if not ok:
         raise RateLimitError(retry_after=retry_after, message=msg)
 
-    system_prompt = _personalize_system_prompt(state, user_name)
+    await _maybe_summarize_history(user_id, state)
+
+    intent = None
+    system_prompt = _personalize_system_prompt(state, user_name, intent=intent)
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(state.messages)
     continuation_request = (
@@ -233,7 +326,7 @@ async def continue_answer(user_id: int, user_name: Optional[str] = None) -> str:
     messages.append({"role": "user", "content": continuation_request})
 
     try:
-        reply = await _call_llm(messages)
+        reply = await _call_llm(messages, model_name=settings.groq_chat_model)
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion (continue_answer)")
         raise
@@ -258,6 +351,7 @@ async def transform_last_answer(
         - 'summary'  -> краткий конспект
         - 'post'     -> пост для Telegram-канала
         - 'patient'  -> проще для пациента
+        - 'case'     -> структурированный клинический случай
     """
     state = get_state(user_id)
     if not state.last_answer:
@@ -266,6 +360,8 @@ async def transform_last_answer(
     ok, retry_after, msg = check_rate_limit(user_id)
     if not ok:
         raise RateLimitError(retry_after=retry_after, message=msg)
+
+    await _maybe_summarize_history(user_id, state)
 
     system_prompt = _personalize_system_prompt(state, user_name)
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
@@ -290,6 +386,13 @@ async def transform_last_answer(
             "Объясни содержание моего предыдущего ответа максимально понятным языком для пациента, "
             "без сложной терминологии. Стиль спокойный и поддерживающий."
         )
+    elif kind == "case":
+        instr = (
+            "Сделай структурированное описание клинического случая на основе моего предыдущего ответа. "
+            "Структура: Жалобы; Анамнез; Объективные данные (если есть); "
+            "Результаты обследований; Возможные диагностические гипотезы; "
+            "Рекомендации по дальнейшему обследованию. Пиши чётко и по делу."
+        )
     else:
         raise ValueError(f"Unknown transform kind: {kind}")
 
@@ -297,7 +400,8 @@ async def transform_last_answer(
     messages.append({"role": "user", "content": user_msg})
 
     try:
-        reply = await _call_llm(messages)
+        # Для трансформаций можно использовать более лёгкую модель
+        reply = await _call_llm(messages, model_name=settings.groq_chat_model_light)
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion (transform_last_answer)")
         raise
