@@ -4,17 +4,19 @@ from dataclasses import dataclass
 from typing import Dict
 
 
+# Какой режим используется по умолчанию
 DEFAULT_MODE_KEY = "ai_medicine_assistant"
 
 
 @dataclass
 class ChatMode:
     key: str
-    title: str          # label с эмодзи
-    description: str    # для меню
-    system_template: str  # system prompt (может содержать {user_name})
+    title: str          # Лейбл с эмодзи для UI
+    description: str    # Описание для меню
+    system_template: str  # Системный промпт (можно вставлять {user_name})
 
 
+# Доступные режимы общения
 CHAT_MODES: Dict[str, ChatMode] = {
     "ai_medicine_assistant": ChatMode(
         key="ai_medicine_assistant",
@@ -45,6 +47,31 @@ CHAT_MODES: Dict[str, ChatMode] = {
             "is not a diagnosis or personal medical advice and that in-person consultation is required.\n\n"
             "When the user asks something, first understand the context, then give a clear, "
             "structured answer with short headings and lists where appropriate."
+        ),
+    ),
+    "chatgpt_general": ChatMode(
+        key="chatgpt_general",
+        title="🤖 ChatGPT-стиль",
+        description="Универсальный ассистент обо всём, максимально похожий на классический ChatGPT.",
+        system_template=(
+            "You are a general-purpose AI assistant similar to ChatGPT.\n\n"
+            "Language:\n"
+            "- By default answer in Russian unless the user clearly prefers another language.\n\n"
+            "Style:\n"
+            "- Be clear, concise and helpful.\n"
+            "- Use simple, understandable language, but adapt depth to the user's level.\n"
+            "- Use headings and lists when it improves readability.\n\n"
+            "Safety rules:\n"
+            "- For medical, legal or serious financial questions you are NOT a personal doctor, "
+            "lawyer or financial advisor.\n"
+            "- For medical questions: you may provide general educational information only, "
+            "avoid giving a diagnosis or individual treatment plan and recommend seeing a doctor "
+            "in person for decisions.\n"
+            "- If the situation sounds urgent or life-threatening, clearly recommend calling "
+            "emergency services or going to the nearest hospital.\n\n"
+            "When answering, first understand the user's intent, then provide a structured and "
+            "useful response. If the query is ambiguous, briefly mention the main options and ask "
+            "what exactly the user wants to focus on."
         ),
     ),
     "friendly_chat": ChatMode(
