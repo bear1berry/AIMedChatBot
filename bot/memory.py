@@ -1,150 +1,191 @@
-# bot/memory.py
 from __future__ import annotations
 
 import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
 
-_DB_CONN: sqlite3.Connection | None = None
+_CONN: sqlite3.Connection | None = None
 
 
-def init_db() -> None:
-    global _DB_CONN
-    if _DB_CONN is not None:
-        return
+def _get_conn() -> sqlite3.Connection:
+    global _CONN
+    if _CONN is None:
+        _CONN = sqlite3.connect(settings.db_path, check_same_thread=False)
+        _CONN.row_factory = sqlite3.Row
+        _init_db(_CONN)
+        logger.info("DB initialized at %s", settings.db_path)
+    return _CONN
 
-    _DB_CONN = sqlite3.connect(settings.db_path, check_same_thread=False)
-    _DB_CONN.row_factory = sqlite3.Row
 
-    cur = _DB_CONN.cursor()
-
-    # Пользователи
-    cur.execute(
+def _init_db(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE NOT NULL,
-            username TEXT,
-            first_seen TEXT,
-            last_seen TEXT
-        )
-        """
-    )
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            role        TEXT,
+            detail_level TEXT,
+            jurisdiction TEXT,
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
 
-    # Сообщения
-    cur.execute(
-        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            title       TEXT NOT NULL,
+            is_active   INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            conv_id     INTEGER NOT NULL,
+            role        TEXT NOT NULL, -- 'user' / 'assistant'
+            content     TEXT NOT NULL,
+            mode        TEXT,
+            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
-
-    _DB_CONN.commit()
-    logger.info("DB initialized at %s", settings.db_path)
+    conn.commit()
 
 
 @contextmanager
 def _cursor():
-    if _DB_CONN is None:
-        init_db()
-    cur = _DB_CONN.cursor()
+    conn = _get_conn()
+    cur = conn.cursor()
     try:
         yield cur
-        _DB_CONN.commit()
+        conn.commit()
     except Exception:
-        _DB_CONN.rollback()
+        conn.rollback()
         raise
+    finally:
+        cur.close()
 
 
-def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
-
-
-def register_user(tg_id: int, username: str | None) -> int:
-    """
-    Регистрирует пользователя, возвращает внутренний user_id.
-    """
-    username = (username or "").lstrip("@") or None
-
+def register_user(user_id: int, username: str | None) -> None:
     with _cursor() as cur:
-        cur.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
-        row = cur.fetchone()
-        if row:
-            user_id = row["id"]
-            cur.execute(
-                "UPDATE users SET username = ?, last_seen = ? WHERE id = ?",
-                (username, _now(), user_id),
-            )
-            return user_id
-
         cur.execute(
             """
-            INSERT INTO users (tg_id, username, first_seen, last_seen)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users (user_id, username)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username
             """,
-            (tg_id, username, _now(), _now()),
+            (user_id, (username or "")[:64]),
         )
-        return cur.lastrowid
 
 
-def save_message(tg_id: int, role: str, content: str, mode: str) -> None:
-    user_id = register_user(tg_id, None)
+def set_profile(user_id: int, username: str | None, role: str, detail_level: str, jurisdiction: str) -> None:
     with _cursor() as cur:
         cur.execute(
             """
-            INSERT INTO messages (user_id, role, content, mode, created_at)
+            INSERT INTO users (user_id, username, role, detail_level, jurisdiction)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                role=excluded.role,
+                detail_level=excluded.detail_level,
+                jurisdiction=excluded.jurisdiction
             """,
-            (user_id, role, content, mode, _now()),
+            (user_id, (username or "")[:64], role, detail_level, jurisdiction),
         )
 
 
-def get_history(tg_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+def get_profile(user_id: int) -> Dict[str, str]:
     with _cursor() as cur:
-        cur.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+        cur.execute("SELECT role, detail_level, jurisdiction FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
-        if not row:
-            return []
+    if not row:
+        # значения по умолчанию
+        return {"role": "пациент", "detail_level": "стандарт", "jurisdiction": "GLOBAL"}
+    return {
+        "role": row["role"] or "пациент",
+        "detail_level": row["detail_level"] or "стандарт",
+        "jurisdiction": row["jurisdiction"] or "GLOBAL",
+    }
 
-        user_id = row["id"]
+
+def create_conversation(user_id: int, title: str) -> int:
+    title = title.strip() or "Новый диалог"
+    with _cursor() as cur:
+        # деактивируем старые
+        cur.execute("UPDATE conversations SET is_active = 0 WHERE user_id = ?", (user_id,))
+        cur.execute(
+            "INSERT INTO conversations (user_id, title, is_active) VALUES (?, ?, 1)",
+            (user_id, title[:120]),
+        )
+        conv_id = cur.lastrowid
+    return int(conv_id)
+
+
+def get_active_conversation(user_id: int) -> int:
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT id FROM conversations WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    if row:
+        return int(row["id"])
+    # создаём по умолчанию
+    return create_conversation(user_id, "Диалог")
+
+
+def list_conversations(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    with _cursor() as cur:
         cur.execute(
             """
-            SELECT role, content, mode, created_at
-            FROM messages
+            SELECT id, title, created_at, is_active
+            FROM conversations
             WHERE user_id = ?
-            ORDER BY id DESC
+            ORDER BY created_at DESC
             LIMIT ?
             """,
             (user_id, limit),
         )
         rows = cur.fetchall()
-
-    # Вернём в хронологическом порядке (старые -> новые)
-    return list(reversed([dict(r) for r in rows]))
+    return [dict(r) for r in rows]
 
 
-def get_stats() -> Dict[str, Any]:
-    """
-    Простая статистика для /stats.
-    """
+def save_message(user_id: int, role: str, content: str, mode: str = "default") -> None:
+    conv_id = get_active_conversation(user_id)
+    with _cursor() as cur:
+        cur.execute(
+            "INSERT INTO messages (conv_id, role, content, mode) VALUES (?, ?, ?, ?)",
+            (conv_id, role, content, mode),
+        )
+
+
+def get_history(user_id: int, limit: int = 12) -> List[Dict[str, str]]:
+    conv_id = get_active_conversation(user_id)
+    with _cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE conv_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (conv_id, limit),
+        )
+        rows = cur.fetchall()
+    # возвращаем в хронологическом порядке
+    return [dict(r) for r in reversed(rows)]
+
+
+def get_stats() -> Dict[str, int]:
     with _cursor() as cur:
         cur.execute("SELECT COUNT(*) AS c FROM users")
-        users = cur.fetchone()["c"]
-
+        users = cur.fetchone()["c"] or 0
         cur.execute("SELECT COUNT(*) AS c FROM messages")
-        msgs = cur.fetchone()["c"]
-
-    return {"users": users, "messages": msgs}
+        msgs = cur.fetchone()["c"] or 0
+    return {"users": int(users), "messages": int(msgs)}
