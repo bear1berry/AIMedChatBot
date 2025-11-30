@@ -4,14 +4,11 @@ from __future__ import annotations
 import logging
 from typing import Dict
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-)
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 
 from .config import settings
 from .ai_client import ask_ai
@@ -100,12 +97,27 @@ async def cb_set_mode(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный режим", show_alert=True)
         return
 
+    current_mode = _get_user_mode(user.id)
+    if mode == current_mode:
+        # Режим уже выбран — просто покажем подсказку
+        await callback.answer("Этот режим уже выбран ✅")
+        return
+
     _set_user_mode(user.id, mode)
     cfg = MODES[mode]
 
-    await callback.message.edit_reply_markup(
-        reply_markup=_modes_keyboard(mode).as_markup()
-    )
+    # Обновляем клавиатуру, но игнорируем "message is not modified"
+    try:
+        if callback.message:
+            await callback.message.edit_reply_markup(
+                reply_markup=_modes_keyboard(mode).as_markup()
+            )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            logger.debug("Ignored Telegram 'message is not modified' for mode=%s", mode)
+        else:
+            raise
+
     await callback.answer(f"Режим: {cfg['title']}")
 
 
@@ -183,7 +195,10 @@ async def text_handler(message: Message) -> None:
     detected_mode = detect_mode(text, current_mode=current_mode)
     if detected_mode != current_mode:
         _set_user_mode(user.id, detected_mode)
-        mode_changed_note = f"🔁 Автоматически переключился в режим: <b>{MODES[detected_mode]['title']}</b>\n\n"
+        mode_changed_note = (
+            f"🔁 Автоматически переключился в режим: "
+            f"<b>{MODES[detected_mode]['title']}</b>\n\n"
+        )
     else:
         mode_changed_note = ""
 
