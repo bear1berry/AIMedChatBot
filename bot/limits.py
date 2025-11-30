@@ -4,40 +4,37 @@ import time
 from typing import Optional, Tuple
 
 from .config import settings
-from .memory import _get_conn  # используем внутренний коннектор к БД
+from .memory import _get_conn  # внутренний коннектор к БД
 
 
 def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
     """
-    Простой rate limit:
+    Лимиты для пользователя на SQLite:
     - N запросов в минуту
     - M запросов в сутки
-    Хранится в таблице rate_limits (user_id, scope, window_start, count).
 
     Возвращает:
-      (ok, retry_after, message)
+        ok: bool
+        retry_after: секунды до следующей попытки (если заблокирован)
+        message: человекочитаемое сообщение (если заблокирован)
     """
-    per_min = settings.rate_limit_per_minute
-    per_day = settings.rate_limit_per_day
-
-    # Лимиты отключены
-    if per_min <= 0 and per_day <= 0:
-        return True, None, None
-
+    now = int(time.time())
     conn = _get_conn()
     cur = conn.cursor()
-    now = int(time.time())
 
-    limits = [
-        ("minute", per_min, 60),
-        ("day", per_day, 86400),
+    scopes = [
+        ("minute", 60, settings.rate_limit_per_minute),
+        ("day", 24 * 60 * 60, settings.rate_limit_per_day),
     ]
 
     blocked_retry: Optional[int] = None
+    blocked_msg: Optional[str] = None
 
-    for scope, limit, window in limits:
+    for scope, window_size, limit in scopes:
         if limit <= 0:
             continue
+
+        window_start = now - (now % window_size)
 
         cur.execute(
             "SELECT window_start, count FROM rate_limits WHERE user_id = ? AND scope = ?",
@@ -45,48 +42,51 @@ def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
         )
         row = cur.fetchone()
 
-        if not row:
-            # первая запись
+        if row is None:
             cur.execute(
-                "INSERT OR REPLACE INTO rate_limits (user_id, scope, window_start, count) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, scope, now, 1),
+                "INSERT INTO rate_limits (user_id, scope, window_start, count) VALUES (?, ?, ?, ?)",
+                (user_id, scope, window_start, 0),
             )
-            continue
-
-        start = int(row["window_start"])
-        count = int(row["count"])
-
-        # окно истекло — начинаем заново
-        if now - start >= window:
-            cur.execute(
-                "UPDATE rate_limits SET window_start = ?, count = ? WHERE user_id = ? AND scope = ?",
-                (now, 1, user_id, scope),
-            )
-            continue
-
-        # лимит исчерпан
-        if count >= limit:
-            retry = window - (now - start)
-            if blocked_retry is None or retry > blocked_retry:
-                blocked_retry = retry
+            current_start = window_start
+            current_count = 0
         else:
-            # увеличиваем счётчик
-            cur.execute(
-                "UPDATE rate_limits SET count = count + 1 WHERE user_id = ? AND scope = ?",
-                (user_id, scope),
-            )
+            current_start, current_count = int(row["window_start"]), int(row["count"])
+            if current_start != window_start:
+                current_start = window_start
+                current_count = 0
+                cur.execute(
+                    "UPDATE rate_limits SET window_start = ?, count = ? WHERE user_id = ? AND scope = ?",
+                    (current_start, current_count, user_id, scope),
+                )
+
+        if current_count >= limit:
+            retry = current_start + window_size - now
+            if blocked_retry is None or retry > blocked_retry:
+                blocked_retry = max(retry, 1)
+                if scope == "minute":
+                    blocked_msg = (
+                        "⏳ Ты отправляешь слишком много запросов за короткое время. "
+                        "Попробуй ещё раз через несколько секунд."
+                    )
+                else:
+                    blocked_msg = (
+                        "🚦 Достигнут дневной лимит запросов для этого бота. "
+                        "Лимит обновится завтра."
+                    )
+
+    if blocked_retry is not None:
+        cur.close()
+        return False, blocked_retry, blocked_msg
+
+    # не заблокирован — инкремент счётчиков
+    for scope, _, limit in scopes:
+        if limit <= 0:
+            continue
+        cur.execute(
+            "UPDATE rate_limits SET count = count + 1 WHERE user_id = ? AND scope = ?",
+            (user_id, scope),
+        )
 
     conn.commit()
     cur.close()
-
-    if blocked_retry is not None:
-        # Показываем более «красивое» сообщение
-        if blocked_retry >= 60:
-            minutes = blocked_retry // 60
-            msg = f"⏳ Лимит запросов превышен. Попробуй снова примерно через {minutes} мин."
-        else:
-            msg = f"⏳ Лимит запросов превышен. Попробуй снова через {blocked_retry} сек."
-        return False, blocked_retry, msg
-
     return True, None, None
