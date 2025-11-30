@@ -6,12 +6,13 @@ from .config import settings
 from .ai_client import ask_ai
 from .vision import analyze_image
 from .modes import MODES
-from .memory import register_user
+from .memory import register_user, active_users
 
 router = Router()
 
-# Храним текущие режимы
+# Храним текущие режимы пользователей
 user_modes = {}
+
 
 def check_access(username: str) -> bool:
     return username.lower() in [u.lower() for u in settings.allowed_users]
@@ -21,6 +22,10 @@ def is_admin(username: str) -> bool:
     return username.lower() == settings.admin_user.lower()
 
 
+# =======================
+#        /start
+# =======================
+
 @router.message(CommandStart())
 async def start(message: Message):
     username = message.from_user.username or ""
@@ -29,9 +34,10 @@ async def start(message: Message):
         await message.answer("🚫 У вас нет доступа к этому боту.")
         return
 
-    # регистрируем пользователя
+    # Регистрируем пользователя
     register_user(message.from_user.id, username)
 
+    # Устанавливаем дефолтный режим
     user_modes[message.from_user.id] = "default"
 
     await message.answer(
@@ -45,7 +51,9 @@ async def start(message: Message):
     )
 
 
-# == Команда /users — только для админа ===============================
+# =======================
+#       /users  (admin)
+# =======================
 
 @router.message(Command("users"))
 async def cmd_users(message: Message):
@@ -54,19 +62,19 @@ async def cmd_users(message: Message):
     if not is_admin(username):
         return await message.answer("🚫 Только администратор может выполнять эту команду.")
 
-    from .memory import active_users
-
     if not active_users:
-        return await message.answer("Пока ещё никто не обращался к боту.")
+        return await message.answer("Пока никто не обращался к боту.")
 
     text = "📋 Список подключённых пользователей:\n\n"
-    for uid, uname in active_users:
-        text += f"• @{uname} (id: {uid})\n"
+    for uid, uname in active_users.items():
+        text += f"• @{uname} (ID: {uid})\n"
 
     await message.answer(text)
 
 
-# == Режимы ============================================================
+# =======================
+#       Режимы
+# =======================
 
 @router.message(Command("mode_default"))
 async def m_default(msg: Message):
@@ -92,7 +100,9 @@ async def m_symptoms(msg: Message):
     await msg.answer("Режим: Анализ симптомов 🔍")
 
 
-# == Анализ изображений ===============================================
+# =======================
+#     Анализ фото
+# =======================
 
 @router.message(F.photo)
 async def photo_handler(message: Message):
@@ -113,7 +123,9 @@ async def photo_handler(message: Message):
     await message.answer(result)
 
 
-# == Основная логика текста ============================================
+# =======================
+#        Текст
+# =======================
 
 @router.message(F.text)
 async def text_handler(message: Message):
