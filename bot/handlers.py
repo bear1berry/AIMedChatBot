@@ -198,4 +198,235 @@ async def cmd_profile(message: Message, state: FSMContext) -> None:
         "<code>роль, детализация, юрисдикция</code>\n\n"
         "Примеры:\n"
         "• <i>врач, подробно, РФ</i>\n"
-        "• <i>пациент, стандарт, GLOBAL<
+        "• <i>пациент, стандарт, GLOBAL</i>",
+    )
+
+
+@router.message(ProfileStates.waiting_profile)
+async def profile_set(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    parts = [p.strip() for p in (message.text or "").split(",")]
+    if len(parts) != 3:
+        await message.answer(
+            "Формат: <code>роль, детализация, юрисдикция</code>\n"
+            "Пример: <i>врач, подробно, РФ</i>"
+        )
+        return
+
+    role, detail, juris = parts
+    set_profile(user.id, user.username or "", role, detail, juris)
+    await state.clear()
+    await message.answer("✅ Профиль обновлён.")
+
+
+# ===== Кейсы / диалоги =====
+
+@router.message(Command("new"))
+async def cmd_new(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    create_conversation(user.id, "Новый случай")
+    await message.answer("📂 Начат новый кейс. Можешь описать ситуацию с самого начала.")
+
+
+@router.message(Command("cases"))
+async def cmd_cases(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    convs = list_conversations(user.id, limit=10)
+    if not convs:
+        await message.answer("Пока нет сохранённых кейсов. Используй /new, чтобы начать.")
+        return
+    lines = ["🧾 <b>Твои кейсы</b>:"]
+    for c in convs:
+        mark = "🟢" if c["is_active"] else "⚪️"
+        ts = c["created_at"][:16]
+        lines.append(f"{mark} <b>{c['title']}</b> ({ts})")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not settings.admin_username or user.username is None or user.username.lstrip("@") != settings.admin_username:
+        await message.answer("Команда доступна только админу.")
+        return
+    s = get_stats()
+    await message.answer(
+        f"📊 <b>Статистика</b>\n"
+        f"Пользователей: <b>{s['users']}</b>\n"
+        f"Сообщений: <b>{s['messages']}</b>"
+    )
+
+
+# ===== Симптом-чекер =====
+
+@router.message(Command("symptoms"))
+async def cmd_symptoms_start(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    if not user:
+        return
+    await state.set_state(SymptomStates.symptom)
+    await message.answer("🩺 Опиши главную жалобу (что беспокоит больше всего):")
+
+
+@router.message(SymptomStates.symptom)
+async def symptom_step_symptom(message: Message, state: FSMContext) -> None:
+    await state.update_data(symptom=message.text or "")
+    await state.set_state(SymptomStates.duration)
+    await message.answer("⏱ Как давно это началось?")
+
+
+@router.message(SymptomStates.duration)
+async def symptom_step_duration(message: Message, state: FSMContext) -> None:
+    await state.update_data(duration=message.text or "")
+    await state.set_state(SymptomStates.details)
+    await message.answer("➕ Есть ли ещё симптомы? Температура, слабость, сыпь и т.п.")
+
+
+@router.message(SymptomStates.details)
+async def symptom_step_details(message: Message, state: FSMContext) -> None:
+    await state.update_data(details=message.text or "")
+    await state.set_state(SymptomStates.red_flags)
+    await message.answer(
+        "🚨 Есть ли «красные флаги»:\n"
+        "• сильная боль\n"
+        "• затруднённое дыхание\n"
+        "• потеря сознания\n"
+        "• резкое ухудшение состояния\n\n"
+        "Если ничего из этого нет — напиши «нет»."
+    )
+
+
+@router.message(SymptomStates.red_flags)
+async def symptom_step_red_flags(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    await state.update_data(red_flags=message.text or "")
+    data = await state.get_data()
+    await state.clear()
+
+    text = (
+        "Симптом-чекер 👇\n\n"
+        f"Главная жалоба: {data.get('symptom')}\n"
+        f"Длительность: {data.get('duration')}\n"
+        f"Доп. симптомы: {data.get('details')}\n"
+        f"Красные флаги: {data.get('red_flags')}\n\n"
+        "На основе этих данных:\n"
+        "• определи вероятные причины;\n"
+        "• опиши, что настораживает;\n"
+        "• перечисли красные флаги и когда нужно срочно обращаться;\n"
+        "• предложи план действий и вопросы к врачу."
+    )
+
+    mode = "symptoms"
+    _set_user_mode(user.id, mode)
+    reply = await ask_ai(user.id, mode, text)
+    await message.answer(
+        reply,
+        reply_markup=answer_with_modes_keyboard(mode),
+    )
+
+
+# ===== Работа с изображениями =====
+
+@router.message(F.photo)
+async def photo_handler(message: Message, bot: Bot) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ запрещён.")
+        return
+
+    photo = message.photo[-1]
+    file = await bot.download(photo)
+    image_bytes = file.read()
+
+    await message.answer("📷 Получил изображение, анализирую...")
+    reply = await analyze_image(image_bytes, user_id=user.id)
+    save_message(user.id, "user", "[изображение]", "vision")
+    save_message(user.id, "assistant", reply, "vision")
+
+    await message.answer(
+        reply,
+        reply_markup=answer_with_modes_keyboard(_get_user_mode(user.id)),
+    )
+
+
+# ===== Обработка текстов =====
+
+@router.message(F.text)
+async def text_handler(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    if not _is_allowed(user.username):
+        await message.answer("🚫 Доступ запрещён.")
+        return
+
+    text = message.text or ""
+    current_mode = _get_user_mode(user.id)
+    detected_mode = detect_mode(text, current_mode=current_mode)
+    if detected_mode != current_mode:
+        _set_user_mode(user.id, detected_mode)
+        mode_note = f"🔁 Переключился в режим: <b>{MODES[detected_mode]['short_name']}</b>\n\n"
+    else:
+        mode_note = ""
+
+    await message.chat.do("typing")
+
+    reply = await ask_ai(user.id, detected_mode, text)
+    final = mode_note + reply
+
+    await message.answer(
+        final,
+        reply_markup=answer_with_modes_keyboard(detected_mode),
+    )
+
+
+# ===== Действия над ответом (простая реализация) =====
+
+@router.callback_query(F.data.startswith("act:"))
+async def cb_answer_action(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if not user or not callback.message:
+        await callback.answer()
+        return
+
+    original = callback.message.text or ""
+    action = callback.data.split(":", 1)[1]
+
+    if action == "summary":
+        prompt = (
+            "Сделай краткий конспект (3–5 пунктов) из следующего текста, чтобы быстро вспомнить суть:\n\n"
+            + original
+        )
+    elif action == "followup":
+        prompt = (
+            "Предложи список из 5–7 уточняющих вопросов, которые стоит задать врачу по следующему ответу:\n\n"
+            + original
+        )
+    elif action == "for_patient":
+        prompt = (
+            "Перепиши следующий текст простым языком для пациента, сохранив смысл и важные предостережения:\n\n"
+            + original
+        )
+    else:
+        await callback.answer()
+        return
+
+    reply = await ask_ai(user.id, _get_user_mode(user.id), prompt)
+    await callback.message.reply(reply)
+    await callback.answer("Готово ✅")
