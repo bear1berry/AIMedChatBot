@@ -1,8 +1,8 @@
 services:
   - type: worker
-    name: ai-med-chat-bot
+    name: aimedchatbot
     env: python
-    region: oregon
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m bot.main"
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
     autoDeploy: true
