@@ -9,7 +9,7 @@ from .memory import get_history, log_message
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_URL = url = "https://api.groq.com/v1/chat/completions"
 
 
 async def ask_ai(user_id: int, mode: str, user_message: str) -> str:
@@ -56,3 +56,4 @@ async def ask_ai(user_id: int, mode: str, user_message: str) -> str:
         reply[:200].replace("\n", " "),
     )
     return reply
+
