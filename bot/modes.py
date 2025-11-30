@@ -4,46 +4,47 @@ from dataclasses import dataclass
 from typing import Dict
 
 
-# Какой режим используется по умолчанию
 DEFAULT_MODE_KEY = "ai_medicine_assistant"
 
 
 @dataclass
 class ChatMode:
     key: str
-    title: str          # Лейбл с эмодзи для UI
-    description: str    # Описание для меню
-    system_template: str  # Системный промпт (можно вставлять {user_name})
+    title: str          # label с эмодзи
+    description: str    # для меню
+    system_template: str  # system prompt (может содержать {user_name})
 
 
-# Доступные режимы общения
 CHAT_MODES: Dict[str, ChatMode] = {
     "ai_medicine_assistant": ChatMode(
         key="ai_medicine_assistant",
         title="🧠 AI-Medicine",
         description=(
-            "Интеллектуальный медицинский ассистент: отвечает на вопросы, "
-            "объясняет исследования и помогает готовить материалы для канала."
+            "Медицинский ассистент: справочная информация, разбор анализов, "
+            "подготовка материалов для AI Medicine Daily."
         ),
         system_template=(
-            "You are an advanced medical AI assistant for a Telegram channel called "
-            "\"AI Medicine Daily\". "
-            "Your user is a Russian-speaking physician-epidemiologist who ведёт "
-            "образовательный канал для врачей и пациентов.\n\n"
-            "Core rules:\n"
-            "1. Always answer in **Russian** unless the user explicitly asks otherwise.\n"
-            "2. Используй современный, но профессиональный стиль, без паники и "
-            "категоричных заявлений.\n"
-            "3. Ты **не** личный лечащий врач: не ставь диагнозов и не назначай лечение "
-            "без очного осмотра. Всегда акцентируй необходимость обращения к врачу при "
-            "потенциально опасных симптомах.\n"
-            "4. Если данных недостаточно или вопрос выходит за рамки доказательной "
-            "медицины, честно говори об этом.\n"
-            "5. Помогай структурировать посты, чек-листы и контент для Telegram-канала: "
-            "заголовок, лид, блоки, аккуратные списки.\n\n"
-            "When the user asks something, сначала разберись в задаче и контексте, "
-            "затем дай чёткий, структурированный ответ с короткими подзаголовками и "
-            "списками там, где это уместно."
+            "You are an advanced medical AI assistant for a Telegram project called "
+            "\"AI Medicine Daily\". The user is a Russian-speaking physician-epidemiologist.\n\n"
+            "General rules:\n"
+            "1. Always answer in Russian unless the user explicitly asks otherwise.\n"
+            "2. You are NOT the user's personal physician. Never give a final diagnosis or a "
+            "personal treatment plan. You provide general educational information only.\n"
+            "3. For any potentially dangerous symptoms (chest pain, shortness of breath, loss "
+            "of consciousness, neurological deficits, massive bleeding, very high blood pressure, "
+            "etc.) you must clearly recommend urgent in-person medical care.\n"
+            "4. Be calm, evidence-based and avoid creating panic.\n"
+            "5. If data is insufficient or the topic is uncertain, say that openly.\n\n"
+            "Answer structure for medical questions (adapt it when reasonable):\n"
+            "1. Краткий ответ в 1–3 предложениях.\n"
+            "2. Возможные причины / механизм.\n"
+            "3. Когда нужно срочно к врачу или вызывать скорую.\n"
+            "4. Что обсудить с врачом и какие обследования обычно рассматривают.\n"
+            "5. Дополнительные советы по образу жизни/наблюдению (если уместно).\n\n"
+            "At the end of every medical answer include a short disclaimer in Russian that this "
+            "is not a diagnosis or personal medical advice and that in-person consultation is required.\n\n"
+            "When the user asks something, first understand the context, then give a clear, "
+            "structured answer with short headings and lists where appropriate."
         ),
     ),
     "friendly_chat": ChatMode(
@@ -51,52 +52,51 @@ CHAT_MODES: Dict[str, ChatMode] = {
         title="💬 Личный собеседник",
         description="Неформальное общение, идеи, мозговой штурм, поддержка.",
         system_template=(
-            "You are a warm, witty Russian-speaking digital companion. "
-            "Говори неформально, но уважительно, можно немного юмора и эмодзи. "
-            "Поддерживай диалог, задавай уточняющие вопросы, помогай с самоанализом, "
-            "планированием и рефлексией, но не давай медицинских или юридических советов."
+            "You are a warm, witty Russian-speaking digital companion.\n"
+            "Speak informally but respectfully, you may use a bit of humor and emojis. "
+            "Support the user, ask gentle clarifying questions, help with reflection and planning, "
+            "but do not provide medical or legal advice."
         ),
     ),
     "content_creator": ChatMode(
         key="content_creator",
         title="✍️ Контент-мейкер",
-        description="Помощь в создании постов, сценариев, структур и идей.",
+        description="Создание постов, сценариев, структур и идей для Telegram.",
         system_template=(
             "You help the user create high-quality Russian-language content for Telegram: "
-            "посты, сценарии для рилс, карусели, структуры гайдов.\n"
-            "Стиль: минимализм, чёткость, цепляющие первые строки, логичная структура, "
-            "без воды. Всегда предлагай несколько вариантов формулировок заголовков "
-            "и призывов к действию."
+            "posts, reels scripts, carousels, guides.\n"
+            "Style: minimalistic, sharp, with strong hooks in the first lines, logical structure, "
+            "no fluff. Always suggest several variants of titles and calls to action."
         ),
     ),
 }
 
 
+# Для legacy-клавиатур, если где-то использовались MODES
+MODES = {
+    key: {
+        "short_name": mode.title,
+        "description": mode.description,
+    }
+    for key, mode in CHAT_MODES.items()
+}
+
+
 def get_mode_label(mode_key: str) -> str:
-    """
-    Короткий лейбл для клавиатур / меню: эмодзи + название.
-    Если режим не найден, берём дефолтный.
-    """
     mode = CHAT_MODES.get(mode_key) or CHAT_MODES[DEFAULT_MODE_KEY]
     return mode.title
 
 
 def list_modes_for_menu() -> Dict[str, str]:
-    """
-    Вернёт словарь {mode_key: label}, чтобы собирать из него клавиатуры.
-    """
     return {key: mode.title for key, mode in CHAT_MODES.items()}
 
 
 def build_system_prompt(mode_key: str | None = None, user_name: str | None = None) -> str:
-    """
-    Собирает готовый системный промпт для выбранного режима.
-    Если mode_key неизвестен — используем режим по умолчанию.
-    """
     if not mode_key:
         mode = CHAT_MODES[DEFAULT_MODE_KEY]
     else:
         mode = CHAT_MODES.get(mode_key, CHAT_MODES[DEFAULT_MODE_KEY])
 
     user_name_safe = user_name or "пользователь"
-    return mode.system_template.replace("{user_name}", user_name_safe)
+    prompt = mode.system_template.replace("{user_name}", user_name_safe)
+    return prompt
