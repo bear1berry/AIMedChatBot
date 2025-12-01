@@ -17,7 +17,6 @@ logging.basicConfig(
 
 
 async def main() -> None:
-    # parse_mode = Markdown, потому что мы генерируем *жирный* и списки
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
