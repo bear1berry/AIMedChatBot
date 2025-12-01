@@ -1,20 +1,82 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from groq import Groq
 
-from .config import settings
+from .modes import build_system_prompt, DEFAULT_MODE_KEY
 from .limits import check_rate_limit
-from .memory import load_conversation_row, save_conversation_row
-from .modes import DEFAULT_MODE_KEY, build_system_prompt
 
 logger = logging.getLogger(__name__)
+
+# --- Model configuration ------------------------------------------------------------------------
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Основная универсальная модель (по умолчанию — GPT-OSS 120B на Groq)
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-oss-120b")
+
+# Быстрая и дешёвая модель для простых задач и саммари
+MODEL_FAST = os.getenv("MODEL_FAST", "llama-3.1-8b-instant")
+
+# Модель с усиленным reasoning (задачи, задачи по коду, сложный анализ)
+MODEL_REASONING = os.getenv("MODEL_REASONING", "deepseek-r1-distill-llama-70b")
+
+# Включать ли мультимодельный режим (несколько моделей для одного запроса)
+MULTI_MODEL_ENABLED = os.getenv("MULTI_MODEL_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+class RateLimitError(Exception):
+    """Выбрасывается при превышении лимита запросов для пользователя."""
+
+    def __init__(self, retry_after: Optional[int], message: Optional[str]) -> None:
+        self.retry_after = retry_after
+        self.message = message or "Превышен лимит запросов."
+        super().__init__(self.message)
+
+
+@dataclass
+class ConversationState:
+    mode_key: str = DEFAULT_MODE_KEY
+    messages: List[dict] = field(default_factory=list)
+
+
+_conversations: Dict[int, ConversationState] = {}
+
+
+def get_state(user_id: int) -> ConversationState:
+    state = _conversations.get(user_id)
+    if state is None:
+        state = ConversationState()
+        _conversations[user_id] = state
+    return state
+
+
+def reset_state(user_id: int) -> None:
+    state = get_state(user_id)
+    state.messages.clear()
+
+
+def set_mode(user_id: int, mode_key: str) -> ConversationState:
+    state = get_state(user_id)
+    state.mode_key = mode_key or DEFAULT_MODE_KEY
+    state.messages.clear()
+    return state
+
+
+# --- Текстовый пост-процессинг под Telegram (HTML) ----------------------------------------------
 
 
 def _postprocess_reply(text: str) -> str:
@@ -66,9 +128,12 @@ def _postprocess_reply(text: str) -> str:
     return text.strip()
 
 
+# --- Классификация запроса и выбор моделей ------------------------------------------------------
+
+
 def _classify_intent(text: str, mode_key: str) -> Optional[str]:
     """
-    Грубая классификация запроса, чтобы подмешивать шаблоны.
+    Грубая классификация запроса, чтобы подмешивать шаблоны / выбирать модели.
 
     Возможные значения:
         - 'workout'    — программа тренировки
@@ -147,208 +212,82 @@ def _classify_intent(text: str, mode_key: str) -> Optional[str]:
     return None
 
 
-@dataclass
-class ConversationState:
-    mode_key: str = DEFAULT_MODE_KEY
-    messages: List[dict] = field(default_factory=list)
-    last_question: Optional[str] = None
-    last_answer: Optional[str] = None
-    verbosity: str = "normal"  # short / normal / long
-    tone: str = "neutral"  # neutral / friendly / strict
-    format_pref: str = "auto"  # auto / more_lists / more_text
-
-
-class RateLimitError(Exception):
-    """Выбрасывается при превышении лимита запросов для пользователя."""
-
-    def __init__(self, retry_after: Optional[int], message: Optional[str]) -> None:
-        self.retry_after = retry_after
-        self.message = message or "Превышен лимит запросов."
-        super().__init__(self.message)
-
-
-_conversations: Dict[int, ConversationState] = {}
-
-_client = Groq(api_key=settings.groq_api_key) if settings.groq_api_key else None
-
-
-def _state_from_row(row: Dict[str, object]) -> ConversationState:
-    try:
-        history = json.loads(row.get("history_json") or "[]")  # type: ignore[arg-type]
-        if not isinstance(history, list):
-            history = []
-    except Exception:
-        history = []
-
-    return ConversationState(
-        mode_key=str(row.get("mode_key") or DEFAULT_MODE_KEY),
-        messages=history,
-        last_question=row.get("last_question"),  # type: ignore[arg-type]
-        last_answer=row.get("last_answer"),  # type: ignore[arg-type]
-        verbosity=str(row.get("verbosity") or "normal"),
-        tone=str(row.get("tone") or "neutral"),
-        format_pref=str(row.get("format_pref") or "auto"),
-    )
-
-
-def get_state(user_id: int) -> ConversationState:
-    state = _conversations.get(user_id)
-    if state is not None:
-        return state
-
-    row = load_conversation_row(user_id)
-    if row is None:
-        state = ConversationState()
-    else:
-        state = _state_from_row(row)
-
-    _conversations[user_id] = state
-    return state
-
-
-def _save_state(user_id: int, state: ConversationState) -> None:
-    save_conversation_row(
-        user_id=user_id,
-        mode_key=state.mode_key,
-        history=state.messages,
-        last_question=state.last_question,
-        last_answer=state.last_answer,
-        verbosity=state.verbosity,
-        tone=state.tone,
-        format_pref=state.format_pref,
-    )
-
-
-def set_mode(user_id: int, mode_key: str) -> ConversationState:
-    state = get_state(user_id)
-    state.mode_key = mode_key
-    state.messages.clear()
-    state.last_question = None
-    state.last_answer = None
-    _save_state(user_id, state)
-    return state
-
-
-def reset_state(user_id: int) -> None:
-    state = get_state(user_id)
-    state.messages.clear()
-    state.last_question = None
-    state.last_answer = None
-    _save_state(user_id, state)
-
-
-def update_preferences(
-    user_id: int,
-    verbosity: Optional[str] = None,
-    tone: Optional[str] = None,
-    format_pref: Optional[str] = None,
-) -> ConversationState:
-    state = get_state(user_id)
-
-    if verbosity in {"short", "normal", "long"}:
-        state.verbosity = verbosity
-    if tone in {"neutral", "friendly", "strict"}:
-        state.tone = tone
-    if format_pref in {"auto", "more_lists", "more_text"}:
-        state.format_pref = format_pref
-
-    _save_state(user_id, state)
-    return state
-
-
-def _personalize_system_prompt(
-    state: ConversationState,
-    user_name: Optional[str],
-    intent: Optional[str] = None,
-) -> str:
+def _is_reasoning_task(text: str) -> bool:
     """
-    Собирает финальный system prompt с учётом:
-    - режима,
-    - настроек пользователя (длина, тон, формат),
-    - типа задачи (контент, тренировка, план дня, чек-лист).
+    Очень грубое определение задач, где полезен reasoning-модель.
     """
-    base = build_system_prompt(mode_key=state.mode_key, user_name=user_name)
-    extras: List[str] = []
+    t = text.lower()
+    reasoning_markers = [
+        "реши задачу",
+        "математика",
+        "докажи",
+        "обоснуй",
+        "подробное объяснение",
+        "step by step",
+        "пошагово",
+        "кейс",
+        "разбор случая",
+        "анализируй",
+        "проанализируй",
+        "напиши код",
+        "ошибка в коде",
+    ]
+    if any(m in t for m in reasoning_markers):
+        return True
 
-    # Настройки формата
-    if state.verbosity == "short":
-        extras.append("Отвечай максимально кратко: 3–5 предложений или 5–7 пунктов списка.")
-    elif state.verbosity == "long":
-        extras.append("Давай развёрнутые ответы с примерами и подробными пояснениями.")
+    # длинный запрос с множеством знаков препинания — тоже кандидат
+    if len(t) > 600 and (t.count("?") + t.count(".") + t.count("!")) > 5:
+        return True
 
-    if state.tone == "friendly":
-        extras.append(
-            "Говори немного более дружелюбно и поддерживающе, можно немного эмодзи, но без фамильярности."
-        )
-    elif state.tone == "strict":
-        extras.append("Стиль более официальный и лаконичный, без юмора и эмодзи.")
-
-    if state.format_pref == "more_lists":
-        extras.append("По возможности используй структурированные списки и подзаголовки.")
-    elif state.format_pref == "more_text":
-        extras.append("Используй больше связного текста, а списки только при необходимости.")
-
-    # Инструкции под тип задачи
-    if intent == "content":
-        extras.append(
-            "Сейчас пользователь просит помочь с созданием или редактированием текста/контента. "
-            "Сконцентрируйся на структуре, читабельности и лаконичности, избегай лишней воды."
-        )
-    elif intent == "workout":
-        extras.append(
-            "Пользователь просит составить программу тренировки. "
-            "Оформи ответ в телеграм-формате с блоками:\n"
-            "• 💪 <b>Цель</b> — 2–3 предложения.\n"
-            "• 📌 <b>Общие рекомендации</b> — 3–7 пунктов.\n"
-            "• 🧱 <b>Структура тренировки</b> — по разделам: разминка, основная часть, заминка.\n"
-            "  В основной части каждая строка: '• Упражнение — подходы × повторы (комментарий)'.\n"
-            "• 🔁 <b>Прогрессия</b> — как увеличивать нагрузку.\n"
-            "• ⚠️ <b>Важно</b> — 2–4 пункта по безопасности и самочувствию.\n"
-            "Избегай markdown-таблиц, используй только списки."
-        )
-    elif intent == "daily_plan":
-        extras.append(
-            "Пользователь просит структурированный план/распорядок дня. "
-            "Оформи ответ блоками:\n"
-            "• 💡 <b>Кратко</b> — 2–3 предложения о цели дня.\n"
-            "• 🌅 <b>Утро</b> — список дел по порядку.\n"
-            "• 🌇 <b>День</b> — список ключевых блоков работы/учёбы/отдыха.\n"
-            "• 🌙 <b>Вечер</b> — завершение дня и восстановление.\n"
-            "• 📌 <b>Акценты</b> — 3–5 главных правил, которые важно не нарушать.\n"
-            "Каждый пункт делай коротким, одна мысль — одна строка."
-        )
-    elif intent == "checklist":
-        extras.append(
-            "Пользователь хочет чёткий чек-лист действий. "
-            "Сделай один блок <b>Чек-лист</b>, а внутри — пункты формата:\n"
-            "• '☐ Сформулировать цель.'\n"
-            "• '☐ Собрать документы.'\n"
-            "• '☐ Проверить результат.'\n"
-            "Каждый шаг — отдельная строка, максимум 10–15 шагов. "
-            "Формулируй в повелительном наклонении (что нужно сделать)."
-        )
-
-    if extras:
-        base += "\n\nДополнительные настройки формата и структуры ответа:\n- " + "\n- ".join(extras)
-
-    return base
+    return False
 
 
-async def _call_llm(
-    messages: List[dict],
-    model_name: Optional[str] = None,
-    *,
-    postprocess: bool = True,
-) -> str:
+def _select_models_for_query(text: str, mode_key: str) -> List[str]:
     """
-    Общий helper для вызова LLM.
-    postprocess=False используется там, где нам не нужны HTML-правки (например, при summary истории).
+    Возвращает список ID моделей, которые стоит задействовать для одного запроса.
     """
+    if not MULTI_MODEL_ENABLED:
+        return [MODEL_PRIMARY]
+
+    intent = _classify_intent(text, mode_key)
+    reasoning = _is_reasoning_task(text)
+    length = len(text)
+
+    # Сценарий 1: сложный анализ / задачи / код -> reasoning + основной ответ
+    if reasoning:
+        return [MODEL_REASONING, MODEL_PRIMARY]
+
+    # Сценарий 2: тренировки / план дня / чек-лист -> одна сильная универсальная модель
+    if intent in {"workout", "daily_plan", "checklist"}:
+        return [MODEL_PRIMARY]
+
+    # Сценарий 3: короткие бытовые вопросы -> быстрая модель
+    if length < 120:
+        return [MODEL_FAST]
+
+    # По умолчанию — одна основная модель
+    return [MODEL_PRIMARY]
+
+
+def _model_human_name(model_id: str) -> str:
+    """
+    Красивое имя модели для вывода в чат.
+    """
+    mapping = {
+        "openai/gpt-oss-120b": "GPT-OSS 120B",
+        "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
+        "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
+        "deepseek-r1-distill-llama-70b": "DeepSeek R1 Distill Llama 70B",
+    }
+    return mapping.get(model_id, model_id)
+
+
+# --- Вызов LLM -------------------------------------------------------------------------------
+
+
+async def _call_model(model_name: str, messages: List[dict]) -> str:
     if _client is None:
-        raise RuntimeError("Groq client is not configured (no API key).")
-
-    if model_name is None:
-        model_name = settings.groq_chat_model
+        raise RuntimeError("Groq client is not configured (GROQ_API_KEY is missing).")
 
     loop = asyncio.get_running_loop()
 
@@ -359,15 +298,11 @@ async def _call_llm(
             temperature=0.7,
             top_p=1,
             max_completion_tokens=2048,
-            reasoning_effort="medium",
         )
-        text = completion.choices[0].message.content or ""
-        return text
+        return completion.choices[0].message.content or ""
 
     raw = await loop.run_in_executor(None, _do_request)
-    if postprocess:
-        return _postprocess_reply(raw)
-    return raw
+    return _postprocess_reply(raw)
 
 
 def _trim_history(state: ConversationState, max_turns: int = 12) -> None:
@@ -378,51 +313,12 @@ def _trim_history(state: ConversationState, max_turns: int = 12) -> None:
         state.messages = state.messages[-max_turns * 2 :]
 
 
-async def _maybe_summarize_history(user_id: int, state: ConversationState) -> None:
-    """
-    Если история стала слишком длинной — сжимаем её в краткий конспект,
-    чтобы не терять контекст и не раздувать промпт.
-    """
-    max_turns_before_summary = 20
-    if len(state.messages) <= max_turns_before_summary * 2:
-        return
-
-    history_json = json.dumps(state.messages, ensure_ascii=False)
-    system_prompt = (
-        "Ты — ассистент, который кратко конспектирует историю диалога между пользователем и ИИ. "
-        "На вход ты получаешь JSON-список сообщений с полями role и content. "
-        "Нужно сделать краткое структурированное резюме на русском языке: "
-        "основные темы, важные решения, ключевые детали. Пиши с подзаголовками и списками."
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": history_json},
-    ]
-
-    try:
-        summary = await _call_llm(
-            messages,
-            model_name=settings.groq_chat_model_light,
-            postprocess=False,
-        )
-    except Exception:
-        logger.exception("Error while summarizing history")
-        return
-
-    state.messages = [
-        {
-            "role": "assistant",
-            "content": "Краткое резюме предыдущего диалога:\n\n" + summary.strip(),
-        }
-    ]
-    state.last_question = None
-    state.last_answer = None
-    _save_state(user_id, state)
+# --- Публичный API для хендлеров --------------------------------------------------------------
 
 
 async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> str:
     """
-    Основная точка входа для обычных сообщений пользователя.
+    Основная точка входа: один запрос пользователя -> один (или несколько) ответов моделей.
     """
     ok, retry_after, msg = check_rate_limit(user_id)
     if not ok:
@@ -430,162 +326,58 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
 
     state = get_state(user_id)
 
-    # При необходимости сжимаем историю
-    await _maybe_summarize_history(user_id, state)
+    # Собираем system-промпт с учётом режима
+    system_prompt = build_system_prompt(mode_key=state.mode_key, user_name=user_name)
 
-    intent = _classify_intent(text, state.mode_key)
-    system_prompt = _personalize_system_prompt(state, user_name, intent=intent)
-
+    # Общий контекст для всех моделей: system + история + новый запрос
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(state.messages)
     messages.append({"role": "user", "content": text})
 
+    models = _select_models_for_query(text, state.mode_key)
+
     try:
-        reply = await _call_llm(
-            messages,
-            model_name=settings.groq_chat_model,
-            postprocess=True,
-        )
+        if len(models) == 1:
+            reply = await _call_model(models[0], messages)
+        else:
+            # Параллельный вызов нескольких моделей
+            results = await asyncio.gather(
+                *[_call_model(m, messages) for m in models],
+                return_exceptions=True,
+            )
+
+            snippets: List[str] = []
+            for idx, (model_name, result) in enumerate(zip(models, results)):
+                if isinstance(result, Exception):
+                    logger.exception("Error from model %s", model_name)
+                    continue
+
+                header_emoji = "🤖" if idx == 0 else "🧠"
+                qualifier = "основной ответ" if idx == 0 else "альтернативный взгляд"
+                header = f"{header_emoji} <b>{_model_human_name(model_name)} — {qualifier}</b>"
+                snippets.append(header + "\n\n" + result.strip())
+
+            if not snippets:
+                raise RuntimeError("All model calls failed")
+
+            separator = "\n\n━━━━━━━━━━━━━━\n\n"
+            reply = separator.join(snippets)
+
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion")
         raise
 
+    # Обновляем историю диалога
     state.messages.append({"role": "user", "content": text})
     state.messages.append({"role": "assistant", "content": reply})
-    state.last_question = text
-    state.last_answer = reply
     _trim_history(state)
-    _save_state(user_id, state)
-
-    return reply
-
-
-async def continue_answer(user_id: int, user_name: Optional[str] = None) -> str:
-    """
-    Просит модель продолжить предыдущий ответ, не повторяя уже написанное.
-    """
-    state = get_state(user_id)
-    if not state.last_answer:
-        raise ValueError("Нет предыдущего ответа, который можно продолжить.")
-
-    ok, retry_after, msg = check_rate_limit(user_id)
-    if not ok:
-        raise RateLimitError(retry_after=retry_after, message=msg)
-
-    await _maybe_summarize_history(user_id, state)
-
-    system_prompt = _personalize_system_prompt(state, user_name, intent=None)
-    messages: List[dict] = [{"role": "system", "content": system_prompt}]
-    messages.extend(state.messages)
-    continuation_request = (
-        "Пожалуйста, продолжи свой предыдущий ответ, не повторяя уже написанное. "
-        "Начни с того места, где мысль оборвалась."
-    )
-    messages.append({"role": "user", "content": continuation_request})
-
-    try:
-        reply = await _call_llm(
-            messages,
-            model_name=settings.groq_chat_model,
-            postprocess=True,
-        )
-    except Exception:
-        logger.exception("Error while calling Groq ChatCompletion (continue_answer)")
-        raise
-
-    state.messages.append({"role": "user", "content": continuation_request})
-    state.messages.append({"role": "assistant", "content": reply})
-    state.last_answer = (state.last_answer or "") + "\n\n" + reply
-    state.last_question = continuation_request
-    _trim_history(state)
-    _save_state(user_id, state)
-
-    return reply
-
-
-async def transform_last_answer(
-    user_id: int,
-    user_name: Optional[str],
-    kind: str,
-) -> str:
-    """
-    kind:
-        - 'summary'  -> краткий конспект
-        - 'post'     -> пост для Telegram-канала
-        - 'patient'  -> проще для пациента
-        - 'case'     -> структурированный клинический случай
-    """
-    state = get_state(user_id)
-    if not state.last_answer:
-        raise ValueError(
-            "Пока нечего обрабатывать — сначала задай вопрос и получи ответ."
-        )
-
-    ok, retry_after, msg = check_rate_limit(user_id)
-    if not ok:
-        raise RateLimitError(retry_after=retry_after, message=msg)
-
-    await _maybe_summarize_history(user_id, state)
-
-    system_prompt = _personalize_system_prompt(state, user_name, intent=None)
-    messages: List[dict] = [{"role": "system", "content": system_prompt}]
-    messages.extend(state.messages)
-
-    if kind == "summary":
-        instr = (
-            "Сделай структурированный конспект моего предыдущего ответа. "
-            "Кратко, по пунктам, с чёткими подзаголовками."
-        )
-    elif kind == "post":
-        instr = (
-            "На основе моего предыдущего ответа сделай готовый пост для Telegram-канала "
-            "\"AI Medicine Daily\":\n"
-            "- мощный цепляющий заголовок,\n"
-            "- 3–6 абзацев основного текста,\n"
-            "- аккуратный призыв к действию,\n"
-            "- 3–7 уместных хештегов."
-        )
-    elif kind == "patient":
-        instr = (
-            "Объясни содержание моего предыдущего ответа максимально понятным языком для пациента, "
-            "без сложной терминологии. Стиль спокойный и поддерживающий."
-        )
-    elif kind == "case":
-        instr = (
-            "Сделай структурированное описание клинического случая на основе моего предыдущего ответа. "
-            "Структура: Жалобы; Анамнез; Объективные данные (если есть); "
-            "Результаты обследований; Возможные диагностические гипотезы; "
-            "Рекомендации по дальнейшему обследованию. Пиши чётко и по делу."
-        )
-    else:
-        raise ValueError(f"Unknown transform kind: {kind}")
-
-    user_msg = f"Вот предыдущий ответ ассистента:\n\n{state.last_answer}\n\n{instr}"
-    messages.append({"role": "user", "content": user_msg})
-
-    try:
-        reply = await _call_llm(
-            messages,
-            model_name=settings.groq_chat_model_light,
-            postprocess=True,
-        )
-    except Exception:
-        logger.exception("Error while calling Groq ChatCompletion (transform_last_answer)")
-        raise
-
-    state.messages.append({"role": "user", "content": instr})
-    state.messages.append({"role": "assistant", "content": reply})
-    state.last_question = instr
-    state.last_answer = reply
-    _trim_history(state)
-    _save_state(user_id, state)
 
     return reply
 
 
 async def healthcheck_llm() -> bool:
     """
-    Лёгкий ping модели.
+    Лёгкий ping модели по основной конфигурации.
     """
     if _client is None:
         return False
@@ -595,7 +387,7 @@ async def healthcheck_llm() -> bool:
 
         def _do() -> bool:
             _client.chat.completions.create(
-                model=settings.groq_chat_model,
+                model=MODEL_PRIMARY,
                 messages=[{"role": "user", "content": "ping"}],
                 max_completion_tokens=1,
                 temperature=0.0,
