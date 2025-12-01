@@ -21,10 +21,10 @@ async def main() -> None:
     if not settings.bot_token:
         raise RuntimeError("BOT_TOKEN is not set in environment variables")
 
-    # ✅ Новый способ указать parse_mode в aiogram 3.13
+    # ✅ Работаем в HTML-режиме — под него настроена постобработка и промпты
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
     dp = Dispatcher()
