@@ -4,89 +4,62 @@ import time
 from typing import Optional, Tuple
 
 from .config import settings
-from .memory import _get_conn  # внутренний коннектор к БД
+
+# Простое in-memory хранилище лимитов:
+# user_id -> {minute_ts, minute_count, day_ts, day_count}
+_RATE_STATE: dict[int, dict[str, int]] = {}
 
 
 def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
     """
-    Лимиты для пользователя на SQLite:
+    Проверка лимитов:
     - N запросов в минуту
     - M запросов в сутки
 
     Возвращает:
-        ok: bool
-        retry_after: секунды до следующей попытки (если заблокирован)
-        message: человекочитаемое сообщение (если заблокирован)
+        (ok, retry_after, message)
     """
     now = int(time.time())
-    conn = _get_conn()
-    cur = conn.cursor()
+    minute = now // 60
+    day = now // (24 * 60 * 60)
 
-    scopes = [
-        ("minute", 60, settings.rate_limit_per_minute),
-        ("day", 24 * 60 * 60, settings.rate_limit_per_day),
-    ]
+    bucket = _RATE_STATE.get(user_id)
+    if bucket is None:
+        bucket = {
+            "minute_ts": minute,
+            "minute_count": 0,
+            "day_ts": day,
+            "day_count": 0,
+        }
+        _RATE_STATE[user_id] = bucket
 
-    blocked_retry: Optional[int] = None
-    blocked_msg: Optional[str] = None
+    # Сбрасываем окна при смене минуты/дня
+    if bucket["minute_ts"] != minute:
+        bucket["minute_ts"] = minute
+        bucket["minute_count"] = 0
+    if bucket["day_ts"] != day:
+        bucket["day_ts"] = day
+        bucket["day_count"] = 0
 
-    for scope, window_size, limit in scopes:
-        if limit <= 0:
-            continue
-
-        window_start = now - (now % window_size)
-
-        cur.execute(
-            "SELECT window_start, count FROM rate_limits WHERE user_id = ? AND scope = ?",
-            (user_id, scope),
+    # Проверка минутного лимита
+    if bucket["minute_count"] >= settings.rate_limit_per_minute:
+        retry = (bucket["minute_ts"] + 1) * 60 - now
+        msg = (
+            "⏳ Лимит запросов в минуту превышен.\n"
+            "Попробуй отправить сообщение чуть позже."
         )
-        row = cur.fetchone()
+        return False, retry, msg
 
-        if row is None:
-            cur.execute(
-                "INSERT INTO rate_limits (user_id, scope, window_start, count) VALUES (?, ?, ?, ?)",
-                (user_id, scope, window_start, 0),
-            )
-            current_start = window_start
-            current_count = 0
-        else:
-            current_start, current_count = int(row["window_start"]), int(row["count"])
-            if current_start != window_start:
-                current_start = window_start
-                current_count = 0
-                cur.execute(
-                    "UPDATE rate_limits SET window_start = ?, count = ? WHERE user_id = ? AND scope = ?",
-                    (current_start, current_count, user_id, scope),
-                )
-
-        if current_count >= limit:
-            retry = current_start + window_size - now
-            if blocked_retry is None or retry > blocked_retry:
-                blocked_retry = max(retry, 1)
-                if scope == "minute":
-                    blocked_msg = (
-                        "⏳ Ты отправляешь слишком много запросов за короткое время. "
-                        "Попробуй ещё раз через несколько секунд."
-                    )
-                else:
-                    blocked_msg = (
-                        "🚦 Достигнут дневной лимит запросов для этого бота. "
-                        "Лимит обновится завтра."
-                    )
-
-    if blocked_retry is not None:
-        cur.close()
-        return False, blocked_retry, blocked_msg
-
-    # не заблокирован — инкремент счётчиков
-    for scope, _, limit in scopes:
-        if limit <= 0:
-            continue
-        cur.execute(
-            "UPDATE rate_limits SET count = count + 1 WHERE user_id = ? AND scope = ?",
-            (user_id, scope),
+    # Проверка дневного лимита
+    if bucket["day_count"] >= settings.rate_limit_per_day:
+        retry = (bucket["day_ts"] + 1) * 24 * 60 * 60 - now
+        msg = (
+            "🚫 Достигнут дневной лимит запросов для этого бота.\n"
+            "Лимит обновится завтра."
         )
+        return False, retry, msg
 
-    conn.commit()
-    cur.close()
+    # Учитываем запрос
+    bucket["minute_count"] += 1
+    bucket["day_count"] += 1
     return True, None, None
