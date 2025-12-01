@@ -7,39 +7,37 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from groq import Groq
+import httpx
 
 from .modes import build_system_prompt, DEFAULT_MODE_KEY
 from .limits import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
-# --- Model configuration ------------------------------------------------------------------------
+# --- AIMLAPI CONFIG ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+AIML_API_KEY = os.getenv("AIML_API_KEY", "").strip()
+AIML_API_BASE = os.getenv("AIML_API_BASE", "https://api.aimlapi.com/v1").rstrip("/")
 
-# Основная универсальная модель (по умолчанию — GPT-OSS 120B на Groq)
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-oss-120b")
-
-# Быстрая и дешёвая модель для простых задач и саммари
-MODEL_FAST = os.getenv("MODEL_FAST", "llama-3.1-8b-instant")
-
-# Модель с усиленным reasoning (задачи, задачи по коду, сложный анализ)
-MODEL_REASONING = os.getenv("MODEL_REASONING", "deepseek-r1-distill-llama-70b")
-
-# Включать ли мультимодельный режим (несколько моделей для одного запроса)
-MULTI_MODEL_ENABLED = os.getenv("MULTI_MODEL_ENABLED", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# Базовые модели (можно переопределить через переменные окружения)
+AIML_MODEL_PRIMARY = os.getenv("AIML_MODEL_PRIMARY", "openai/gpt-4.1-2025-04-14")
+AIML_MODEL_FAST = os.getenv("AIML_MODEL_FAST", "openai/gpt-4.1-mini-2025-04-14")
+AIML_MODEL_REASONING = os.getenv(
+    "AIML_MODEL_REASONING",
+    "deepseek/deepseek-reasoner",
+)
+AIML_MODEL_GPT_OSS_120B = os.getenv(
+    "AIML_MODEL_GPT_OSS_120B",
+    "openai/gpt-oss-120b",
+)
+AIML_MODEL_DEEPSEEK_CHAT = os.getenv(
+    "AIML_MODEL_DEEPSEEK_CHAT",
+    "deepseek/deepseek-chat-v3.1",
+)
 
 
 class RateLimitError(Exception):
-    """Выбрасывается при превышении лимита запросов для пользователя."""
+    """Ошибка превышения лимита запросов для пользователя."""
 
     def __init__(self, retry_after: Optional[int], message: Optional[str]) -> None:
         self.retry_after = retry_after
@@ -51,6 +49,8 @@ class RateLimitError(Exception):
 class ConversationState:
     mode_key: str = DEFAULT_MODE_KEY
     messages: List[dict] = field(default_factory=list)
+    # "auto" – автоматический выбор модели; остальные – режимы «чисто одна модель»
+    model_profile: str = "auto"
 
 
 _conversations: Dict[int, ConversationState] = {}
@@ -76,7 +76,43 @@ def set_mode(user_id: int, mode_key: str) -> ConversationState:
     return state
 
 
-# --- Текстовый пост-процессинг под Telegram (HTML) ----------------------------------------------
+# --- Профили выбора модели (режим «чисто одна модель») ----------------------------------------
+
+_MODEL_PROFILE_LABELS: Dict[str, str] = {
+    "auto": "Авто (выбор под задачу)",
+    "gpt4.1": "GPT-4.1 (AIMLAPI)",
+    "gpt4.1mini": "GPT-4.1 Mini (AIMLAPI)",
+    "gpt_oss_120b": "GPT-OSS 120B (AIMLAPI)",
+    "deepseek_reasoner": "DeepSeek Reasoner (AIMLAPI)",
+    "deepseek_chat": "DeepSeek Chat (AIMLAPI)",
+}
+
+
+def set_model_profile(user_id: int, profile: str) -> ConversationState:
+    """
+    Режимы:
+        - "auto"
+        - "gpt4.1"
+        - "gpt4.1mini"
+        - "gpt_oss_120b"
+        - "deepseek_reasoner"
+        - "deepseek_chat"
+    """
+    if profile not in _MODEL_PROFILE_LABELS:
+        profile = "auto"
+
+    state = get_state(user_id)
+    state.model_profile = profile
+    # при смене модели — начинаем диалог с чистого листа
+    state.messages.clear()
+    return state
+
+
+def get_model_profile_label(profile: str) -> str:
+    return _MODEL_PROFILE_LABELS.get(profile, _MODEL_PROFILE_LABELS["auto"])
+
+
+# --- Текстовый пост-процессинг под Telegram (HTML) ---------------------------------------------
 
 
 def _postprocess_reply(text: str) -> str:
@@ -88,8 +124,6 @@ def _postprocess_reply(text: str) -> str:
     - убираем разделители таблиц типа |----|----|;
     - строки таблиц '| кол1 | кол2 |' превращаем в буллеты;
     - схлопываем >2 подряд пустые строки.
-
-    HTML-теги (<b>, <i>, <u>, <a> и т.п.), которые вернула модель, не трогаем.
     """
     if not text:
         return text
@@ -107,7 +141,12 @@ def _postprocess_reply(text: str) -> str:
     text = re.sub(r"^\s*#{2,6}\s+(.+)$", _heading_repl, text, flags=re.M)
 
     # 3) строки-разделители markdown-таблиц типа |----|----|
-    text = re.sub(r"^\s*\|?\s*-{2,}\s*(\|-*)?\s*$", "", text, flags=re.M)
+    text = re.sub(
+        r"^\s*\|?\s*-{2,}\s*(\|-*)?\s*$",
+        "",
+        text,
+        flags=re.M,
+    )
 
     # 4) строки таблиц '| ячейка1 | ячейка2 |' -> буллеты
     def _table_line_repl(match: re.Match) -> str:
@@ -133,14 +172,7 @@ def _postprocess_reply(text: str) -> str:
 
 def _classify_intent(text: str, mode_key: str) -> Optional[str]:
     """
-    Грубая классификация запроса, чтобы подмешивать шаблоны / выбирать модели.
-
-    Возможные значения:
-        - 'workout'    — программа тренировки
-        - 'daily_plan' — план / распорядок дня
-        - 'checklist'  — чек-лист / алгоритм шагов
-        - 'content'    — работа с текстом / постами
-        - None         — обычный ответ
+    Грубая классификация запроса, чтобы выбирать модель/шаблон.
     """
     t = text.lower()
 
@@ -158,9 +190,8 @@ def _classify_intent(text: str, mode_key: str) -> Optional[str]:
         "тренажерный зал",
         "тренажёрный зал",
     ]
-    for m in workout_markers:
-        if m in t:
-            return "workout"
+    if any(m in t for m in workout_markers):
+        return "workout"
 
     daily_plan_markers = [
         "план на день",
@@ -173,9 +204,8 @@ def _classify_intent(text: str, mode_key: str) -> Optional[str]:
         "лист дел на день",
         "список дел на день",
     ]
-    for m in daily_plan_markers:
-        if m in t:
-            return "daily_plan"
+    if any(m in t for m in daily_plan_markers):
+        return "daily_plan"
 
     checklist_markers = [
         "чек-лист",
@@ -188,9 +218,8 @@ def _classify_intent(text: str, mode_key: str) -> Optional[str]:
         "что делать по шагам",
         "пошаговая инструкция",
     ]
-    for m in checklist_markers:
-        if m in t:
-            return "checklist"
+    if any(m in t for m in checklist_markers):
+        return "checklist"
 
     content_markers = [
         "сделай пост",
@@ -205,16 +234,15 @@ def _classify_intent(text: str, mode_key: str) -> Optional[str]:
         "придумай заголовок",
         "сделай заголовок",
     ]
-    for m in content_markers:
-        if m in t:
-            return "content"
+    if any(m in t for m in content_markers):
+        return "content"
 
     return None
 
 
 def _is_reasoning_task(text: str) -> bool:
     """
-    Очень грубое определение задач, где полезен reasoning-модель.
+    Очень грубое определение задач, где полезна reasoning-модель.
     """
     t = text.lower()
     reasoning_markers = [
@@ -242,31 +270,44 @@ def _is_reasoning_task(text: str) -> bool:
     return False
 
 
-def _select_models_for_query(text: str, mode_key: str) -> List[str]:
+def _select_models_for_query(text: str, state: ConversationState) -> List[str]:
     """
-    Возвращает список ID моделей, которые стоит задействовать для одного запроса.
+    Возвращает список ID моделей AIMLAPI, которые стоит задействовать для одного запроса.
+    Учитывает выбранный пользователем профиль (model_profile).
     """
-    if not MULTI_MODEL_ENABLED:
-        return [MODEL_PRIMARY]
+    profile = state.model_profile
 
-    intent = _classify_intent(text, mode_key)
+    # Режимы «чисто одна модель»
+    if profile == "gpt4.1":
+        return [AIML_MODEL_PRIMARY]
+    if profile == "gpt4.1mini":
+        return [AIML_MODEL_FAST]
+    if profile == "gpt_oss_120b":
+        return [AIML_MODEL_GPT_OSS_120B]
+    if profile == "deepseek_reasoner":
+        return [AIML_MODEL_REASONING]
+    if profile == "deepseek_chat":
+        return [AIML_MODEL_DEEPSEEK_CHAT]
+
+    # Авто-режим
+    intent = _classify_intent(text, state.mode_key)
     reasoning = _is_reasoning_task(text)
     length = len(text)
 
-    # Сценарий 1: сложный анализ / задачи / код -> reasoning + основной ответ
+    # Сложные задачи / код — reasoning + основной ответ
     if reasoning:
-        return [MODEL_REASONING, MODEL_PRIMARY]
+        return [AIML_MODEL_REASONING, AIML_MODEL_PRIMARY]
 
-    # Сценарий 2: тренировки / план дня / чек-лист -> одна сильная универсальная модель
+    # Планы, чек-листы
     if intent in {"workout", "daily_plan", "checklist"}:
-        return [MODEL_PRIMARY]
+        return [AIML_MODEL_PRIMARY]
 
-    # Сценарий 3: короткие бытовые вопросы -> быстрая модель
+    # Короткие бытовые вопросы
     if length < 120:
-        return [MODEL_FAST]
+        return [AIML_MODEL_FAST]
 
     # По умолчанию — одна основная модель
-    return [MODEL_PRIMARY]
+    return [AIML_MODEL_PRIMARY]
 
 
 def _model_human_name(model_id: str) -> str:
@@ -274,35 +315,52 @@ def _model_human_name(model_id: str) -> str:
     Красивое имя модели для вывода в чат.
     """
     mapping = {
-        "openai/gpt-oss-120b": "GPT-OSS 120B",
-        "llama-3.1-8b-instant": "Llama 3.1 8B Instant",
-        "llama-3.3-70b-versatile": "Llama 3.3 70B Versatile",
-        "deepseek-r1-distill-llama-70b": "DeepSeek R1 Distill Llama 70B",
+        AIML_MODEL_PRIMARY: "GPT-4.1 (AIMLAPI)",
+        AIML_MODEL_FAST: "GPT-4.1 Mini (AIMLAPI)",
+        AIML_MODEL_REASONING: "DeepSeek Reasoner (AIMLAPI)",
+        AIML_MODEL_GPT_OSS_120B: "GPT-OSS 120B (AIMLAPI)",
+        AIML_MODEL_DEEPSEEK_CHAT: "DeepSeek Chat (AIMLAPI)",
+        "deepseek/deepseek-r1": "DeepSeek Reasoner (AIMLAPI)",
+        "deepseek/deepseek-chat": "DeepSeek Chat (AIMLAPI)",
+        "openai/gpt-4.1-2025-04-14": "GPT-4.1 (AIMLAPI)",
+        "openai/gpt-4.1-mini-2025-04-14": "GPT-4.1 Mini (AIMLAPI)",
+        "openai/gpt-oss-120b": "GPT-OSS 120B (AIMLAPI)",
     }
     return mapping.get(model_id, model_id)
 
 
-# --- Вызов LLM -------------------------------------------------------------------------------
+# --- Вызов AIMLAPI ----------------------------------------------------------------------------
 
 
 async def _call_model(model_name: str, messages: List[dict]) -> str:
-    if _client is None:
-        raise RuntimeError("Groq client is not configured (GROQ_API_KEY is missing).")
+    """
+    Общий вызов AIMLAPI /v1/chat/completions (OpenAI-совместимый).
+    """
+    if not AIML_API_KEY:
+        raise RuntimeError("AIML_API_KEY не установлен в переменных окружения.")
 
-    loop = asyncio.get_running_loop()
+    url = f"{AIML_API_BASE}/chat/completions"
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 2048,
+    }
+    headers = {
+        "Authorization": f"Bearer {AIML_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    def _do_request() -> str:
-        completion = _client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=0.7,
-            top_p=1,
-            max_completion_tokens=2048,
-        )
-        return completion.choices[0].message.content or ""
-
-    raw = await loop.run_in_executor(None, _do_request)
-    return _postprocess_reply(raw)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Неверный формат ответа AIMLAPI: {data!r}")
+    return _postprocess_reply(content or "")
 
 
 def _trim_history(state: ConversationState, max_turns: int = 12) -> None:
@@ -334,7 +392,7 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
     messages.extend(state.messages)
     messages.append({"role": "user", "content": text})
 
-    models = _select_models_for_query(text, state.mode_key)
+    models = _select_models_for_query(text, state)
 
     try:
         if len(models) == 1:
@@ -355,16 +413,16 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
                 header_emoji = "🤖" if idx == 0 else "🧠"
                 qualifier = "основной ответ" if idx == 0 else "альтернативный взгляд"
                 header = f"{header_emoji} <b>{_model_human_name(model_name)} — {qualifier}</b>"
-                snippets.append(header + "\n\n" + result.strip())
+                snippets.append(header + "\n\n" + str(result).strip())
 
             if not snippets:
-                raise RuntimeError("All model calls failed")
+                raise RuntimeError("Все вызовы моделей завершились ошибкой.")
 
             separator = "\n\n━━━━━━━━━━━━━━\n\n"
             reply = separator.join(snippets)
 
     except Exception:
-        logger.exception("Error while calling Groq ChatCompletion")
+        logger.exception("Error while calling AIMLAPI ChatCompletion")
         raise
 
     # Обновляем историю диалога
@@ -379,22 +437,26 @@ async def healthcheck_llm() -> bool:
     """
     Лёгкий ping модели по основной конфигурации.
     """
-    if _client is None:
+    if not AIML_API_KEY:
         return False
 
+    url = f"{AIML_API_BASE}/chat/completions"
+    payload = {
+        "model": AIML_MODEL_FAST or AIML_MODEL_PRIMARY,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }
+    headers = {
+        "Authorization": f"Bearer {AIML_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        loop = asyncio.get_running_loop()
-
-        def _do() -> bool:
-            _client.chat.completions.create(
-                model=MODEL_PRIMARY,
-                messages=[{"role": "user", "content": "ping"}],
-                max_completion_tokens=1,
-                temperature=0.0,
-            )
-            return True
-
-        return await loop.run_in_executor(None, _do)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return True
     except Exception:
         logger.exception("LLM healthcheck failed")
         return False
