@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -15,10 +16,135 @@ from .modes import DEFAULT_MODE_KEY, build_system_prompt
 
 logger = logging.getLogger(__name__)
 
-if not settings.groq_api_key:
-    logger.warning("GROQ_API_KEY is not set. LLM calls will fail.")
 
-_client = Groq(api_key=settings.groq_api_key) if settings.groq_api_key else None
+def _postprocess_reply(text: str) -> str:
+    """
+    Лёгкая чистка ответа под Telegram (HTML parse_mode):
+
+    - убираем ```code fences```;
+    - превращаем markdown-заголовки ##, ### в <b>...</b>;
+    - убираем разделители таблиц типа |----|----|;
+    - строки таблиц '| кол1 | кол2 |' превращаем в буллеты;
+    - схлопываем >2 подряд пустые строки.
+
+    HTML-теги (<b>, <i>, <u>, <a> и т.п.), которые вернула модель, не трогаем.
+    """
+    if not text:
+        return text
+
+    # 1) убрать ```code fences``` целиком
+    text = re.sub(r"```.+?```", "", text, flags=re.S)
+
+    # 2) заголовки вида "## Заголовок" -> пустая строка + <b>Заголовок</b>
+    def _heading_repl(match: re.Match) -> str:
+        title = match.group(1).strip()
+        if not title:
+            return ""
+        return f"\n<b>{title}</b>\n"
+
+    text = re.sub(r"^\s*#{2,6}\s+(.+)$", _heading_repl, text, flags=re.M)
+
+    # 3) строки-разделители markdown-таблиц типа |----|----|
+    text = re.sub(r"^\s*\|?\s*-{2,}\s*(\|-*)?\s*$", "", text, flags=re.M)
+
+    # 4) строки таблиц '| ячейка1 | ячейка2 |' -> буллеты
+    def _table_line_repl(match: re.Match) -> str:
+        row = match.group(0).strip()
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        cells = [c for c in cells if c]
+        if not cells:
+            return ""
+        head, *rest = cells
+        tail = (" — " + ", ".join(rest)) if rest else ""
+        return f"• <b>{head}</b>{tail}\n"
+
+    text = re.sub(r"^\s*\|.*\|\s*$", _table_line_repl, text, flags=re.M)
+
+    # 5) убираем тройные и более пустые строки
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def _classify_intent(text: str, mode_key: str) -> Optional[str]:
+    """
+    Грубая классификация запроса, чтобы подмешивать шаблоны.
+
+    Возможные значения:
+        - 'workout'    — программа тренировки
+        - 'daily_plan' — план / распорядок дня
+        - 'checklist'  — чек-лист / алгоритм шагов
+        - 'content'    — работа с текстом / постами
+        - None         — обычный ответ
+    """
+    t = text.lower()
+
+    workout_markers = [
+        "тренировка",
+        "тренировочный план",
+        "план тренировки",
+        "программу тренировок",
+        "программа тренировок",
+        "сплит",
+        "upper lower",
+        "верх/низ",
+        "зал",
+        "спортзал",
+        "тренажерный зал",
+        "тренажёрный зал",
+    ]
+    for m in workout_markers:
+        if m in t:
+            return "workout"
+
+    daily_plan_markers = [
+        "план на день",
+        "распорядок дня",
+        "расписание на день",
+        "режим дня",
+        "структура дня",
+        "как распределить день",
+        "to-do на день",
+        "лист дел на день",
+        "список дел на день",
+    ]
+    for m in daily_plan_markers:
+        if m in t:
+            return "daily_plan"
+
+    checklist_markers = [
+        "чек-лист",
+        "чек лист",
+        "чеклист",
+        "список шагов",
+        "по шагам",
+        "пошаговый план",
+        "алгоритм действий",
+        "что делать по шагам",
+        "пошаговая инструкция",
+    ]
+    for m in checklist_markers:
+        if m in t:
+            return "checklist"
+
+    content_markers = [
+        "сделай пост",
+        "подготовь пост",
+        "сделай текст",
+        "перепиши текст",
+        "перепиши это",
+        "оформи пост",
+        "описание для канала",
+        "описание профиля",
+        "придумай название",
+        "придумай заголовок",
+        "сделай заголовок",
+    ]
+    for m in content_markers:
+        if m in t:
+            return "content"
+
+    return None
 
 
 @dataclass
@@ -27,12 +153,9 @@ class ConversationState:
     messages: List[dict] = field(default_factory=list)
     last_question: Optional[str] = None
     last_answer: Optional[str] = None
-    verbosity: str = "normal"   # short / normal / long
-    tone: str = "neutral"       # neutral / friendly / strict
-    format_pref: str = "auto"   # auto / more_lists / more_text
-
-
-_conversations: Dict[int, ConversationState] = {}
+    verbosity: str = "normal"  # short / normal / long
+    tone: str = "neutral"  # neutral / friendly / strict
+    format_pref: str = "auto"  # auto / more_lists / more_text
 
 
 class RateLimitError(Exception):
@@ -44,74 +167,9 @@ class RateLimitError(Exception):
         super().__init__(self.message)
 
 
-def _classify_intent(text: str, mode_key: str) -> Optional[str]:
-    """
-    Примитивная классификация намерения пользователя для подстройки промпта.
+_conversations: Dict[int, ConversationState] = {}
 
-    Возвращает:
-        - 'content' — работа с текстом/контентом
-        - None — обычный диалог
-    """
-    t = text.lower()
-    # Явные признаки работы с текстом
-    content_markers = [
-        "сделай пост",
-        "подготовь пост",
-        "сделай текст",
-        "перепиши текст",
-        "перепиши это",
-        "сделай описание",
-        "сделай заголовок",
-        "придумай заголовок",
-        "придумай название",
-        "оформи пост",
-        "для телеграм канала",
-        "для telegram канала",
-        "для tg канала",
-    ]
-    for m in content_markers:
-        if m in t:
-            return "content"
-
-    return None
-
-
-def _personalize_system_prompt(
-    state: ConversationState,
-    user_name: Optional[str],
-    intent: Optional[str] = None,
-) -> str:
-    base = build_system_prompt(mode_key=state.mode_key, user_name=user_name)
-    extras: List[str] = []
-
-    if state.verbosity == "short":
-        extras.append("Отвечай максимально кратко: 3–5 предложений или 5–7 пунктов списка.")
-    elif state.verbosity == "long":
-        extras.append("Давай развёрнутые ответы с примерами и подробными пояснениями.")
-
-    if state.tone == "friendly":
-        extras.append(
-            "Говори немного более дружелюбно и поддерживающе, можно немного эмодзи, но без фамильярности."
-        )
-    elif state.tone == "strict":
-        extras.append("Стиль более официальный и лаконичный, без юмора и эмодзи.")
-
-    if state.format_pref == "more_lists":
-        extras.append("По возможности используй структурированные списки и подзаголовки.")
-    elif state.format_pref == "more_text":
-        extras.append("Используй больше связного текста, а списки только при необходимости.")
-
-    # Дополнительные подсказки под задачу
-    if intent == "content":
-        extras.append(
-            "Сейчас пользователь просит помочь с созданием или редактированием текста/контента. "
-            "Сконцентрируйся на структуре, формулировках и читабельности результата."
-        )
-
-    if extras:
-        base += "\n\nДополнительные настройки формата ответа:\n- " + "\n- ".join(extras)
-
-    return base
+_client = Groq(api_key=settings.groq_api_key) if settings.groq_api_key else None
 
 
 def _state_from_row(row: Dict[str, object]) -> ConversationState:
@@ -126,7 +184,7 @@ def _state_from_row(row: Dict[str, object]) -> ConversationState:
         mode_key=str(row.get("mode_key") or DEFAULT_MODE_KEY),
         messages=history,
         last_question=row.get("last_question"),  # type: ignore[arg-type]
-        last_answer=row.get("last_answer"),      # type: ignore[arg-type]
+        last_answer=row.get("last_answer"),  # type: ignore[arg-type]
         verbosity=str(row.get("verbosity") or "normal"),
         tone=str(row.get("tone") or "neutral"),
         format_pref=str(row.get("format_pref") or "auto"),
@@ -198,7 +256,94 @@ def update_preferences(
     return state
 
 
-async def _call_llm(messages: List[dict], model_name: Optional[str] = None) -> str:
+def _personalize_system_prompt(
+    state: ConversationState,
+    user_name: Optional[str],
+    intent: Optional[str] = None,
+) -> str:
+    """
+    Собирает финальный system prompt с учётом:
+    - режима,
+    - настроек пользователя (длина, тон, формат),
+    - типа задачи (контент, тренировка, план дня, чек-лист).
+    """
+    base = build_system_prompt(mode_key=state.mode_key, user_name=user_name)
+    extras: List[str] = []
+
+    # Настройки формата
+    if state.verbosity == "short":
+        extras.append("Отвечай максимально кратко: 3–5 предложений или 5–7 пунктов списка.")
+    elif state.verbosity == "long":
+        extras.append("Давай развёрнутые ответы с примерами и подробными пояснениями.")
+
+    if state.tone == "friendly":
+        extras.append(
+            "Говори немного более дружелюбно и поддерживающе, можно немного эмодзи, но без фамильярности."
+        )
+    elif state.tone == "strict":
+        extras.append("Стиль более официальный и лаконичный, без юмора и эмодзи.")
+
+    if state.format_pref == "more_lists":
+        extras.append("По возможности используй структурированные списки и подзаголовки.")
+    elif state.format_pref == "more_text":
+        extras.append("Используй больше связного текста, а списки только при необходимости.")
+
+    # Инструкции под тип задачи
+    if intent == "content":
+        extras.append(
+            "Сейчас пользователь просит помочь с созданием или редактированием текста/контента. "
+            "Сконцентрируйся на структуре, читабельности и лаконичности, избегай лишней воды."
+        )
+    elif intent == "workout":
+        extras.append(
+            "Пользователь просит составить программу тренировки. "
+            "Оформи ответ в телеграм-формате с блоками:\n"
+            "• 💪 <b>Цель</b> — 2–3 предложения.\n"
+            "• 📌 <b>Общие рекомендации</b> — 3–7 пунктов.\n"
+            "• 🧱 <b>Структура тренировки</b> — по разделам: разминка, основная часть, заминка.\n"
+            "  В основной части каждая строка: '• Упражнение — подходы × повторы (комментарий)'.\n"
+            "• 🔁 <b>Прогрессия</b> — как увеличивать нагрузку.\n"
+            "• ⚠️ <b>Важно</b> — 2–4 пункта по безопасности и самочувствию.\n"
+            "Избегай markdown-таблиц, используй только списки."
+        )
+    elif intent == "daily_plan":
+        extras.append(
+            "Пользователь просит структурированный план/распорядок дня. "
+            "Оформи ответ блоками:\n"
+            "• 💡 <b>Кратко</b> — 2–3 предложения о цели дня.\n"
+            "• 🌅 <b>Утро</b> — список дел по порядку.\n"
+            "• 🌇 <b>День</b> — список ключевых блоков работы/учёбы/отдыха.\n"
+            "• 🌙 <b>Вечер</b> — завершение дня и восстановление.\n"
+            "• 📌 <b>Акценты</b> — 3–5 главных правил, которые важно не нарушать.\n"
+            "Каждый пункт делай коротким, одна мысль — одна строка."
+        )
+    elif intent == "checklist":
+        extras.append(
+            "Пользователь хочет чёткий чек-лист действий. "
+            "Сделай один блок <b>Чек-лист</b>, а внутри — пункты формата:\n"
+            "• '☐ Сформулировать цель.'\n"
+            "• '☐ Собрать документы.'\n"
+            "• '☐ Проверить результат.'\n"
+            "Каждый шаг — отдельная строка, максимум 10–15 шагов. "
+            "Формулируй в повелительном наклонении (что нужно сделать)."
+        )
+
+    if extras:
+        base += "\n\nДополнительные настройки формата и структуры ответа:\n- " + "\n- ".join(extras)
+
+    return base
+
+
+async def _call_llm(
+    messages: List[dict],
+    model_name: Optional[str] = None,
+    *,
+    postprocess: bool = True,
+) -> str:
+    """
+    Общий helper для вызова LLM.
+    postprocess=False используется там, где нам не нужны HTML-правки (например, при summary истории).
+    """
     if _client is None:
         raise RuntimeError("Groq client is not configured (no API key).")
 
@@ -216,12 +361,19 @@ async def _call_llm(messages: List[dict], model_name: Optional[str] = None) -> s
             max_completion_tokens=2048,
             reasoning_effort="medium",
         )
-        return completion.choices[0].message.content or ""
+        text = completion.choices[0].message.content or ""
+        return text
 
-    return await loop.run_in_executor(None, _do_request)
+    raw = await loop.run_in_executor(None, _do_request)
+    if postprocess:
+        return _postprocess_reply(raw)
+    return raw
 
 
 def _trim_history(state: ConversationState, max_turns: int = 12) -> None:
+    """
+    Обрезает историю, оставляя не более max_turns последних пар сообщений user+assistant.
+    """
     if len(state.messages) > max_turns * 2:
         state.messages = state.messages[-max_turns * 2 :]
 
@@ -235,7 +387,6 @@ async def _maybe_summarize_history(user_id: int, state: ConversationState) -> No
     if len(state.messages) <= max_turns_before_summary * 2:
         return
 
-    # Уже довольно длинный диалог — делаем summary
     history_json = json.dumps(state.messages, ensure_ascii=False)
     system_prompt = (
         "Ты — ассистент, который кратко конспектирует историю диалога между пользователем и ИИ. "
@@ -249,7 +400,11 @@ async def _maybe_summarize_history(user_id: int, state: ConversationState) -> No
     ]
 
     try:
-        summary = await _call_llm(messages, model_name=settings.groq_chat_model_light)
+        summary = await _call_llm(
+            messages,
+            model_name=settings.groq_chat_model_light,
+            postprocess=False,
+        )
     except Exception:
         logger.exception("Error while summarizing history")
         return
@@ -286,7 +441,11 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
     messages.append({"role": "user", "content": text})
 
     try:
-        reply = await _call_llm(messages, model_name=settings.groq_chat_model)
+        reply = await _call_llm(
+            messages,
+            model_name=settings.groq_chat_model,
+            postprocess=True,
+        )
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion")
         raise
@@ -315,8 +474,7 @@ async def continue_answer(user_id: int, user_name: Optional[str] = None) -> str:
 
     await _maybe_summarize_history(user_id, state)
 
-    intent = None
-    system_prompt = _personalize_system_prompt(state, user_name, intent=intent)
+    system_prompt = _personalize_system_prompt(state, user_name, intent=None)
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(state.messages)
     continuation_request = (
@@ -326,7 +484,11 @@ async def continue_answer(user_id: int, user_name: Optional[str] = None) -> str:
     messages.append({"role": "user", "content": continuation_request})
 
     try:
-        reply = await _call_llm(messages, model_name=settings.groq_chat_model)
+        reply = await _call_llm(
+            messages,
+            model_name=settings.groq_chat_model,
+            postprocess=True,
+        )
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion (continue_answer)")
         raise
@@ -355,7 +517,9 @@ async def transform_last_answer(
     """
     state = get_state(user_id)
     if not state.last_answer:
-        raise ValueError("Пока нечего обрабатывать — сначала задай вопрос и получи ответ.")
+        raise ValueError(
+            "Пока нечего обрабатывать — сначала задай вопрос и получи ответ."
+        )
 
     ok, retry_after, msg = check_rate_limit(user_id)
     if not ok:
@@ -363,7 +527,7 @@ async def transform_last_answer(
 
     await _maybe_summarize_history(user_id, state)
 
-    system_prompt = _personalize_system_prompt(state, user_name)
+    system_prompt = _personalize_system_prompt(state, user_name, intent=None)
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(state.messages)
 
@@ -400,8 +564,11 @@ async def transform_last_answer(
     messages.append({"role": "user", "content": user_msg})
 
     try:
-        # Для трансформаций можно использовать более лёгкую модель
-        reply = await _call_llm(messages, model_name=settings.groq_chat_model_light)
+        reply = await _call_llm(
+            messages,
+            model_name=settings.groq_chat_model_light,
+            postprocess=True,
+        )
     except Exception:
         logger.exception("Error while calling Groq ChatCompletion (transform_last_answer)")
         raise
