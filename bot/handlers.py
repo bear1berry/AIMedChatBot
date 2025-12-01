@@ -14,8 +14,7 @@ from .ai_client import (
     get_state,
     reset_state,
     set_mode,
-    set_model_profile,
-    get_model_profile_label,
+    get_model_profile_label,  # 🆕 для красивого вывода профиля модели
 )
 from .modes import CHAT_MODES, DEFAULT_MODE_KEY, get_mode_label, list_modes_for_menu
 
@@ -24,34 +23,10 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-def _build_modes_keyboard(current_mode: str) -> InlineKeyboardBuilder:
-    """
-    Кнопки выбора режима ассистента (медицинский, обычный и т.д.).
-    """
+def _build_modes_keyboard() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for key, label in list_modes_for_menu().items():
-        mark = "✅" if key == current_mode else "⚪️"
-        kb.button(text=f"{mark} {label}", callback_data=f"set_mode:{key}")
-    kb.adjust(1)
-    return kb
-
-
-def _build_models_keyboard(current_profile: str) -> InlineKeyboardBuilder:
-    """
-    Кнопки выбора профиля модели (авто, только GPT-4.1, только DeepSeek и т.д.).
-    """
-    kb = InlineKeyboardBuilder()
-    profiles = [
-        ("auto", "🤖 Авто (подбор моделей)"),
-        ("gpt4", "🧠 GPT-4.1"),
-        ("mini", "⚡️ GPT-4o mini"),
-        ("oss", "🧬 GPT-OSS 120B"),
-        ("deepseek_reasoner", "🧩 DeepSeek Reasoner"),
-        ("deepseek_chat", "💬 DeepSeek Chat"),
-    ]
-    for code, label in profiles:
-        mark = "✅" if code == current_profile else "⚪️"
-        kb.button(text=f"{mark} {label}", callback_data=f"set_model:{code}")
+        kb.button(text=label, callback_data=f"set_mode:{key}")
     kb.adjust(1)
     return kb
 
@@ -88,75 +63,46 @@ async def cmd_start(message: Message) -> None:
     assert user is not None
 
     state = get_state(user.id)
-    current_mode = state.mode_key or DEFAULT_MODE_KEY
-    current_mode_label = get_mode_label(current_mode)
-    current_profile_label = get_model_profile_label(state.model_profile)
+    current_mode_label = get_mode_label(state.mode_key or DEFAULT_MODE_KEY)
+    profile_label = get_model_profile_label(state.model_profile)
 
-    kb_modes = _build_modes_keyboard(current_mode=current_mode)
-    kb_models = _build_models_keyboard(current_profile=state.model_profile)
-    kb_modes.attach(kb_models)
+    kb = _build_modes_keyboard()
 
+    # Минималистичное приветствие в HTML
     text = (
         f"Привет, {user.first_name or 'друг'}! 👋\n\n"
         "Я твой ИИ-ассистент для проекта <b>AI Medicine</b>.\n"
         "Помогу с медицинскими вопросами, идеями для постов и просто поболтать.\n\n"
         f"Режим: <b>{current_mode_label}</b>\n"
-        f"Модель: <b>{current_profile_label}</b>\n\n"
+        f"Модель: <b>{profile_label}</b>\n\n"
         "✍️ Просто напиши свой вопрос ниже — я отвечу.\n"
         "Чтобы сменить стиль работы или модель, используй кнопки ниже."
     )
 
-    await message.answer(text, reply_markup=kb_modes.as_markup())
+    await message.answer(text, reply_markup=kb.as_markup())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     text = (
         "Я ИИ-ассистент, максимально похожий на ChatGPT, но заточенный под твой проект 🧠\n\n"
-        "Доступные команды:\n"
-        "/start — приветствие и выбор режима/модели\n"
+        "<b>Команды:</b>\n"
+        "/start — приветствие и выбор режима\n"
         "/mode — переключить режим общения\n"
-        "/model — выбрать профиль модели (GPT-4, DeepSeek и т.д.)\n"
         "/reset — очистить историю диалога\n"
         "/help — это сообщение\n\n"
-        "Дальше просто общайся со мной обычными сообщениями — я подстроюсь под контекст."
+        "Дальше просто общайся со мной обычными сообщениями."
     )
     await message.answer(text)
 
 
 @router.message(Command("mode"))
 async def cmd_mode(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-
-    kb_modes = _build_modes_keyboard(current_mode=state.mode_key or DEFAULT_MODE_KEY)
-    kb_models = _build_models_keyboard(current_profile=state.model_profile)
-    kb_modes.attach(kb_models)
-
+    kb = _build_modes_keyboard()
     await message.answer(
-        "Выбери режим работы ассистента и, при желании, профиль модели:",
-        reply_markup=kb_modes.as_markup(),
+        "Выбери режим работы ассистента:",
+        reply_markup=kb.as_markup(),
     )
-
-
-@router.message(Command("model"))
-async def cmd_model(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-
-    kb = _build_models_keyboard(current_profile=state.model_profile)
-    text = (
-        "Выбери профиль модели, с которой хочешь продолжать диалог:\n\n"
-        "🤖 <b>Авто</b> — бот сам подбирает 1–2 модели под задачу.\n"
-        "🧠 <b>GPT-4.1</b> — максимум качества.\n"
-        "⚡️ <b>GPT-4o mini</b> — быстро и экономно.\n"
-        "🧬 <b>GPT-OSS 120B</b> — мощный open-source.\n"
-        "🧩 <b>DeepSeek Reasoner</b> — сложные разборы и рассуждения.\n"
-        "💬 <b>DeepSeek Chat</b> — объяснения и диалоги."
-    )
-    await message.answer(text, reply_markup=kb.as_markup())
 
 
 @router.message(Command("reset"))
@@ -182,80 +128,90 @@ async def callback_set_mode(callback: CallbackQuery) -> None:
         await callback.answer("Неизвестный режим 🤔", show_alert=True)
         return
 
-    state = set_mode(user.id, mode_key)
+    set_mode(user.id, mode_key)
     mode_label = get_mode_label(mode_key)
 
-    kb_modes = _build_modes_keyboard(current_mode=state.mode_key or DEFAULT_MODE_KEY)
-    kb_models = _build_models_keyboard(current_profile=state.model_profile)
-    kb_modes.attach(kb_models)
-
+    # Обновим клавиатуру, чтобы было видно выбранный режим
     await callback.message.edit_reply_markup(
-        reply_markup=kb_modes.as_markup()
+        reply_markup=_build_modes_keyboard().as_markup()
     )
-    await callback.answer(f"Режим: {mode_label}")
+    await callback.answer()
+    await callback.message.answer(
+        f"Режим переключён на <b>{mode_label}</b>.\n"
+        "Можешь задать новый вопрос — контекст старого диалога я обнулил для чистоты ответа."
+    )
 
 
-@router.callback_query(F.data.startswith("set_model:"))
-async def callback_set_model(callback: CallbackQuery) -> None:
-    if not callback.data:
-        return
+@router.message(F.photo)
+async def photo_handler(message: Message) -> None:
+    """
+    Обработка фотографий для vision-модели (если включено).
+    Сейчас ответ даёт Groq-vision через отдельный модуль.
+    """
+    from .vision import analyze_image  # локальный импорт, чтобы не ловить циклы
 
-    user = callback.from_user
+    user = message.from_user
     assert user is not None
 
-    profile = callback.data.split(":", 1)[1]
-    try:
-        state = set_model_profile(user.id, profile)
-    except ValueError:
-        await callback.answer("Неизвестный профиль модели 🤔", show_alert=True)
-        return
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    file_path = file.file_path
+    assert file_path is not None
 
-    current_mode = state.mode_key or DEFAULT_MODE_KEY
-    kb_modes = _build_modes_keyboard(current_mode=current_mode)
-    kb_models = _build_models_keyboard(current_profile=state.model_profile)
-    kb_modes.attach(kb_models)
+    async with ChatActionSender.upload_photo(chat_id=message.chat.id):
+        file_bytes = await message.bot.download_file(file_path)
+        content = file_bytes.read()
 
-    label = get_model_profile_label(state.model_profile)
+    async with ChatActionSender.typing(chat_id=message.chat.id):
+        reply = await analyze_image(content, user_id=user.id)
 
-    await callback.message.edit_reply_markup(
-        reply_markup=kb_modes.as_markup()
-    )
-    await callback.answer(f"Модель: {label}")
+    for chunk in _split_text(reply):
+        await message.answer(chunk)
 
 
-@router.message(F.text & ~F.via_bot)
+@router.message()
 async def handle_chat(message: Message) -> None:
     user = message.from_user
     assert user is not None
 
-    user_name = user.first_name or user.username or "пользователь"
+    text = (message.text or "").strip()
+    if not text:
+        return
 
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-        try:
-            answer = await ask_ai(
-                user_id=user.id,
-                text=message.text,
-                user_name=user_name,
-            )
-        except RateLimitError as e:
-            if e.scope == "minute":
-                await message.answer(
-                    "Слишком много запросов за последнюю минуту 🧨\n"
-                    "Попробуй ещё раз через 20–30 секунд."
-                )
-            else:
-                await message.answer(
-                    "Достигнут дневной лимит запросов для этого бота 🚫\n"
-                    "Лимит обновится завтра."
-                )
-            return
-        except Exception:
-            logger.exception("Error in handle_chat")
+    # Простая защита по username / id (если настроено)
+    from .config import settings
+
+    if settings.allowed_users:
+        username = (user.username or "").lower()
+        if username.lstrip("@") not in {u.lower() for u in settings.allowed_users}:
             await message.answer(
-                "Кажется, что-то пошло не так на стороне модели 😔\n"
-                "Попробуй отправить запрос ещё раз чуть позже."
+                "Этот бот доступен только для ограниченного круга пользователей. "
+                "Если ты считаешь, что это ошибка — напиши администратору."
             )
             return
+
+    try:
+        async with ChatActionSender.typing(chat_id=message.chat.id):
+            answer = await ask_ai(user_id=user.id, text=text, user_name=user.first_name)
+    except RateLimitError as e:
+        if e.scope == "minute":
+            await message.answer(
+                "⏱ Слишком много запросов подряд. "
+                "Подожди минуту и попробуй ещё раз."
+            )
+        else:
+            await message.answer(
+                "📈 На сегодня лимит запросов исчерпан. "
+                "Попробуй снова завтра 🙏"
+            )
+        return
+    except Exception as e:
+        logger.exception("Error in handle_chat", exc_info=e)
+        await message.answer(
+            "Кажется, что-то пошло не так на стороне модели 😔\n"
+            "Попробуй отправить запрос ещё раз чуть позже."
+        )
+        return
 
     for chunk in _split_text(answer):
         await message.answer(chunk)
