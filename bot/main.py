@@ -10,7 +10,6 @@ from aiogram.enums import ParseMode
 from .config import settings
 from .handlers import router as main_router
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -18,13 +17,10 @@ logging.basicConfig(
 
 
 async def main() -> None:
-    if not settings.bot_token:
-        raise RuntimeError("BOT_TOKEN is not set in environment variables")
-
-    # ✅ Работаем в HTML-режиме — под него настроена постобработка и промпты
+    # parse_mode = Markdown, потому что мы генерируем *жирный* и списки
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
     )
 
     dp = Dispatcher()
