@@ -21,16 +21,21 @@ AIML_API_BASE = os.getenv("AIML_API_BASE", "https://api.aimlapi.com/v1").rstrip(
 if not AIML_API_KEY:
     logger.warning("AIML_API_KEY is not set. LLM calls will fail.")
 
-# Мягкий лимит на пользователя (как и раньше, в памяти процесса)
+# Мягкий лимит на пользователя (в памяти процесса)
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "20"))
 RATE_LIMIT_PER_DAY = int(os.getenv("RATE_LIMIT_PER_DAY", "500"))
 
-# Модели по умолчанию — можно переопределить через переменные окружения
-AIML_MODEL_PRIMARY = os.getenv("AIML_MODEL_PRIMARY", "openai/gpt-4.1")
-AIML_MODEL_FAST = os.getenv("AIML_MODEL_FAST", "openai/gpt-4o-mini")
-AIML_MODEL_GPT_OSS_120B = os.getenv("AIML_MODEL_GPT_OSS_120B", "openai/gpt-oss-120b")
-AIML_MODEL_DEEPSEEK_REASONER = os.getenv("AIML_MODEL_DEEPSEEK_REASONER", "deepseek/deepseek-reasoner")
-AIML_MODEL_DEEPSEEK_CHAT = os.getenv("AIML_MODEL_DEEPSEEK_CHAT", "deepseek/deepseek-chat")
+# Модели по умолчанию — id выровнены под AIMLAPI
+# Эти значения можно переопределить Environment-переменными.
+AIML_MODEL_PRIMARY = os.getenv("AIML_MODEL_PRIMARY", "gpt-4.1").strip()
+AIML_MODEL_FAST = os.getenv("AIML_MODEL_FAST", "gpt-4o-mini").strip()
+AIML_MODEL_GPT_OSS_120B = os.getenv("AIML_MODEL_GPT_OSS_120B", "gpt-oss-120b").strip()
+AIML_MODEL_DEEPSEEK_REASONER = os.getenv(
+    "AIML_MODEL_DEEPSEEK_REASONER", "deepseek-reasoner"
+).strip()
+AIML_MODEL_DEEPSEEK_CHAT = os.getenv(
+    "AIML_MODEL_DEEPSEEK_CHAT", "deepseek-chat"
+).strip()
 
 
 @dataclass
@@ -155,10 +160,10 @@ import re
 
 def _postprocess_reply(text: str) -> str:
     """
-    Лёгкая постобработка ответа модели:
+    Лёгкая постобработка ответа модели под Telegram Markdown:
     - подчистка лишних переносов
-    - превращаем markdown-заголовки и **жирный** в HTML для Bot(parse_mode='HTML')
-    - аккуратные маркеры списков
+    - превращаем # заголовки в *жирные строки*
+    - делаем маркеры списков аккуратнее
     """
     if not text:
         return "⚠️ Модель не вернула текст ответа."
@@ -168,13 +173,10 @@ def _postprocess_reply(text: str) -> str:
     # Сжимаем слишком большие расстояния
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Markdown **bold** -> <b>bold</b>
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-
-    # Заголовки # / ## / ### -> <b>...</b>
+    # Заголовки # / ## / ### -> *Заголовок*
     def _hdr(match: re.Match) -> str:
         content = match.group(1).strip()
-        return f"<b>{content}</b>"
+        return f"*{content}*"
 
     text = re.sub(r"^#{1,3}\s+(.+)$", _hdr, text, flags=re.MULTILINE)
 
@@ -229,9 +231,18 @@ def _model_short_desc(model_id: str) -> str:
 def _is_reasoning_task(question: str) -> bool:
     q = question.lower()
     triggers = [
-        "разбери", "обоснуй", "пошагово", "step by step", "разложи",
-        "случай", "case", "диагноз", "дифференциальный", "план лечения",
-        "анализируй", "analysis",
+        "разбери",
+        "обоснуй",
+        "пошагово",
+        "step by step",
+        "разложи",
+        "случай",
+        "case",
+        "диагноз",
+        "дифференциальный",
+        "план лечения",
+        "анализируй",
+        "analysis",
     ]
     return any(t in q for t in triggers) or len(q) > 1200
 
@@ -239,8 +250,14 @@ def _is_reasoning_task(question: str) -> bool:
 def _is_brainstorm_task(question: str) -> bool:
     q = question.lower()
     triggers = [
-        "придумай", "варианты", "идеи", "brainstorm", "название", "title",
-        "формулировка", "контент-план",
+        "придумай",
+        "варианты",
+        "идеи",
+        "brainstorm",
+        "название",
+        "title",
+        "формулировка",
+        "контент-план",
     ]
     return any(t in q for t in triggers)
 
@@ -248,7 +265,13 @@ def _is_brainstorm_task(question: str) -> bool:
 def _is_code_task(question: str) -> bool:
     q = question.lower()
     triggers = [
-        "python", "script", "скрипт", "код", "sql", "javascript", "js",
+        "python",
+        "script",
+        "скрипт",
+        "код",
+        "sql",
+        "javascript",
+        "js",
     ]
     return any(t in q for t in triggers)
 
@@ -325,9 +348,34 @@ async def _call_model(model: str, messages: list[dict]) -> str:
             raise
 
     if resp.status_code >= 400:
-        err = data.get("error") if isinstance(data, dict) else data
-        logger.error("AIMLAPI error (%s): %r", resp.status_code, err)
-        raise RuntimeError(f"AIMLAPI error {resp.status_code}: {err}")
+        # AIMLAPI чаще всего кладёт текст в поле message, а не error
+        if isinstance(data, dict):
+            err_text = data.get("error") or data.get("message") or data
+        else:
+            err_text = data
+
+        err_str = str(err_text)
+        logger.error(
+            "AIMLAPI error (%s) for model=%s: %s",
+            resp.status_code,
+            model,
+            err_str[:500],
+        )
+
+        # Специальный кейс: модель на обслуживании — делаем фолбэк
+        if (
+            resp.status_code >= 500
+            and "model is under maintenance" in err_str.lower()
+            and model == AIML_MODEL_GPT_OSS_120B
+        ):
+            logger.warning(
+                "Model %s is under maintenance, falling back to %s",
+                model,
+                AIML_MODEL_PRIMARY,
+            )
+            return await _call_model(AIML_MODEL_PRIMARY, messages)
+
+        raise RuntimeError(f"AIMLAPI error {resp.status_code}: {err_str}")
 
     try:
         content = data["choices"][0]["message"]["content"]
@@ -374,11 +422,11 @@ async def ask_ai(user_id: int, text: str, user_name: str | None = None) -> str:
             if isinstance(result, Exception):
                 logger.exception("Model %s failed", model_id, exc_info=result)
                 block = (
-                    f"{emoji} <b>{name}</b> ({desc}):\n"
+                    f"{emoji} *{name}* ({desc}):\n"
                     "⚠️ Ошибка при обращении к модели. Попробуй ещё раз."
                 )
             else:
-                block = f"{emoji} <b>{name}</b> ({desc}):\n{result}"
+                block = f"{emoji} *{name}* ({desc}):\n{result}"
 
             blocks.append(block)
 
