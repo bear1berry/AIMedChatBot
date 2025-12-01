@@ -50,7 +50,6 @@ def set_mode(user_id: int, mode_key: str) -> None:
 async def healthcheck_llm() -> bool:
     """
     Простая проверка доступности модели.
-    Не обязательно вызывать в бою, но оставим для /ping.
     """
     try:
         _ = await _client.chat.completions.create(
@@ -142,15 +141,16 @@ def _postprocess_reply(text: str) -> str:
 
 async def ask_ai(user_id: int, user_text: str) -> str:
     """
-    Основной вызов модели Groq (openai/gpt-oss-120b) с учётом режима и истории.
+    Основной вызов модели Groq (openai/gpt-oss-120b) с учётом режима и расширенной истории.
     """
     state = get_state(user_id)
     mode_key = state.mode_key or DEFAULT_MODE_KEY
 
     system_prompt = build_system_prompt(mode_key)
 
-    # Историю ограничиваем, чтобы не раздувать запрос.
-    history = state.messages[-16:]  # примерно 8 последних обменов
+    # 🔧 Расширяем контекст: берём больше последних сообщений
+    # Примерно 20 последних обменов (user + assistant) = 40 сообщений
+    history = state.messages[-40:]
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -163,7 +163,7 @@ async def ask_ai(user_id: int, user_text: str) -> str:
             model=settings.model_name,
             messages=messages,
             temperature=0.35,
-            max_completion_tokens=1400,
+            max_completion_tokens=1800,  # чуть больше для сложных кейсов
         )
     except Exception as e:
         logger.exception("Groq API error: %s", e)
@@ -174,7 +174,7 @@ async def ask_ai(user_id: int, user_text: str) -> str:
 
     reply = _postprocess_reply(reply)
 
-    # Обновляем историю
+    # Обновляем историю (чтобы дальше держать контекст)
     state.messages.append({"role": "user", "content": user_text})
     state.messages.append({"role": "assistant", "content": reply})
 
