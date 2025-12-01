@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 from groq import AsyncGroq
 
@@ -12,17 +12,22 @@ from .modes import DEFAULT_MODE_KEY, build_system_prompt, get_mode_label
 
 logger = logging.getLogger(__name__)
 
+AnswerStyle = Literal["default", "short", "detailed", "checklist"]
+ToneStyle = Literal["default", "story", "strict"]
+Audience = Literal["auto", "patient", "doctor"]
+
 
 @dataclass
 class ConversationState:
     mode_key: str = DEFAULT_MODE_KEY
-    # Только история user/assistant, system добавляем каждый раз отдельно
     messages: List[Dict[str, str]] = field(default_factory=list)
+    answer_style: AnswerStyle = "default"
+    tone: ToneStyle = "default"
+    audience: Audience = "auto"
 
 
 _STATES: Dict[int, ConversationState] = {}
 
-# Async-клиент Groq
 _client = AsyncGroq(api_key=settings.groq_api_key)
 
 
@@ -42,15 +47,11 @@ def reset_state(user_id: int) -> None:
 def set_mode(user_id: int, mode_key: str) -> None:
     state = get_state(user_id)
     state.mode_key = mode_key
-    # При смене режима лучше сбросить историю, чтобы стиль не мешался
     state.messages.clear()
     logger.info("User %s switched mode to %s", user_id, get_mode_label(mode_key))
 
 
 async def healthcheck_llm() -> bool:
-    """
-    Простая проверка доступности модели.
-    """
     try:
         _ = await _client.chat.completions.create(
             model=settings.model_name,
@@ -67,6 +68,213 @@ async def healthcheck_llm() -> bool:
         return False
 
 
+# --- Хелперы анализа текста ---
+
+
+def _classify_task_type(text: str) -> str:
+    t = text.lower()
+
+    post_triggers = [
+        "пост для",
+        "пост в",
+        "для канала",
+        "описание канала",
+        "описание профиля",
+        "контент-план",
+        "контент план",
+        "заголовок поста",
+        "текст для поста",
+    ]
+    outline_triggers = [
+        "конспект",
+        "шпаргалк",
+        "структуру",
+        "структура лекции",
+        "план лекции",
+        "план доклада",
+        "outline",
+    ]
+    plan_triggers = [
+        "пошаговый план",
+        "что делать",
+        "todo",
+        "to-do",
+        "список задач",
+        "дорожную карту",
+    ]
+    code_triggers = [
+        "код",
+        "script",
+        "скрипт",
+        "python",
+        "sql",
+        "javascript",
+        "ошибка",
+        "traceback",
+        "stack trace",
+    ]
+
+    if any(w in t for w in code_triggers):
+        return "code"
+    if any(w in t for w in post_triggers):
+        return "post"
+    if any(w in t for w in outline_triggers):
+        return "outline"
+    if any(w in t for w in plan_triggers):
+        return "plan"
+    return "chat"
+
+
+def _detect_audience_from_text(text: str) -> Audience:
+    t = text.lower()
+    patient_triggers = [
+        "для пациента",
+        "понятным языком",
+        "простым языком",
+        "для обычных людей",
+    ]
+    doctor_triggers = [
+        "для врача",
+        "для студентов-медиков",
+        "для ординаторов",
+        "для медиков",
+        "лекция для",
+    ]
+
+    if any(w in t for w in patient_triggers):
+        return "patient"
+    if any(w in t for w in doctor_triggers):
+        return "doctor"
+    return "auto"
+
+
+_MEDICAL_KEYWORDS = [
+    "диагноз",
+    "лечение",
+    "лечить",
+    "симптом",
+    "жалоб",
+    "пациент",
+    "температур",
+    "кашель",
+    "боль",
+    "высыпан",
+    "анализ",
+    "кровь",
+    "пневмони",
+    "инфекц",
+    "эпид",
+    "вакцин",
+    "прививк",
+]
+
+
+def _is_medical_context(text: str, mode_key: str) -> bool:
+    if mode_key == "ai_medicine_assistant":
+        return True
+    t = text.lower()
+    return any(w in t for w in _MEDICAL_KEYWORDS)
+
+
+_RED_FLAG_KEYWORDS = [
+    "резкая боль в груди",
+    "сильная боль в груди",
+    "одышк",
+    "не может дышать",
+    "удушье",
+    "потеря сознания",
+    "упал в обморок",
+    "судорог",
+    "онемение руки",
+    "перекосило лицо",
+    "нарушение речи",
+    "кровавая рвота",
+    "рвота с кровью",
+    "черный стул",
+    "дёгтеобразный стул",
+    "температура 40",
+    "температура 39",
+    "очень сильная боль в животе",
+]
+
+
+def _has_medical_red_flags(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in _RED_FLAG_KEYWORDS)
+
+
+def _build_dynamic_instructions(
+    state: ConversationState, user_text: str
+) -> str:
+    parts: List[str] = []
+
+    # Тип задачи
+    task_type = _classify_task_type(user_text)
+    if task_type == "post":
+        parts.append(
+            "- Формат ответа: текст для поста в Telegram с коротким цепляющим вступлением и 2–4 абзацами. Если уместно, добавь короткий список."
+        )
+    elif task_type == "outline":
+        parts.append(
+            "- Формат ответа: структурированный конспект с заголовками и списками."
+        )
+    elif task_type == "plan":
+        parts.append(
+            "- Формат ответа: пошаговый план действий (чек-лист), каждый шаг с новой строки."
+        )
+    elif task_type == "code":
+        parts.append(
+            "- Формат ответа: сначала краткое объяснение, затем пример кода. Избегай лишнего использования Markdown-форматирования внутри кода."
+        )
+    else:
+        parts.append("- Формат ответа: обычное объяснение, структурно и по делу.")
+
+    # Стиль длины ответа
+    if state.answer_style == "short":
+        parts.append(
+            "- Длина ответа: максимально кратко, 3–7 ключевых пунктов или предложений, только суть."
+        )
+    elif state.answer_style == "detailed":
+        parts.append(
+            "- Длина ответа: подробно, но без воды. Разделяй текст на логические блоки с заголовками и списками."
+        )
+    elif state.answer_style == "checklist":
+        parts.append(
+            "- Формат ответа: чек-лист. Каждый пункт с новой строки, начинай с символа «•»."
+        )
+
+    # Тон
+    if state.tone == "story":
+        parts.append(
+            "- Тон: лёгкий сторителлинг. Сначала короткий контекст или мини-история, затем выводы и рекомендации."
+        )
+    elif state.tone == "strict":
+        parts.append(
+            "- Тон: сухо, структурно и по делу, без лишних эмоций и украшательств."
+        )
+
+    # Аудитория
+    effective_audience = state.audience
+    if effective_audience == "auto":
+        detected = _detect_audience_from_text(user_text)
+        if detected != "auto":
+            effective_audience = detected
+
+    if effective_audience == "patient":
+        parts.append(
+            "- Аудитория: пациент или человек без медобразования. Объясняй максимально простым и понятным языком, избегай тяжёлых терминов или сразу расшифровывай их."
+        )
+    elif effective_audience == "doctor":
+        parts.append(
+            "- Аудитория: врач или студент-медик. Можно использовать медицинскую терминологию, ориентируйся на профессиональный уровень."
+        )
+
+    if not parts:
+        return ""
+
+    return "Дополнительные настройки ответа:\n" + "\n".join(parts)
+
+
 def _postprocess_reply(text: str) -> str:
     """
     Приводим ответ модели к аккуратному Markdown без сырого HTML и мусора.
@@ -74,13 +282,10 @@ def _postprocess_reply(text: str) -> str:
     if not text:
         return "Извини, сейчас не получилось сформировать ответ."
 
-    # Нормализуем переводы строк
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Убираем пробелы по краям
     text = text.strip()
 
-    # 1) Конвертация HTML-жирного в Markdown: <b>...</b>, <strong>...</strong> → *...*
+    # HTML жирный -> *...*
     def repl_bold(match: re.Match) -> str:
         inner = match.group(1).strip()
         if not inner:
@@ -94,7 +299,7 @@ def _postprocess_reply(text: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # 2) Курсив: <i>...</i>, <em>...</em> → _..._
+    # HTML курсив -> _..._
     def repl_italic(match: re.Match) -> str:
         inner = match.group(1).strip()
         if not inner:
@@ -108,7 +313,7 @@ def _postprocess_reply(text: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # 3) Простые HTML-теги абзацев/переносов → перевод строки
+    # Простые теги абзацев -> перевод строки
     text = re.sub(
         r"</?(?:p|br|div|span)\s*/?>",
         "\n",
@@ -116,10 +321,10 @@ def _postprocess_reply(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 4) Остальные одиночные теги просто выбрасываем
+    # Остальные одиночные теги — выбрасываем
     text = re.sub(r"</?[^>\n]{1,20}>", "", text)
 
-    # 5) Заголовки вида "# Текст" / "## Текст" / "### Текст" → *Текст*
+    # Заголовки "# ..." -> *...*
     def heading_repl(match: re.Match) -> str:
         title = match.group("title").strip()
         if not title:
@@ -133,7 +338,23 @@ def _postprocess_reply(text: str) -> str:
         flags=re.MULTILINE,
     )
 
-    # 6) Сжимаем пачки пустых строк
+    # Нумерованные списки "1. ..." / "1) ..." -> "• ..."
+    text = re.sub(
+        r"^\s*\d+[.)]\s+",
+        "• ",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # "- пункт" в начале строки -> "• пункт"
+    text = re.sub(
+        r"^\s*-\s+",
+        "• ",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # Сжимаем пачки пустых строк
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
@@ -141,15 +362,18 @@ def _postprocess_reply(text: str) -> str:
 
 async def ask_ai(user_id: int, user_text: str) -> str:
     """
-    Основной вызов модели Groq (openai/gpt-oss-120b) с учётом режима и расширенной истории.
+    Основной вызов модели Groq (openai/gpt-oss-120b) с учётом режима, истории и настроек стиля.
     """
     state = get_state(user_id)
     mode_key = state.mode_key or DEFAULT_MODE_KEY
 
-    system_prompt = build_system_prompt(mode_key)
+    base_system = build_system_prompt(mode_key)
+    dynamic = _build_dynamic_instructions(state, user_text)
+    system_prompt = base_system
+    if dynamic:
+        system_prompt = base_system + "\n\n" + dynamic
 
-    # 🔧 Расширяем контекст: берём больше последних сообщений
-    # Примерно 20 последних обменов (user + assistant) = 40 сообщений
+    # Расширенный контекст: до ~40 сообщений истории
     history = state.messages[-40:]
 
     messages: List[Dict[str, str]] = [
@@ -163,7 +387,7 @@ async def ask_ai(user_id: int, user_text: str) -> str:
             model=settings.model_name,
             messages=messages,
             temperature=0.35,
-            max_completion_tokens=1800,  # чуть больше для сложных кейсов
+            max_completion_tokens=1800,
         )
     except Exception as e:
         logger.exception("Groq API error: %s", e)
@@ -174,8 +398,129 @@ async def ask_ai(user_id: int, user_text: str) -> str:
 
     reply = _postprocess_reply(reply)
 
-    # Обновляем историю (чтобы дальше держать контекст)
+    # Медицинские флаги / дисклеймеры
+    is_med = _is_medical_context(user_text, mode_key)
+    has_flags = _has_medical_red_flags(user_text)
+
+    if is_med:
+        disclaimer = (
+            "⚠️ Этот ответ носит информационный характер и не является заменой очной "
+            "консультации врача. Для постановки диагноза и назначения лечения обязательно "
+            "обратитесь к специалисту."
+        )
+        if disclaimer not in reply:
+            reply = f"{reply}\n\n{disclaimer}"
+
+    if has_flags:
+        emergency = (
+            "🚨 В описанной ситуации могут присутствовать симптомы, требующие срочной "
+            "оценки врачом.\n"
+            "Если есть выраженная боль, затруднённое дыхание, нарушение сознания, судороги, "
+            "признаки инсульта или другие острые симптомы — немедленно вызовите скорую помощь "
+            "или обратитесь в ближайший приёмный покой."
+        )
+        reply = f"{emergency}\n\n{reply}"
+
+    # Заголовок с режимом (минималистично)
+    mode_label = get_mode_label(mode_key)
+    reply = f"{mode_label}\n\n{reply}"
+
+    # Сохраняем историю
     state.messages.append({"role": "user", "content": user_text})
     state.messages.append({"role": "assistant", "content": reply})
 
     return reply
+
+
+# --- Дополнительные функции для /summary, /todo, /md, /status ---
+
+
+async def summarize_dialog(user_id: int) -> str:
+    state = get_state(user_id)
+    if not state.messages:
+        return "Диалог пока пуст — нечего резюмировать."
+
+    history = state.messages[-40:]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты делаешь краткое резюме диалога между пользователем и ассистентом.\n"
+                "Сформируй 3–7 ключевых пункта: о чём говорили, какие решения и идеи появились."
+            ),
+        },
+        *history,
+    ]
+
+    completion = await _client.chat.completions.create(
+        model=settings.model_name,
+        messages=messages,
+        temperature=0.2,
+        max_completion_tokens=600,
+    )
+    reply = completion.choices[0].message.content if completion.choices else ""
+    return _postprocess_reply(reply or "Не удалось построить резюме диалога.")
+
+
+async def extract_todos(user_id: int) -> str:
+    state = get_state(user_id)
+    if not state.messages:
+        return "Диалог пока пуст — задач не видно."
+
+    history = state.messages[-40:]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Извлеки из диалога список задач и конкретных действий для пользователя.\n"
+                "Формат ответа: чек-лист с пунктами, каждый пункт с новой строки, начинать с «•».\n"
+                "Если явных задач нет — покажи возможные шаги, которые логично вытекают из обсуждения."
+            ),
+        },
+        *history,
+    ]
+
+    completion = await _client.chat.completions.create(
+        model=settings.model_name,
+        messages=messages,
+        temperature=0.25,
+        max_completion_tokens=600,
+    )
+    reply = completion.choices[0].message.content if completion.choices else ""
+    return _postprocess_reply(reply or "Я не вижу явных задач в этом диалоге.")
+
+
+def export_markdown(user_id: int) -> str:
+    state = get_state(user_id)
+    if not state.messages:
+        return "Диалог пока пуст."
+
+    history = state.messages[-80:]
+
+    lines: List[str] = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"*User:*\n{content}")
+        elif role == "assistant":
+            lines.append(f"*Assistant:*\n{content}")
+        else:
+            lines.append(f"*{role}:*\n{content}")
+
+    return "\n\n---\n\n".join(lines)
+
+
+def get_user_settings(user_id: int) -> Dict[str, str]:
+    state = get_state(user_id)
+    return {
+        "mode_key": state.mode_key,
+        "mode_label": get_mode_label(state.mode_key),
+        "answer_style": state.answer_style,
+        "tone": state.tone,
+        "audience": state.audience,
+        "messages_count": str(len(state.messages)),
+        "model_name": settings.model_name,
+    }
