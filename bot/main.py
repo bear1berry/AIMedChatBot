@@ -21,8 +21,8 @@ async def main() -> None:
     """
     Точка входа бота.
 
-    Важно: используем HTML parse_mode, чтобы <b>, <i>, <code> и аккуратная
-    разметка из промптов отображались в Telegram как задумано.
+    Важно: используем HTML parse_mode, чтобы <b>, <i>, <code> и остальная
+    разметка из ответов отображалась в Telegram как задумано.
     """
     bot = Bot(
         token=settings.bot_token,
