@@ -6,313 +6,297 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.chat_action import ChatActionSender
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .ai_client import (
+    RateLimitError,
     ask_ai,
     get_state,
     reset_state,
     set_mode,
-    summarize_dialog,
-    extract_todos,
-    export_markdown,
-    get_user_settings,
-    healthcheck_llm,
+    set_model_profile,
+    get_model_profile_label,
 )
-from .config import settings
-from .keyboards import build_modes_keyboard
-from .limits import check_rate_limit
-from .modes import DEFAULT_MODE_KEY, CHAT_MODES, get_mode_label
+from .modes import CHAT_MODES, DEFAULT_MODE_KEY, get_mode_label, list_modes_for_menu
 
-router = Router()
 logger = logging.getLogger(__name__)
 
-MAX_TELEGRAM_MESSAGE_LEN = 4096
+router = Router()
 
 
-def _split_text(text: str) -> list[str]:
+# =========================
+# ВСПОМОГАТЕЛЬНЫЕ КЛАВИАТУРЫ
+# =========================
+
+def _build_modes_keyboard(current_mode: str) -> InlineKeyboardBuilder:
     """
-    Делим длинный текст на части < 4096 символов, стараясь резать по абзацам.
+    Кнопки выбора режима ассистента (медицинский, универсальный, беседа, контент).
+    Порядок берём из CHAT_MODES через list_modes_for_menu().
     """
-    text = text.strip()
-    if len(text) <= MAX_TELEGRAM_MESSAGE_LEN:
-        return [text]
-
-    parts: list[str] = []
-    rest = text
-
-    while len(rest) > MAX_TELEGRAM_MESSAGE_LEN:
-        cut = rest.rfind("\n\n", 0, MAX_TELEGRAM_MESSAGE_LEN)
-        if cut == -1:
-            cut = rest.rfind("\n", 0, MAX_TELEGRAM_MESSAGE_LEN)
-        if cut == -1:
-            cut = rest.rfind(" ", 0, MAX_TELEGRAM_MESSAGE_LEN)
-        if cut == -1:
-            cut = MAX_TELEGRAM_MESSAGE_LEN
-
-        chunk = rest[: cut].strip()
-        if chunk:
-            parts.append(chunk)
-        rest = rest[cut:].lstrip()
-
-    if rest:
-        parts.append(rest)
-
-    return parts
+    kb = InlineKeyboardBuilder()
+    for key, label in list_modes_for_menu().items():
+        mark = "✅" if key == current_mode else "⚪️"
+        kb.button(text=f"{mark} {label}", callback_data=f"set_mode:{key}")
+    kb.adjust(1)
+    return kb
 
 
-# --- Команды ---
+def _build_models_keyboard(current_profile: str) -> InlineKeyboardBuilder:
+    """
+    Кнопки выбора профиля модели (авто, GPT-4.1, mini, OSS, DeepSeek и т.д.).
+    """
+    kb = InlineKeyboardBuilder()
+    profiles = [
+        ("auto", "🤖 Авто (подбор моделей)"),
+        ("gpt4", "🧠 GPT-4.1"),
+        ("mini", "⚡️ GPT-4o mini"),
+        ("oss", "🧬 GPT-OSS 120B"),
+        ("deepseek_reasoner", "🧩 DeepSeek Reasoner"),
+        ("deepseek_chat", "💬 DeepSeek Chat"),
+    ]
+    for code, label in profiles:
+        mark = "✅" if code == current_profile else "⚪️"
+        kb.button(text=f"{mark} {label}", callback_data=f"set_model:{code}")
+    kb.adjust(1)
+    return kb
 
+
+def _split_text(text: str, max_len: int = 3500) -> list[str]:
+    """
+    Аккуратно режем длинный текст на куски под лимит Telegram.
+    Стараемся резать по пустой строке / строке / пробелу.
+    """
+    chunks: list[str] = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+
+        split_pos = (
+            text.rfind("\n\n", 0, max_len)
+            if text.rfind("\n\n", 0, max_len) != -1
+            else text.rfind("\n", 0, max_len)
+        )
+        if split_pos == -1:
+            split_pos = text.rfind(" ", 0, max_len)
+        if split_pos == -1:
+            split_pos = max_len
+
+        chunks.append(text[:split_pos])
+        text = text[split_pos:].lstrip()
+
+    return chunks
+
+
+# =========================
+# КОМАНДЫ
+# =========================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    """
+    Приветствие + главное «джобсовское» меню: режимы + профиль модели.
+    """
     user = message.from_user
     assert user is not None
 
     state = get_state(user.id)
-    current_mode_key = state.mode_key or DEFAULT_MODE_KEY
-    current_mode_label = get_mode_label(current_mode_key)
+    current_mode = state.mode_key or DEFAULT_MODE_KEY
+    current_mode_label = get_mode_label(current_mode)
+    current_profile_label = get_model_profile_label(state.model_profile)
 
-    kb = build_modes_keyboard(current_mode_key)
+    kb_modes = _build_modes_keyboard(current_mode=current_mode)
+    kb_models = _build_models_keyboard(current_profile=state.model_profile)
+    kb_modes.attach(kb_models)
 
     text = (
         f"Привет, {user.first_name or 'друг'}! 👋\n\n"
-        "Я твой ИИ-ассистент для проекта *AI Medicine*.\n"
-        "Помогу с медицинскими вопросами, идеями для постов и просто поболтать.\n\n"
-        f"Текущий режим: *{current_mode_label}*\n\n"
-        "✏️ Просто напиши свой вопрос ниже — я отвечу.\n"
-        "Чтобы сменить стиль работы, используй кнопки ниже.\n\n"
-        "Дополнительно доступны команды:\n"
-        "• /mode — выбрать режим\n"
-        "• /short, /detailed, /checklist — длина ответа\n"
-        "• /story, /strict, /neutral — тон ответа\n"
-        "• /patient, /doctor — язык «для пациента» или «для врача»\n"
-        "• /summary — краткое резюме диалога\n"
-        "• /todo — извлечь список задач\n"
-        "• /md — экспорт диалога в Markdown\n"
-        "• /status — статус модели и настроек\n"
-        "• /reset — очистить историю диалога"
+        "<b>AIMed</b> — твой ИИ-ассистент для проекта <b>AI Medicine</b> и личного развития.\n\n"
+        "Что я могу:\n"
+        "• ⚕️ Разобрать симптомы и анализы, помочь подготовиться к приёму (без постановки диагноза).\n"
+        "• 📚 Помочь с учёбой, экзаменами и разбором сложных тем.\n"
+        "• ✍️ Придумать и допилить контент для Telegram-каналов.\n"
+        "• 🧠 Поддержать, навести порядок в голове и помочь выстроить план действий.\n\n"
+        "Текущие настройки:\n"
+        f"• Режим: <b>{current_mode_label}</b>\n"
+        f"• Модель: <b>{current_profile_label}</b>\n\n"
+        "✍️ Просто напиши свой запрос ниже — я подстроюсь под контекст.\n"
+        "При необходимости режим и модель можно сменить кнопками ниже 👇"
     )
 
-    await message.answer(text, reply_markup=kb)
+    await message.answer(text, reply_markup=kb_modes.as_markup())
 
 
-@router.message(Command("reset"))
-async def cmd_reset(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    reset_state(user.id)
-    await message.answer("🧹 История диалога очищена. Начнём заново!")
-
-
-@router.message(Command("mode"))
-async def cmd_mode(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-
-    state = get_state(user.id)
-    current_mode_key = state.mode_key or DEFAULT_MODE_KEY
-
-    kb = build_modes_keyboard(current_mode_key)
-
-    lines = ["Доступные режимы:"]
-    for key, mode in CHAT_MODES.items():
-        mark = "✅" if key == current_mode_key else "•"
-        lines.append(f"{mark} {mode.title} — {mode.description}")
-
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-# --- Стиль ответа: длина ---
-
-
-@router.message(Command("short"))
-async def cmd_short(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.answer_style = "short"
-    await message.answer("⚡ Теперь отвечаю максимально кратко: 3–7 ключевых пунктов.")
-
-
-@router.message(Command("detailed"))
-async def cmd_detailed(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.answer_style = "detailed"
-    await message.answer("📚 Теперь отвечаю подробнее и структурно.")
-
-
-@router.message(Command("checklist"))
-async def cmd_checklist(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.answer_style = "checklist"
-    await message.answer("🧾 Теперь ответы в формате чек-листа.")
-
-
-# --- Стиль ответа: тон ---
-
-
-@router.message(Command("story"))
-async def cmd_story(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.tone = "story"
-    await message.answer("📖 Теперь отвечаю в формате лёгкого сторителлинга.")
-
-
-@router.message(Command("strict"))
-async def cmd_strict(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.tone = "strict"
-    await message.answer("📐 Теперь отвечаю максимально сухо и структурно.")
-
-
-@router.message(Command("neutral"))
-async def cmd_neutral(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.tone = "default"
-    await message.answer("🎚 Тон ответа возвращён в нейтральный.")
-
-
-# --- Аудитория ---
-
-
-@router.message(Command("patient"))
-async def cmd_patient(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.audience = "patient"
-    await message.answer("🧑‍🤝‍🧑 Теперь объясняю максимально простым языком, «для пациента».")
-
-
-@router.message(Command("doctor"))
-async def cmd_doctor(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-    state = get_state(user.id)
-    state.audience = "doctor"
-    await message.answer("👨‍⚕️ Теперь можно использовать профессиональные медицинские термины.")
-
-
-# --- Сервисные команды: /summary, /todo, /md, /status ---
-
-
-@router.message(Command("summary"))
-async def cmd_summary(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-        reply = await summarize_dialog(user.id)
-
-    for chunk in _split_text(reply):
-        await message.answer(chunk)
-
-
-@router.message(Command("todo"))
-async def cmd_todo(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-        reply = await extract_todos(user.id)
-
-    for chunk in _split_text(reply):
-        await message.answer(chunk)
-
-
-@router.message(Command("md"))
-async def cmd_md(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-
-    text = export_markdown(user.id)
-    for chunk in _split_text(text):
-        await message.answer(chunk)
-
-
-@router.message(Command("status"))
-async def cmd_status(message: Message) -> None:
-    user = message.from_user
-    assert user is not None
-
-    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-        ok = await healthcheck_llm()
-
-    settings_info = get_user_settings(user.id)
-    status_str = "✅ Модель доступна" if ok else "⚠️ Модель сейчас недоступна"
-
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    """
+    Краткая справка по возможностям и командам.
+    """
     text = (
-        f"{status_str}\n\n"
-        f"Режим: *{settings_info['mode_label']}*\n"
-        f"Модель: `{settings_info['model_name']}`\n"
-        f"Стиль ответа: *{settings_info['answer_style']}*\n"
-        f"Тон: *{settings_info['tone']}*\n"
-        f"Аудитория: *{settings_info['audience']}*\n"
-        f"Сообщений в текущей сессии: *{settings_info['messages_count']}*"
+        "Я ИИ-ассистент, максимально близкий к ChatGPT, но заточенный под твой стек задач 🧠\n\n"
+        "Основные режимы:\n"
+        "• 🧠 AI-Medicine — медицинский ассистент, разбор анализов, подготовка к приёму.\n"
+        "• 🤖 Универсальный ассистент — любые вопросы и задачи.\n"
+        "• 💬 Личный собеседник — поддержка, разговоры, мозговой штурм.\n"
+        "• ✍️ Контент-мейкер — посты, структуры, идеи для Telegram.\n\n"
+        "Команды:\n"
+        "/start — приветствие и главное меню\n"
+        "/mode — быстро сменить режим общения\n"
+        "/model — выбрать профиль модели (GPT-4, mini, DeepSeek и т.д.)\n"
+        "/reset — очистить историю диалога\n"
+        "/help — эта справка\n\n"
+        "Дальше просто общайся со мной обычными сообщениями — я запоминаю контекст диалога."
     )
     await message.answer(text)
 
 
-# --- Callback-кнопки для смены режима ---
-
-
-@router.callback_query(F.data.startswith("mode:"))
-async def callback_set_mode(callback: CallbackQuery) -> None:
-    assert callback.data is not None
-    user = callback.from_user
+@router.message(Command("mode"))
+async def cmd_mode(message: Message) -> None:
+    """
+    Отдельная команда для смены режима.
+    """
+    user = message.from_user
     assert user is not None
+    state = get_state(user.id)
 
-    mode_key = callback.data.split(":", 1)[1]
-    if mode_key not in CHAT_MODES:
-        await callback.answer("Такого режима нет 🤔", show_alert=True)
-        return
+    kb_modes = _build_modes_keyboard(current_mode=state.mode_key or DEFAULT_MODE_KEY)
+    kb_models = _build_models_keyboard(current_profile=state.model_profile)
+    kb_modes.attach(kb_models)
 
-    set_mode(user.id, mode_key)
-    kb = build_modes_keyboard(mode_key)
-    label = get_mode_label(mode_key)
-
-    if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=kb)
-
-    await callback.answer(f"Режим: {label}")
+    await message.answer(
+        "Выбери режим работы ассистента и, при желании, профиль модели:",
+        reply_markup=kb_modes.as_markup(),
+    )
 
 
-# --- Основной обработчик текста ---
+@router.message(Command("model"))
+async def cmd_model(message: Message) -> None:
+    """
+    Быстрый выбор только профиля модели.
+    """
+    user = message.from_user
+    assert user is not None
+    state = get_state(user.id)
+
+    kb = _build_models_keyboard(current_profile=state.model_profile)
+
+    await message.answer(
+        "Выбери профиль модели (можно оставить <b>Авто</b> — я сам подберу оптимальный вариант):",
+        reply_markup=kb.as_markup(),
+    )
 
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_chat(message: Message) -> None:
+@router.message(Command("reset"))
+async def cmd_reset(message: Message) -> None:
+    """
+    Сброс истории диалога, но без смены режима/модели.
+    """
     user = message.from_user
     assert user is not None
 
-    # Ограничение по списку разрешённых пользователей (если задан)
-    if settings.allowed_users:
-        username = (user.username or "").lower().lstrip("@")
-        if username not in [u.lower() for u in settings.allowed_users]:
-            await message.answer(
-                "🚫 Сейчас бот работает в закрытом режиме.\n"
-                "Доступ ограничен для тестирования."
-            )
-            return
+    reset_state(user.id)
+    await message.answer(
+        "История диалога очищена 🧹\n"
+        "Можем начать с чистого листа — просто напиши новый запрос."
+    )
 
-    ok, _, msg = check_rate_limit(user.id)
-    if not ok:
-        await message.answer(msg or "⏳ Лимит запросов превышен. Попробуй позже.")
+
+# =========================
+# CALLBACK-КНОПКИ
+# =========================
+
+@router.callback_query(F.data.startswith("set_mode:"))
+async def cb_set_mode(callback: CallbackQuery) -> None:
+    """
+    Пользователь выбрал другой режим (медицинский / общий / контент и т.д.).
+    """
+    user = callback.from_user
+    assert user is not None
+
+    data = callback.data or ""
+    _, mode_key = data.split(":", 1)
+
+    if mode_key not in CHAT_MODES:
+        await callback.answer("Неизвестный режим 🤔", show_alert=True)
         return
 
+    state = set_mode(user.id, mode_key)
+    current_mode = state.mode_key or DEFAULT_MODE_KEY
+
+    kb_modes = _build_modes_keyboard(current_mode=current_mode)
+    kb_models = _build_models_keyboard(current_profile=state.model_profile)
+    kb_modes.attach(kb_models)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=kb_modes.as_markup())
+
+    mode_cfg = CHAT_MODES[mode_key]
+    await callback.answer(f"Режим: {mode_cfg.title}")
+
+
+@router.callback_query(F.data.startswith("set_model:"))
+async def cb_set_model(callback: CallbackQuery) -> None:
+    """
+    Пользователь выбрал другой профиль модели (GPT-4 / mini / OSS / DeepSeek).
+    """
+    user = callback.from_user
+    assert user is not None
+
+    data = callback.data or ""
+    _, profile = data.split(":", 1)
+
+    try:
+        state = set_model_profile(user.id, profile)
+    except ValueError:
+        await callback.answer("Неизвестный профиль модели 🤔", show_alert=True)
+        return
+
+    kb_modes = _build_modes_keyboard(current_mode=state.mode_key or DEFAULT_MODE_KEY)
+    kb_models = _build_models_keyboard(current_profile=state.model_profile)
+    kb_modes.attach(kb_models)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=kb_modes.as_markup())
+
+    label = get_model_profile_label(state.model_profile)
+    await callback.answer(f"Модель: {label}")
+
+
+# =========================
+# ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# =========================
+
+@router.message(F.text & ~F.via_bot)
+async def handle_chat(message: Message) -> None:
+    """
+    Главный обработчик текста: прогоняем запрос через ask_ai с учётом режима/модели.
+    """
+    user = message.from_user
+    if user is None:
+        return
+
+    user_name = user.first_name or user.username or ""
+
+    # красивый индикатор «печатает…»
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
-            answer = await ask_ai(user.id, message.text or "")
+            answer = await ask_ai(
+                user_id=user.id,
+                text=message.text,
+                user_name=user_name,
+            )
+        except RateLimitError as e:
+            if e.scope == "minute":
+                await message.answer(
+                    "Слишком много запросов за последнюю минуту 🧨\n"
+                    "Попробуй ещё раз через 20–30 секунд."
+                )
+            else:
+                await message.answer(
+                    "Достигнут дневной лимит запросов для этого бота 🚫\n"
+                    "Лимит обновится завтра."
+                )
+            return
         except Exception:
             logger.exception("Error in handle_chat")
             await message.answer(
