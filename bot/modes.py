@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Dict
 
 
-# Режим по умолчанию — универсальный ассистент, а не медицина
+# Режим по умолчанию — универсальный ассистент
 DEFAULT_MODE_KEY = "chatgpt_general"
 
 
-# Общие правила оформления именно под Telegram (HTML parse_mode)
+# Общие правила оформления именно под Telegram (HTML parse mode)
 STYLE_TELEGRAM_HTML = """
 Formatting rules for Telegram chat (HTML parse mode):
 
@@ -32,7 +32,6 @@ class ChatMode:
     system_template: str # Системный промпт (можно вставлять {user_name})
 
 
-# Доступные режимы общения
 CHAT_MODES: Dict[str, ChatMode] = {
     "chatgpt_general": ChatMode(
         key="chatgpt_general",
@@ -115,8 +114,7 @@ CHAT_MODES: Dict[str, ChatMode] = {
     ),
 }
 
-
-# Legacy mapping for other modules that expect MODES
+# Legacy-словарь, если где-то ещё ожидается MODES
 MODES = {
     key: {
         "short_name": mode.title,
