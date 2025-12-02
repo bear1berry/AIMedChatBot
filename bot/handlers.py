@@ -21,6 +21,10 @@ from .ai_client import (
     set_mode,
     set_model_profile,
     get_model_profile_label,
+    list_workspaces,
+    get_current_workspace,
+    set_current_workspace,
+    create_workspace,
 )
 from .modes import CHAT_MODES, DEFAULT_MODE_KEY, get_mode_label, list_modes_for_menu
 
@@ -36,14 +40,14 @@ router = Router()
 
 def build_main_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    Главная клавиатура внизу экрана (как на скриншоте):
-    🎓 Для учёбы | ⚙️ Настройки бота
-    🆘 Помощь    | 🔁 Перезапуск
+    Нижняя клавиатура (как системные кнопки Telegram):
+    🧠 Пространства | ⚙️ Настройки
+    🆘 Помощь       | 🔁 Перезапуск
     """
     keyboard = [
         [
-            KeyboardButton(text="🎓 Для учёбы"),
-            KeyboardButton(text="⚙️ Настройки бота"),
+            KeyboardButton(text="🧠 Пространства"),
+            KeyboardButton(text="⚙️ Настройки"),
         ],
         [
             KeyboardButton(text="🆘 Помощь"),
@@ -62,16 +66,26 @@ def _build_modes_keyboard(current_mode: str) -> InlineKeyboardBuilder:
     Кнопки выбора режима ассистента (используются только в разделе настроек).
     """
     kb = InlineKeyboardBuilder()
-    for key, label in list_modes_for_menu().items():
+    # Логичный порядок: универсальный → собеседник → контент → здоровье
+    order = [
+        "chatgpt_general",
+        "friendly_chat",
+        "content_creator",
+        "ai_medicine_assistant",
+    ]
+    for key in order:
+        mode = CHAT_MODES.get(key)
+        if not mode:
+            continue
         mark = "✅" if key == current_mode else "⚪️"
-        kb.button(text=f"{mark} {label}", callback_data=f"set_mode:{key}")
+        kb.button(text=f"{mark} {mode.title}", callback_data=f"set_mode:{key}")
     kb.adjust(1)
     return kb
 
 
 def _build_models_keyboard(current_profile: str) -> InlineKeyboardBuilder:
     """
-    Кнопки выбора профиля модели (авто, GPT-4.1, DeepSeek и т.д.).
+    Кнопки выбора профиля модели.
     """
     kb = InlineKeyboardBuilder()
     profiles = [
@@ -89,6 +103,24 @@ def _build_models_keyboard(current_profile: str) -> InlineKeyboardBuilder:
     return kb
 
 
+def _build_workspaces_keyboard(user_id: int) -> InlineKeyboardBuilder:
+    """
+    Инлайн-меню выбора workspace.
+    """
+    state = get_state(user_id)
+    current_id = state.current_workspace_id
+    workspaces = list_workspaces(user_id)
+
+    kb = InlineKeyboardBuilder()
+    for ws in workspaces:
+        mark = "✅" if ws.id == current_id else "⚪️"
+        kb.button(text=f"{mark} {ws.title}", callback_data=f"ws:switch:{ws.id}")
+
+    kb.adjust(1)
+    kb.button(text="➕ Новое пространство", callback_data="ws:new")
+    return kb
+
+
 def _split_text(text: str, max_len: int = 3500) -> list[str]:
     """
     Аккуратно режем длинный текст на куски под лимит Telegram.
@@ -99,11 +131,9 @@ def _split_text(text: str, max_len: int = 3500) -> list[str]:
             chunks.append(text)
             break
 
-        split_pos = (
-            text.rfind("\n\n", 0, max_len)
-            if text.rfind("\n\n", 0, max_len) != -1
-            else text.rfind("\n", 0, max_len)
-        )
+        split_pos = text.rfind("\n\n", 0, max_len)
+        if split_pos == -1:
+            split_pos = text.rfind("\n", 0, max_len)
         if split_pos == -1:
             split_pos = text.rfind(" ", 0, max_len)
         if split_pos == -1:
@@ -123,26 +153,25 @@ def _split_text(text: str, max_len: int = 3500) -> list[str]:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     """
-    Минималистичный экран приветствия без инлайн-кнопок —
-    всё управление уходит в нижнюю клавиатуру.
+    Стартовый экран: чистый текст + нижняя клавиатура.
     """
     user = message.from_user
     if user is None:
         return
 
     state = get_state(user.id)
+    current_ws = get_current_workspace(user.id)
     current_mode = state.mode_key or DEFAULT_MODE_KEY
     current_mode_label = get_mode_label(current_mode)
     current_profile_label = get_model_profile_label(state.model_profile)
 
     text = (
         f"Привет, {user.first_name or 'друг'}! 👋\n\n"
-        "<b>AIMed</b> — твой персональный ИИ-ассистент.\n\n"
-        "Что я умею:\n"
-        "• 🤖 Помогать с любыми вопросами и задачами.\n"
-        "• 🎓 Разобраться в учёбе и сложных темах.\n"
-        "• ✍️ Подбирать формулировки, улучшать тексты и генерировать идеи.\n"
-        "• ⚕️ Давать общую справочную информацию по здоровью (без диагноза и назначений).\n\n"
+        "<b>AIMed</b> — твой персональный ИИ-центр.\n\n"
+        "Я помогу с задачами по работе, учёбе, личной жизни и проектам — "
+        "в одном месте, но с разными пространствами.\n\n"
+        "<b>Текущее пространство:</b>\n"
+        f"• 🧠 <b>{current_ws.title}</b>\n\n"
         "<b>Сейчас выбрано:</b>\n"
         f"• Режим: <b>{current_mode_label}</b>\n"
         f"• Модель: <b>{current_profile_label}</b>\n\n"
@@ -155,18 +184,21 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     text = (
-        "Я универсальный ИИ-ассистент с минималистичным интерфейсом.\n\n"
-        "Режимы работы:\n"
-        "• 🤖 Универсальный ассистент — любые вопросы и задачи.\n"
-        "• 💬 Личный собеседник — поддержка, идеи, рефлексия.\n"
-        "• ✍️ Контент-мейкер — посты, карусели, сценарии.\n"
-        "• 🧠 AI-Medicine — справочная информация по здоровью (без диагноза и назначений).\n\n"
+        "Я универсальный ИИ-ассистент с концепцией рабочих пространств (workspaces).\n\n"
+        "Каждое пространство — это отдельный контекст диалога, режим и история:\n"
+        "• можно держать отдельно канал, учёбу, работу и личное;\n"
+        "• переключаться между ними через кнопку <b>🧠 Пространства</b>.\n\n"
+        "Режимы общения:\n"
+        "• 🤖 Универсальный ассистент — любые вопросы и задачи;\n"
+        "• 💬 Личный собеседник — поддержка, рефлексия, мозговой штурм;\n"
+        "• ✍️ Контент-мейкер — посты, карусели, сценарии;\n"
+        "• ⚕️ Здоровье и медицина — общая справочная информация (без диагноза и назначений).\n\n"
         "Кнопки внизу:\n"
-        "• 🎓 Для учёбы — акцент на объяснения и обучение.\n"
-        "• ⚙️ Настройки бота — выбор режима и модели.\n"
-        "• 🆘 Помощь — эта шпаргалка.\n"
-        "• 🔁 Перезапуск — очистка диалога и возврат к стартовому экрану.\n\n"
-        "Команды тоже доступны: /start, /mode, /model, /reset."
+        "• 🧠 Пространства — выбор/создание workspace;\n"
+        "• ⚙️ Настройки — выбор режима и модели для текущего пространства;\n"
+        "• 🆘 Помощь — это сообщение;\n"
+        "• 🔁 Перезапуск — очистить историю текущего пространства.\n\n"
+        "Команды: /start, /help, /mode, /model, /reset."
     )
     await message.answer(text)
 
@@ -174,7 +206,7 @@ async def cmd_help(message: Message) -> None:
 @router.message(Command("mode"))
 async def cmd_mode(message: Message) -> None:
     """
-    Отдельная команда для смены режима (через инлайн-клавиатуру).
+    Быстрый выбор режима общения для текущего workspace.
     """
     user = message.from_user
     if user is None:
@@ -188,7 +220,7 @@ async def cmd_mode(message: Message) -> None:
     kb_modes.attach(kb_models)
 
     await message.answer(
-        "Выбери режим и профиль модели:",
+        "Выбери режим и профиль модели для <b>текущего</b> пространства:",
         reply_markup=kb_modes.as_markup(),
     )
 
@@ -214,79 +246,81 @@ async def cmd_model(message: Message) -> None:
 @router.message(Command("reset"))
 async def cmd_reset(message: Message) -> None:
     """
-    Полный сброс диалога.
+    Очистка истории только текущего workspace.
     """
     user = message.from_user
     if user is None:
         return
 
     reset_state(user.id)
+    current_ws = get_current_workspace(user.id)
     await message.answer(
-        "История диалога очищена 🧹\n"
-        "Можем начать с чистого листа — напиши новый запрос или используй кнопки внизу.",
+        f"История пространства <b>{current_ws.title}</b> очищена 🧹\n"
+        "Можем начать с чистого листа — просто напиши новый запрос.",
         reply_markup=build_main_reply_keyboard(),
     )
 
 
 # =========================
-# ОБРАБОТЧИКИ НИЖНЕЙ КЛАВИАТУРЫ
+# НИЖНЯЯ КЛАВИАТУРА
 # =========================
 
 
-@router.message(F.text == "🎓 Для учёбы")
-async def on_btn_study(message: Message) -> None:
+@router.message(F.text == "🧠 Пространства")
+async def on_btn_workspaces(message: Message) -> None:
     """
-    Переключаем акцент на обучение.
-    Сейчас это мапится на универсальный режим; при желании можно завести отдельный.
+    Открываем меню рабочих пространств.
     """
     user = message.from_user
     if user is None:
         return
 
-    # Если появится отдельный учебный режим — укажи здесь его ключ вместо chatgpt_general
-    set_mode(user.id, "chatgpt_general")
+    kb = _build_workspaces_keyboard(user.id)
+    current_ws = get_current_workspace(user.id)
 
-    await message.answer(
-        "Ок, делаем фокус на учёбе. Задавай вопросы по предметам, теориям, экзаменам — разберём по полочкам. 📚",
-        reply_markup=build_main_reply_keyboard(),
+    text = (
+        "🧠 <b>Твои пространства</b>\n\n"
+        "Каждое пространство — отдельный контекст диалога.\n"
+        "Сейчас активно: "
+        f"<b>{current_ws.title}</b>.\n\n"
+        "Нажми на нужное пространство, чтобы переключиться, или создай новое."
     )
 
+    await message.answer(text, reply_markup=kb.as_markup())
 
-@router.message(F.text == "⚙️ Настройки бота")
+
+@router.message(F.text == "⚙️ Настройки")
 async def on_btn_settings(message: Message) -> None:
     """
-    Открываем экран настроек: выбор режима + модели через инлайн-клавиатуру.
+    Открываем экран настроек: режим + модель.
     """
     user = message.from_user
     if user is None:
         return
 
     state = get_state(user.id)
+    current_ws = get_current_workspace(user.id)
     current_mode = state.mode_key or DEFAULT_MODE_KEY
 
     kb_modes = _build_modes_keyboard(current_mode=current_mode)
     kb_models = _build_models_keyboard(current_profile=state.model_profile)
     kb_modes.attach(kb_models)
 
-    await message.answer(
-        "Настройки бота. Выбери режим и профиль модели:",
-        reply_markup=kb_modes.as_markup(),
+    text = (
+        "⚙️ <b>Настройки для текущего пространства</b>\n\n"
+        f"Пространство: <b>{current_ws.title}</b>\n\n"
+        "Выбери режим общения и профиль модели:"
     )
+    await message.answer(text, reply_markup=kb_modes.as_markup())
 
 
 @router.message(F.text == "🆘 Помощь")
 async def on_btn_help(message: Message) -> None:
-    """
-    Просто переиспользуем /help.
-    """
     await cmd_help(message)
 
 
 @router.message(F.text == "🔁 Перезапуск")
 async def on_btn_restart(message: Message) -> None:
-    """
-    Очистка истории и возврат к стартовому экрану.
-    """
     user = message.from_user
     if user is None:
         return
@@ -296,7 +330,7 @@ async def on_btn_restart(message: Message) -> None:
 
 
 # =========================
-# CALLBACK-КНОПКИ НАСТРОЕК
+# CALLBACK-КНОПКИ
 # =========================
 
 
@@ -360,6 +394,52 @@ async def callback_set_model(callback: CallbackQuery) -> None:
     await callback.answer(f"Модель: {label}")
 
 
+@router.callback_query(F.data.startswith("ws:switch:"))
+async def callback_ws_switch(callback: CallbackQuery) -> None:
+    """
+    Переключение между workspace.
+    """
+    data = callback.data or ""
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer()
+        return
+
+    user = callback.from_user
+    if user is None:
+        await callback.answer()
+        return
+
+    ws_id = parts[2]
+    ws = set_current_workspace(user.id, ws_id)
+
+    kb = _build_workspaces_keyboard(user.id)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+
+    await callback.answer(f"Активно пространство: {ws.title}")
+
+
+@router.callback_query(F.data == "ws:new")
+async def callback_ws_new(callback: CallbackQuery) -> None:
+    """
+    Создать новое пространство с дефолтным названием.
+    """
+    user = callback.from_user
+    if user is None:
+        await callback.answer()
+        return
+
+    ws = create_workspace(user.id, title="")
+    kb = _build_workspaces_keyboard(user.id)
+
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+
+    await callback.answer(f"Создано и выбрано: {ws.title}")
+
+
 # =========================
 # ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
 # =========================
@@ -368,7 +448,8 @@ async def callback_set_model(callback: CallbackQuery) -> None:
 @router.message(F.text & ~F.via_bot)
 async def handle_chat(message: Message) -> None:
     """
-    Всё, что не совпало с кнопками, идёт как обычный запрос к ИИ.
+    Всё, что не совпало с кнопками и командами, идёт как обычный запрос к ИИ
+    в контексте текущего workspace.
     """
     user = message.from_user
     if user is None:
@@ -376,6 +457,7 @@ async def handle_chat(message: Message) -> None:
 
     user_id = user.id
     user_name = user.first_name or user.username or ""
+    current_ws = get_current_workspace(user_id)
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
@@ -404,5 +486,8 @@ async def handle_chat(message: Message) -> None:
             )
             return
 
-    for chunk in _split_text(answer):
+    # Добавляем лейбл workspace перед ответом
+    header = f"🧠 Workspace: <b>{current_ws.title}</b>\n\n"
+    full = header + (answer or "")
+    for chunk in _split_text(full):
         await message.answer(chunk)
