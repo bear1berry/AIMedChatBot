@@ -9,6 +9,10 @@ load_dotenv()
 
 
 def _env_required(name: str) -> str:
+    """
+    Получить обязательную переменную окружения.
+    Если переменная не задана — бросаем понятную ошибку при старте бота.
+    """
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"Environment variable {name} is required")
@@ -17,15 +21,12 @@ def _env_required(name: str) -> str:
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
     if not raw:
         return default
     try:
         return int(raw)
     except ValueError:
-        return default
+        raise RuntimeError(f"Environment variable {name} must be an integer, got {raw!r}")
 
 
 @dataclass
@@ -33,13 +34,30 @@ class Settings:
     # Telegram
     bot_token: str = field(default_factory=lambda: _env_required("BOT_TOKEN"))
 
-    # Groq
-    groq_api_key: str = field(default_factory=lambda: _env_required("GROQ_API_KEY"))
+    # Yandex Cloud / YandexGPT
+    # Ключ и каталог для доступа к YandexGPT через OpenAI-совместимый API.
+    yandex_api_key: str = field(
+        default_factory=lambda: _env_required("YANDEX_CLOUD_API_KEY")
+    )
+    yandex_folder_id: str = field(
+        default_factory=lambda: _env_required("YANDEX_CLOUD_FOLDER")
+    )
+    # Имя модели только для информации, логика выбора модели живёт в ai_client.
     model_name: str = field(
-        default_factory=lambda: os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
+        default_factory=lambda: os.getenv(
+            "MODEL_NAME",
+            "gpt://{folder}/yandexgpt/latest".format(
+                folder=os.getenv("YANDEX_CLOUD_FOLDER", "<folder_id>")
+            ),
+        )
     )
 
-    # Rate limiting
+    # Путь к базе данных для хранения заметок/истории
+    db_path: str = field(
+        default_factory=lambda: os.getenv("DB_PATH", "bot_data.sqlite3")
+    )
+
+    # Rate limiting для вспомогательных механизмов (limits.py)
     rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 20)
     )
