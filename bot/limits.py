@@ -10,14 +10,16 @@ from .config import settings
 _RATE_STATE: dict[int, dict[str, int]] = {}
 
 
-def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
-    """
-    Проверка лимитов:
-    - N запросов в минуту
-    - M запросов в сутки
+def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str], Optional[str]]:
+    """Проверка лимитов запросов для пользователя.
+
+    Лимиты:
+    - settings.rate_limit_per_minute запросов в минуту
+    - settings.rate_limit_per_day запросов в сутки
 
     Возвращает:
-        (ok, retry_after, message)
+        (ok, retry_after, scope, message)
+        scope: "minute" или "day" (какой лимит сработал) либо None.
     """
     now = int(time.time())
     minute = now // 60
@@ -48,7 +50,7 @@ def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
             "⏳ Лимит запросов в минуту превышен.\n"
             "Попробуй отправить сообщение чуть позже."
         )
-        return False, retry, msg
+        return False, retry, "minute", msg
 
     # Проверка дневного лимита
     if bucket["day_count"] >= settings.rate_limit_per_day:
@@ -57,9 +59,9 @@ def check_rate_limit(user_id: int) -> Tuple[bool, Optional[int], Optional[str]]:
             "🚫 Достигнут дневной лимит запросов для этого бота.\n"
             "Лимит обновится завтра."
         )
-        return False, retry, msg
+        return False, retry, "day", msg
 
     # Учитываем запрос
     bucket["minute_count"] += 1
     bucket["day_count"] += 1
-    return True, None, None
+    return True, None, None, None
