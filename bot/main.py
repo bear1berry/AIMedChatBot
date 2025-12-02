@@ -10,6 +10,7 @@ from aiogram.enums import ParseMode
 from .config import settings
 from .handlers import router as main_router
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -20,9 +21,8 @@ async def main() -> None:
     """
     Точка входа бота.
 
-    Главное изменение по UX:
-    — parse_mode переведён в HTML, чтобы все <b>, <i> и аккуратная верстка,
-      которую мы просим у модели, отображались в Telegram как надо.
+    Важно: используем HTML parse_mode, чтобы форматирование (<b>, <i>, <code>)
+    из промптов и ответов нормально отображалось в Telegram.
     """
     bot = Bot(
         token=settings.bot_token,
