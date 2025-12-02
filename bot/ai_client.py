@@ -1,624 +1,497 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import re
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Optional
 
-from groq import AsyncGroq
+import httpx
 
-from .config import settings
-from .limits import check_rate_limit
-from .modes import DEFAULT_MODE_KEY, build_system_prompt, get_mode_label
+from .modes import build_system_prompt, DEFAULT_MODE_KEY
 
 logger = logging.getLogger(__name__)
 
-# --- Типы настроек диалога ---
+# === AIMLAPI config ===
 
-AnswerStyle = Literal["default", "short", "detailed", "checklist"]
-ToneStyle = Literal["default", "story", "strict"]
-Audience = Literal["auto", "patient", "doctor"]
-ModelProfile = Literal[
-    "auto",
-    "gpt4",
-    "mini",
-    "oss",
-    "deepseek_reasoner",
-    "deepseek_chat",
-]
+AIML_API_KEY = os.getenv("AIML_API_KEY", "")
+AIML_API_URL = os.getenv("AIML_API_URL", "https://api.aimlapi.com/v1/chat/completions")
 
+# Основные модели
+AIML_MODEL_PRIMARY = os.getenv("AIML_MODEL_PRIMARY", "openai/gpt-4.1")
+AIML_MODEL_FAST = os.getenv("AIML_MODEL_FAST", "openai/gpt-4.1-mini")
+AIML_MODEL_GPT_OSS_120B = os.getenv("AIML_MODEL_GPT_OSS_120B", "openai/gpt-oss-120b")
+AIML_MODEL_DEEPSEEK_REASONER = os.getenv("AIML_MODEL_DEEPSEEK_REASONER", "deepseek/deepseek-reasoner")
+AIML_MODEL_DEEPSEEK_CHAT = os.getenv("AIML_MODEL_DEEPSEEK_CHAT", "deepseek/deepseek-chat")
 
-_MODEL_PROFILE_LABELS: Dict[str, str] = {
-    "auto": "🤖 Авто (подбор модели)",
-    "gpt4": "🧠 GPT-4.1 (профиль)",
-    "mini": "⚡️ GPT-4o mini (профиль)",
-    "oss": "🧬 GPT-OSS 120B",
-    "deepseek_reasoner": "🧩 DeepSeek Reasoner (профиль)",
-    "deepseek_chat": "💬 DeepSeek Chat (профиль)",
-}
+# Лимиты на пользователя (можно переопределить через переменные окружения)
+RATE_LIMIT_PER_MINUTE = int(os.getenv("AIMED_RATE_LIMIT_PER_MINUTE", "20"))
+RATE_LIMIT_PER_DAY = int(os.getenv("AIMED_RATE_LIMIT_PER_DAY", "200"))
 
 
 class RateLimitError(Exception):
-    """Исключение, выбрасываемое при превышении лимитов запросов."""
+    """Raised when per-user rate limit is exceeded."""
 
-    def __init__(
-        self,
-        scope: str,
-        retry_after: Optional[int],
-        message: Optional[str] = None,
-    ) -> None:
-        super().__init__(message or "Rate limit exceeded")
-        self.scope = scope          # "minute" или "day"
-        self.retry_after = retry_after
-        self.message = message or ""
+    def __init__(self, scope: str):
+        # scope: "minute" or "day"
+        super().__init__(scope)
+        self.scope = scope
+
+
+@dataclass
+class _RateLimitBucket:
+    minute_ts: int = 0
+    minute_count: int = 0
+    day_ts: int = 0
+    day_count: int = 0
+
+
+_rate_limits: Dict[int, _RateLimitBucket] = {}
+
+
+def _check_rate_limit(user_id: int) -> None:
+    now = int(time.time())
+    minute = now // 60
+    day = now // 86400
+
+    bucket = _rate_limits.get(user_id)
+    if bucket is None:
+        bucket = _RateLimitBucket()
+        _rate_limits[user_id] = bucket
+
+    if bucket.minute_ts != minute:
+        bucket.minute_ts = minute
+        bucket.minute_count = 0
+
+    if bucket.day_ts != day:
+        bucket.day_ts = day
+        bucket.day_count = 0
+
+    if bucket.minute_count >= RATE_LIMIT_PER_MINUTE:
+        raise RateLimitError("minute")
+
+    if bucket.day_count >= RATE_LIMIT_PER_DAY:
+        raise RateLimitError("day")
+
+    bucket.minute_count += 1
+    bucket.day_count += 1
+
+
+# === Workspaces & conversation state ===
+
+
+@dataclass
+class Workspace:
+    id: str
+    title: str
+    mode_key: str = DEFAULT_MODE_KEY
+    model_profile: str = "auto"  # auto | gpt4 | mini | oss | deepseek_reasoner | deepseek_chat
+    messages: List[dict] = field(default_factory=list)
+
+
+def _default_workspace_title(ws_id: str) -> str:
+    if ws_id == "default":
+        return "AI Universal"
+    if ws_id == "study":
+        return "Study Room"
+    if ws_id == "channel":
+        return "AI Medicine / канал"
+    if ws_id == "personal":
+        return "Личное / жизнь"
+    return f"Workspace {ws_id}"
 
 
 @dataclass
 class ConversationState:
-    mode_key: str = DEFAULT_MODE_KEY
-    messages: List[Dict[str, str]] = field(default_factory=list)
-    answer_style: AnswerStyle = "default"
-    tone: ToneStyle = "default"
-    audience: Audience = "auto"
-    model_profile: ModelProfile = "auto"
+    current_workspace_id: str = "default"
+    workspaces: Dict[str, Workspace] = field(default_factory=dict)
+
+    @property
+    def current(self) -> Workspace:
+        if self.current_workspace_id not in self.workspaces:
+            # ленивая инициализация
+            self.workspaces[self.current_workspace_id] = Workspace(
+                id=self.current_workspace_id,
+                title=_default_workspace_title(self.current_workspace_id),
+            )
+        return self.workspaces[self.current_workspace_id]
+
+    # Backward-compatible properties
+
+    @property
+    def mode_key(self) -> str:
+        return self.current.mode_key
+
+    @mode_key.setter
+    def mode_key(self, value: str) -> None:
+        self.current.mode_key = value
+
+    @property
+    def model_profile(self) -> str:
+        return self.current.model_profile
+
+    @model_profile.setter
+    def model_profile(self, value: str) -> None:
+        self.current.model_profile = value
+
+    @property
+    def messages(self) -> List[dict]:
+        return self.current.messages
+
+    @messages.setter
+    def messages(self, value: List[dict]) -> None:
+        self.current.messages = value
 
 
-_STATES: Dict[int, ConversationState] = {}
+_conversations: Dict[int, ConversationState] = {}
 
-_client = AsyncGroq(api_key=settings.groq_api_key)
+
+def _ensure_default_workspaces(state: ConversationState) -> None:
+    """Создаём дефолтные пространства, если их ещё нет."""
+    if state.workspaces:
+        return
+
+    state.workspaces["default"] = Workspace(
+        id="default",
+        title=_default_workspace_title("default"),
+        mode_key=DEFAULT_MODE_KEY,
+        model_profile="auto",
+    )
+    # Дополнительные преднастроенные пространства
+    state.workspaces["channel"] = Workspace(
+        id="channel",
+        title=_default_workspace_title("channel"),
+        mode_key="content_creator",
+        model_profile="auto",
+    )
+    state.workspaces["study"] = Workspace(
+        id="study",
+        title=_default_workspace_title("study"),
+        mode_key=DEFAULT_MODE_KEY,
+        model_profile="auto",
+    )
+    state.workspaces["personal"] = Workspace(
+        id="personal",
+        title=_default_workspace_title("personal"),
+        mode_key="friendly_chat",
+        model_profile="auto",
+    )
+    state.current_workspace_id = "default"
 
 
 def get_state(user_id: int) -> ConversationState:
-    state = _STATES.get(user_id)
+    state = _conversations.get(user_id)
     if state is None:
         state = ConversationState()
-        _STATES[user_id] = state
+        _conversations[user_id] = state
+    _ensure_default_workspaces(state)
+    return state
+
+
+def list_workspaces(user_id: int) -> List[Workspace]:
+    state = get_state(user_id)
+    return list(state.workspaces.values())
+
+
+def get_current_workspace(user_id: int) -> Workspace:
+    state = get_state(user_id)
+    return state.current
+
+
+def set_current_workspace(user_id: int, workspace_id: str) -> Workspace:
+    state = get_state(user_id)
+    if workspace_id not in state.workspaces:
+        state.workspaces[workspace_id] = Workspace(
+            id=workspace_id,
+            title=_default_workspace_title(workspace_id),
+        )
+    state.current_workspace_id = workspace_id
+    return state.current
+
+
+def create_workspace(
+    user_id: int,
+    title: Optional[str] = None,
+    base_mode: Optional[str] = None,
+    model_profile: Optional[str] = None,
+) -> Workspace:
+    state = get_state(user_id)
+    # подберём свободный id wsN
+    idx = 1
+    while True:
+        ws_id = f"ws{idx}"
+        if ws_id not in state.workspaces:
+            break
+        idx += 1
+
+    ws = Workspace(
+        id=ws_id,
+        title=title.strip() if title and title.strip() else _default_workspace_title(ws_id),
+        mode_key=base_mode or DEFAULT_MODE_KEY,
+        model_profile=model_profile or "auto",
+    )
+    state.workspaces[ws_id] = ws
+    state.current_workspace_id = ws_id
+    return ws
+
+
+def set_mode(user_id: int, mode_key: str) -> ConversationState:
+    """
+    Установить режим для текущего workspace и очистить историю.
+    """
+    state = get_state(user_id)
+    state.mode_key = mode_key
+    state.messages.clear()
     return state
 
 
 def reset_state(user_id: int) -> None:
-    """Полный сброс состояния диалога пользователя в памяти."""
-    _STATES[user_id] = ConversationState()
+    """
+    Очистить историю только текущего workspace, режим и модель оставить.
+    """
+    state = _conversations.get(user_id)
+    if state:
+        state.current.messages.clear()
 
 
-def set_mode(user_id: int, mode_key: str) -> ConversationState:
-    """Переключение режима ассистента для пользователя."""
-    state = get_state(user_id)
-    state.mode_key = mode_key or DEFAULT_MODE_KEY
-    state.messages.clear()
-    logger.info("User %s switched mode to %s", user_id, get_mode_label(state.mode_key))
-    return state
+_MODEL_PROFILE_LABELS = {
+    "auto": "Авто (подбор)",
+    "gpt4": "GPT-4.1",
+    "mini": "GPT-4o mini",
+    "oss": "GPT-OSS 120B",
+    "deepseek_reasoner": "DeepSeek Reasoner",
+    "deepseek_chat": "DeepSeek Chat",
+}
 
 
 def set_model_profile(user_id: int, profile: str) -> ConversationState:
-    """Сохраняем выбранный профиль модели (для UI и возможных будущих настроек)."""
+    """
+    Установить профиль модели для текущего workspace.
+    """
     if profile not in _MODEL_PROFILE_LABELS:
         raise ValueError(f"Unknown model profile: {profile}")
-
     state = get_state(user_id)
-    state.model_profile = profile  # type: ignore[assignment]
-    logger.info("User %s switched model profile to %s", user_id, profile)
+    state.model_profile = profile
     return state
 
 
-def get_model_profile_label(profile: Optional[str]) -> str:
-    if not profile:
-        return _MODEL_PROFILE_LABELS["auto"]
-    return _MODEL_PROFILE_LABELS.get(profile, _MODEL_PROFILE_LABELS["auto"])
-
-
-async def healthcheck_llm() -> bool:
-    """Простой ping-запрос к модели Groq, чтобы проверить доступность API."""
-    try:
-        _ = await _client.chat.completions.create(
-            model=settings.model_name,
-            messages=[
-                {"role": "system", "content": "You are a healthcheck probe."},
-                {"role": "user", "content": "ping"},
-            ],
-            max_completion_tokens=1,
-            temperature=0.0,
-        )
-        return True
-    except Exception:
-        logger.exception("Healthcheck failed")
-        return False
-
-
-# --- Хелперы анализа текста ---
-
-
-def _classify_task_type(text: str) -> str:
-    t = text.lower()
-
-    post_triggers = [
-        "пост для",
-        "пост в",
-        "для канала",
-        "описание канала",
-        "описание профиля",
-        "контент-план",
-        "контент план",
-        "заголовок поста",
-        "текст для поста",
-    ]
-    outline_triggers = [
-        "конспект",
-        "шпаргалк",
-        "структуру",
-        "структура лекции",
-        "план лекции",
-        "план доклада",
-        "outline",
-    ]
-    plan_triggers = [
-        "пошаговый план",
-        "что делать",
-        "todo",
-        "to-do",
-        "список задач",
-        "дорожную карту",
-    ]
-    code_triggers = [
-        "код",
-        "script",
-        "скрипт",
-        "python",
-        "sql",
-        "javascript",
-        "ошибка",
-        "traceback",
-        "stack trace",
-    ]
-
-    if any(w in t for w in code_triggers):
-        return "code"
-    if any(w in t for w in post_triggers):
-        return "post"
-    if any(w in t for w in outline_triggers):
-        return "outline"
-    if any(w in t for w in plan_triggers):
-        return "plan"
-    return "chat"
-
-
-def _detect_audience_from_text(text: str) -> Audience:
-    t = text.lower()
-    patient_triggers = [
-        "для пациента",
-        "понятным языком",
-        "простым языком",
-        "для обычных людей",
-    ]
-    doctor_triggers = [
-        "для врача",
-        "для студентов-медиков",
-        "для ординаторов",
-        "для медиков",
-        "лекция для",
-    ]
-
-    if any(w in t for w in patient_triggers):
-        return "patient"
-    if any(w in t for w in doctor_triggers):
-        return "doctor"
-    return "auto"
-
-
-_MEDICAL_KEYWORDS = [
-    "диагноз",
-    "лечение",
-    "лечить",
-    "симптом",
-    "жалоб",
-    "пациент",
-    "температур",
-    "кашель",
-    "боль",
-    "высыпан",
-    "анализ",
-    "кровь",
-    "пневмони",
-    "инфекц",
-    "эпид",
-    "вакцин",
-    "прививк",
-]
-
-
-def _is_medical_context(text: str, mode_key: str) -> bool:
-    if mode_key == "ai_medicine_assistant":
-        return True
-    t = text.lower()
-    return any(w in t for w in _MEDICAL_KEYWORDS)
-
-
-_RED_FLAG_KEYWORDS = [
-    "резкая боль в груди",
-    "сильная боль в груди",
-    "одышк",
-    "не может дышать",
-    "удушье",
-    "потеря сознания",
-    "упал в обморок",
-    "судорог",
-    "онемение руки",
-    "перекосило лицо",
-    "нарушение речи",
-    "кровавая рвота",
-    "рвота с кровью",
-    "черный стул",
-    "дёгтеобразный стул",
-    "температура 40",
-    "температура 39",
-    "очень сильная боль в животе",
-]
-
-
-def _has_medical_red_flags(text: str) -> bool:
-    t = text.lower()
-    return any(w in t for w in _RED_FLAG_KEYWORDS)
-
-
-def _build_dynamic_instructions(state: ConversationState, user_text: str) -> str:
-    parts: List[str] = []
-
-    # Тип задачи
-    task_type = _classify_task_type(user_text)
-    if task_type == "post":
-        parts.append(
-            "- Формат ответа: текст для поста в Telegram с коротким цепляющим вступлением и 2–4 абзацами. Если уместно, добавь короткий список."
-        )
-    elif task_type == "outline":
-        parts.append(
-            "- Формат ответа: структурированный конспект с заголовками и списками."
-        )
-    elif task_type == "plan":
-        parts.append(
-            "- Формат ответа: пошаговый план действий (чек-лист), каждый шаг с новой строки."
-        )
-    elif task_type == "code":
-        parts.append(
-            "- Формат ответа: сначала краткое объяснение, затем пример кода. Избегай лишнего использования Markdown-форматирования внутри кода."
-        )
-    else:
-        parts.append("- Формат ответа: обычное объяснение, структурно и по делу.")
-
-    # Стиль длины ответа
-    if state.answer_style == "short":
-        parts.append(
-            "- Длина ответа: максимально кратко, 3–7 ключевых пунктов или предложений, только суть."
-        )
-    elif state.answer_style == "detailed":
-        parts.append(
-            "- Длина ответа: подробно, но без воды. Разделяй текст на логические блоки с заголовками и списками."
-        )
-    elif state.answer_style == "checklist":
-        parts.append(
-            "- Формат ответа: чек-лист. Каждый пункт с новой строки, начинай с символа «•»."
-        )
-
-    # Тон
-    if state.tone == "story":
-        parts.append(
-            "- Тон: лёгкий сторителлинг. Сначала короткий контекст или мини-история, затем выводы и рекомендации."
-        )
-    elif state.tone == "strict":
-        parts.append(
-            "- Тон: сухо, структурно и по делу, без лишних эмоций и украшательств."
-        )
-
-    # Аудитория
-    effective_audience = state.audience
-    if effective_audience == "auto":
-        detected = _detect_audience_from_text(user_text)
-        if detected != "auto":
-            effective_audience = detected
-
-    if effective_audience == "patient":
-        parts.append(
-            "- Аудитория: пациент или человек без медобразования. Объясняй максимально простым и понятным языком, избегай тяжёлых терминов или сразу расшифровывай их."
-        )
-    elif effective_audience == "doctor":
-        parts.append(
-            "- Аудитория: врач или студент-медик. Можно использовать медицинскую терминологию, ориентируйся на профессиональный уровень."
-        )
-
-    if not parts:
-        return ""
-
-    return "Дополнительные настройки ответа:\n" + "\n".join(parts)
-
-
-# --- Постобработка текста под HTML parse_mode ---
-
-
-_ALLOWED_HTML_TAGS = {"b", "strong", "i", "em", "u", "code", "a"}
-
-
-def _strip_unsupported_html(text: str) -> str:
-    """Удаляем все HTML-теги, кроме безопасных для Telegram."""
-
-    def _repl(match: re.Match) -> str:
-        tag = match.group("tag").lower()
-        if tag in _ALLOWED_HTML_TAGS:
-            return match.group(0)
-        return ""
-
-    return re.sub(
-        r"</?(?P<tag>[a-zA-Z0-9]+)(?:\s[^>]*?)?>",
-        _repl,
-        text,
-    )
-
-
-def _convert_simple_markdown_to_html(text: str) -> str:
-    """Мини-конвертер самых частых Markdown-паттернов в HTML."""
-    # **bold** или *bold* -> <b>bold</b>
-    text = re.sub(
-        r"\*\*(?P<inner>[^*]+)\*\*", r"<b>\g<inner></b>", text
-    )
-    text = re.sub(
-        r"\*(?P<inner>[^*]+)\*", r"<b>\g<inner></b>", text
-    )
-
-    # _italic_ -> <i>italic</i>
-    text = re.sub(
-        r"_(?P<inner>[^_]+)_", r"<i>\g<inner></i>", text
-    )
-    return text
+def get_model_profile_label(profile: str) -> str:
+    return _MODEL_PROFILE_LABELS.get(profile, "Авто (подбор)")
 
 
 def _postprocess_reply(text: str) -> str:
-    """Приводим ответ к аккуратной HTML-разметке для Telegram."""
-    if not text:
-        return "Извини, сейчас не получилось сформировать ответ."
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-    # Простейшие теги абзацев -> перевод строки
-    text = re.sub(
-        r"</?(?:p|br|div|span)\s*/?>",
-        "\n",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    # Нумерованные списки "1. ..." / "1) ..." -> "• ..."
-    text = re.sub(
-        r"^\s*\d+[.)]\s+",
-        "• ",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # "- пункт" в начале строки -> "• пункт"
-    text = re.sub(
-        r"^\s*-\s+",
-        "• ",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # Заголовки вида "# Заголовок" -> <b>Заголовок</b>
-    def heading_repl(match: re.Match) -> str:
-        title = match.group("title").strip()
-        if not title:
-            return ""
-        return f"<b>{title}</b>\n"
-
-    text = re.sub(
-        r"^(?P<hashes>#{1,3})\s+(?P<title>.+)$",
-        heading_repl,
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # Конвертируем простейший Markdown в HTML
-    text = _convert_simple_markdown_to_html(text)
-
-    # Убираем лишние и опасные HTML-теги
-    text = _strip_unsupported_html(text)
-
-    # Сжимаем пачки пустых строк
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+    """
+    Лёгкая пост-обработка ответа: убираем лишние пробелы и дублирующиеся пустые строки.
+    """
+    text = text.replace("\r\n", "\n").strip()
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text
 
 
-def _select_model_and_params(state: ConversationState) -> Tuple[str, float]:
-    """Подбор имени модели и температуры по профилю.
+def _model_human_name(model_id: str) -> str:
+    if model_id == AIML_MODEL_PRIMARY:
+        return "GPT-4.1"
+    if model_id == AIML_MODEL_FAST:
+        return "GPT-4o mini"
+    if model_id == AIML_MODEL_GPT_OSS_120B:
+        return "GPT-OSS 120B"
+    if model_id == AIML_MODEL_DEEPSEEK_REASONER:
+        return "DeepSeek Reasoner"
+    if model_id == AIML_MODEL_DEEPSEEK_CHAT:
+        return "DeepSeek Chat"
+    return model_id
 
-    Сейчас всё завязано на одном значении settings.model_name, но профиль
-    сохраняем на будущее и слегка корректируем температуру.
+
+def _model_emoji(model_id: str) -> str:
+    if model_id == AIML_MODEL_PRIMARY:
+        return "🧠"
+    if model_id == AIML_MODEL_FAST:
+        return "⚡️"
+    if model_id == AIML_MODEL_GPT_OSS_120B:
+        return "🧬"
+    if model_id == AIML_MODEL_DEEPSEEK_REASONER:
+        return "🧩"
+    if model_id == AIML_MODEL_DEEPSEEK_CHAT:
+        return "💬"
+    return "🤖"
+
+
+def _model_short_desc(model_id: str) -> str:
+    if model_id == AIML_MODEL_PRIMARY:
+        return "точная и универсальная модель"
+    if model_id == AIML_MODEL_FAST:
+        return "быстрые ответы и черновики"
+    if model_id == AIML_MODEL_GPT_OSS_120B:
+        return "open-source модель для идей"
+    if model_id == AIML_MODEL_DEEPSEEK_REASONER:
+        return "глубокое рассуждение"
+    if model_id == AIML_MODEL_DEEPSEEK_CHAT:
+        return "диалоговая модель DeepSeek"
+    return "LLM"
+
+
+def _is_reasoning_task(question: str) -> bool:
+    q = question.lower()
+    return any(word in q for word in ["почему", "обоснуй", "объясни ход мыслей", "разбери кейс", "задача", "кейc"])
+
+
+def _is_brainstorm_task(question: str) -> bool:
+    q = question.lower()
+    return any(word in q for word in ["идея", "идеи", "варианты", "мозговой штурм", "придумай", "концепцию"])
+
+
+def _is_code_task(question: str) -> bool:
+    q = question.lower()
+    return any(word in q for word in ["код", "python", "sql", "javascript", "ошибка", "traceback", "програм", "скрипт"])
+
+
+def _select_models_for_query(question: str, state: ConversationState) -> List[str]:
+    """
+    Возвращает список id моделей, которые нужно дернуть для ответа.
+    Если выбрана ручная модель — всегда одна.
+    В режиме auto — 1–2 модели в зависимости от задачи.
     """
     profile = state.model_profile
 
-    # Базовое значение
-    model_name = settings.model_name
-    temperature = 0.35
-
+    # Ручной выбор — всегда ровно одна модель
+    if profile == "gpt4":
+        return [AIML_MODEL_PRIMARY]
     if profile == "mini":
-        temperature = 0.4
-    elif profile == "deepseek_reasoner":
-        temperature = 0.25
-    elif profile == "deepseek_chat":
-        temperature = 0.5
-    # gpt4 / oss / auto остаются с дефолтной температурой
+        return [AIML_MODEL_FAST]
+    if profile == "oss":
+        return [AIML_MODEL_GPT_OSS_120B]
+    if profile == "deepseek_reasoner":
+        return [AIML_MODEL_DEEPSEEK_REASONER]
+    if profile == "deepseek_chat":
+        return [AIML_MODEL_DEEPSEEK_CHAT]
 
-    return model_name, temperature
+    # Авто-подбор
+    is_reasoning = _is_reasoning_task(question)
+    is_brainstorm = _is_brainstorm_task(question)
+    is_code = _is_code_task(question)
+
+    # Сложные кейсы / код — 2 модели: GPT-4.1 + DeepSeek Reasoner
+    if is_reasoning or is_code:
+        return [AIML_MODEL_PRIMARY, AIML_MODEL_DEEPSEEK_REASONER]
+
+    # Брейншторм / креатив — GPT-OSS 120B + GPT-4.1
+    if is_brainstorm:
+        return [AIML_MODEL_GPT_OSS_120B, AIML_MODEL_PRIMARY]
+
+    # Обычный короткий вопрос — быстрая модель
+    if len(question) < 400:
+        return [AIML_MODEL_FAST]
+
+    # Остальное — основная модель
+    return [AIML_MODEL_PRIMARY]
 
 
-# --- Основной вызов модели ---
+async def _call_model(model: str, messages: List[dict]) -> str:
+    """
+    Вызов AIMLAPI для одной модели.
+    """
+    if not AIML_API_KEY:
+        raise RuntimeError("AIML_API_KEY is not set")
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "max_tokens": 2048,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {AIML_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(AIML_API_URL, json=payload, headers=headers)
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.exception("Failed to parse AIMLAPI response: %s", resp.text[:500])
+        raise RuntimeError("Failed to parse AIMLAPI response")
+
+    if resp.status_code >= 400:
+        err = data.get("error") if isinstance(data, dict) else data
+        logger.error("AIMLAPI error (%s): %r", resp.status_code, err)
+        raise RuntimeError(f"AIMLAPI error {resp.status_code}: {err}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        logger.exception("Unexpected AIMLAPI payload: %r", data)
+        raise RuntimeError("Unexpected AIMLAPI response format")
+
+    return _postprocess_reply(content)
 
 
 async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> str:
-    """Основной вызов модели Groq с учётом режима, истории и настроек стиля."""
+    """
+    Главная точка входа: отправить запрос в ИИ с учётом workspace, режима и истории.
+    """
+    _check_rate_limit(user_id)
+
     state = get_state(user_id)
-    mode_key = state.mode_key or DEFAULT_MODE_KEY
+    ws = state.current
 
-    # Проверяем rate-limit
-    ok, retry_after, scope, msg = check_rate_limit(user_id)
-    if not ok:
-        raise RateLimitError(scope or "minute", retry_after, msg)
+    system_prompt = build_system_prompt(mode_key=ws.mode_key, user_name=user_name)
+    messages: List[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(ws.messages)
+    messages.append({"role": "user", "content": text})
 
-    base_system = build_system_prompt(mode_key, user_name=user_name)
-    dynamic = _build_dynamic_instructions(state, text)
-    system_prompt = base_system
-    if dynamic:
-        system_prompt = base_system + "\n\n" + dynamic
+    models = _select_models_for_query(text, state)
 
-    # История (до ~40 сообщений)
-    history = state.messages[-40:]
+    if len(models) == 1:
+        reply = await _call_model(models[0], messages)
+    else:
+        # Несколько моделей — запускаем параллельно и красиво объединяем ответы
+        tasks = [_call_model(m, messages) for m in models]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-        *history,
-        {"role": "user", "content": text},
-    ]
+        blocks: List[str] = []
+        for model_id, result in zip(models, results):
+            name = _model_human_name(model_id)
+            emoji = _model_emoji(model_id)
+            desc = _model_short_desc(model_id)
 
-    model_name, temperature = _select_model_and_params(state)
+            if isinstance(result, Exception):
+                logger.exception("Model %s failed", model_id, exc_info=result)
+                block = (
+                    f"{emoji} <b>{name}</b> ({desc}):\n"
+                    "⚠️ Ошибка при обращении к модели. Попробуй ещё раз."
+                )
+            else:
+                block = f"{emoji} <b>{name}</b> ({desc}):\n{result}"
 
-    try:
-        completion = await _client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=temperature,
-            max_completion_tokens=1800,
-        )
-    except Exception as e:
-        logger.exception("Groq API error: %s", e)
-        raise
+            blocks.append(block)
 
-    reply = completion.choices[0].message.content if completion.choices else ""
-    reply = reply or "Извини, я не смог сформировать осмысленный ответ."
+        reply = "\n\n━━━━━━━━━━━━━━\n\n".join(blocks)
 
-    reply = _postprocess_reply(reply)
+    # Обновляем историю текущего workspace
+    ws.messages.append({"role": "user", "content": text})
+    ws.messages.append({"role": "assistant", "content": reply})
 
-    # Медицинские флаги / дисклеймеры
-    is_med = _is_medical_context(text, mode_key)
-    has_flags = _has_medical_red_flags(text)
-
-    if is_med:
-        disclaimer = (
-            "⚠️ Этот ответ носит информационный характер и не является заменой очной "
-            "консультации врача. Для постановки диагноза и назначения лечения обязательно "
-            "обратитесь к специалисту."
-        )
-        if disclaimer not in reply:
-            reply = f"{reply}\n\n{disclaimer}"
-
-    if has_flags:
-        emergency = (
-            "🚨 В описанной ситуации могут присутствовать симптомы, требующие срочной "
-            "оценки врачом.\n"
-            "Если есть выраженная боль, затруднённое дыхание, нарушение сознания, судороги, "
-            "признаки инсульта или другие острые симптомы — немедленно вызовите скорую помощь "
-            "или обратитесь в ближайший приёмный покой."
-        )
-        reply = f"{emergency}\n\n{reply}"
-
-    # Заголовок с режимом
-    mode_label = get_mode_label(mode_key)
-    reply = f"<b>{mode_label}</b>\n\n{reply}"
-
-    # Сохраняем историю
-    state.messages.append({"role": "user", "content": text})
-    state.messages.append({"role": "assistant", "content": reply})
+    # ограничиваем историю (последние N обменов)
+    max_turns = 12
+    if len(ws.messages) > max_turns * 2:
+        ws.messages = ws.messages[-max_turns * 2 :]
 
     return reply
 
 
-# --- Дополнительные функции для /summary, /todo, /md, /status ---
-
-
-async def summarize_dialog(user_id: int) -> str:
-    state = get_state(user_id)
-    if not state.messages:
-        return "Диалог пока пуст — нечего резюмировать."
-
-    history = state.messages[-40:]
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты делаешь краткое резюме диалога между пользователем и ассистентом.\n"
-                "Сформируй 3–7 ключевых пункта: о чём говорили, какие решения и идеи появились."
-            ),
-        },
-        *history,
-    ]
-
-    completion = await _client.chat.completions.create(
-        model=settings.model_name,
-        messages=messages,
-        temperature=0.2,
-        max_completion_tokens=600,
-    )
-    reply = completion.choices[0].message.content if completion.choices else ""
-    return _postprocess_reply(reply or "Не удалось построить резюме диалога.")
-
-
-async def extract_todos(user_id: int) -> str:
-    state = get_state(user_id)
-    if not state.messages:
-        return "Диалог пока пуст — задач не видно."
-
-    history = state.messages[-40:]
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Извлеки из диалога список задач и конкретных действий для пользователя.\n"
-                "Формат ответа: чек-лист с пунктами, каждый пункт с новой строки, начинать с «•».\n"
-                "Если явных задач нет — покажи возможные шаги, которые логично вытекают из обсуждения."
-            ),
-        },
-        *history,
-    ]
-
-    completion = await _client.chat.completions.create(
-        model=settings.model_name,
-        messages=messages,
-        temperature=0.25,
-        max_completion_tokens=600,
-    )
-    reply = completion.choices[0].message.content if completion.choices else ""
-    return _postprocess_reply(reply or "Я не вижу явных задач в этом диалоге.")
-
-
-def export_markdown(user_id: int) -> str:
-    state = get_state(user_id)
-    if not state.messages:
-        return "Диалог пока пуст."
-
-    history = state.messages[-80:]
-
-    lines: List[str] = []
-    for msg in history:
-        role = msg.get("role", "")
-        content = msg.get("content", "").strip()
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"*User:*\n{content}")
-        elif role == "assistant":
-            lines.append(f"*Assistant:*\n{content}")
-        else:
-            lines.append(f"*{role}:*\n{content}")
-
-    return "\n\n---\n\n".join(lines)
-
-
-def get_user_settings(user_id: int) -> Dict[str, str]:
-    state = get_state(user_id)
-    return {
-        "mode_key": state.mode_key,
-        "mode_label": get_mode_label(state.mode_key),
-        "answer_style": state.answer_style,
-        "tone": state.tone,
-        "audience": state.audience,
-        "model_profile": state.model_profile,
-        "messages_count": str(len(state.messages)),
-        "model_name": settings.model_name,
-    }
+async def healthcheck_llm() -> bool:
+    """
+    Лёгкий пинг для проверки доступности модели.
+    """
+    try:
+        _ = await _call_model(AIML_MODEL_FAST, [{"role": "user", "content": "ping"}])
+        return True
+    except Exception:
+        logger.exception("LLM healthcheck failed")
+        return False
