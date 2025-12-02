@@ -13,38 +13,48 @@ from .modes import build_system_prompt, DEFAULT_MODE_KEY
 
 logger = logging.getLogger(__name__)
 
-# === YandexGPT / OpenAI-compatible config ===
+# === YandexGPT / OpenAI-совместимый API ===
+#
+# Бот работает через OpenAI-совместимый endpoint YandexGPT:
+#   https://llm.api.cloud.yandex.net/v1/chat/completions
+#
+# Нужны:
+#   - сервисный API-ключ:  YANDEX_CLOUD_API_KEY
+#   - ID каталога:         YANDEX_CLOUD_FOLDER
+#
+# В .env нужно добавить, например:
+#   YANDEX_CLOUD_API_KEY=yc_sa_********************************
+#   YANDEX_CLOUD_FOLDER=b1gxxxxxxxxxxxxxxxx
 
-# Идентификатор каталога (folder_id) и ключ сервисного аккаунта Yandex Cloud.
-# Значения задаём через переменные YANDEX_CLOUD_FOLDER и YANDEX_CLOUD_API_KEY.
-YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "")
+YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "").strip()
 
-# Для обратной совместимости можно оставить AIML_API_KEY — он используется как запасной вариант.
-AIML_API_KEY = os.getenv("YANDEX_CLOUD_API_KEY") or os.getenv("AIML_API_KEY", "")
+# Оставляем AIML_API_KEY для обратной совместимости, но приоритет у YANDEX_CLOUD_API_KEY.
+AIML_API_KEY = (
+    os.getenv("YANDEX_CLOUD_API_KEY") or os.getenv("AIML_API_KEY", "")
+).strip()
 
-# OpenAI-совместимый endpoint YandexGPT (chat.completions) :contentReference[oaicite:0]{index=0}
 AIML_API_URL = os.getenv(
     "AIML_API_URL",
     "https://llm.api.cloud.yandex.net/v1/chat/completions",
-)
+).strip()
 
 
 def _default_model_uri(short_id: str) -> str:
-    """Собираем URI модели вида gpt://<folder>/<short_id>.
-
-    Если каталог не указан (YANDEX_CLOUD_FOLDER пустой), возвращаем short_id как есть —
-    тогда его можно задать полностью через переменную окружения AIML_MODEL_*.
     """
-    if short_id.startswith("gpt://"):
-        return short_id
+    Собираем URI модели вида gpt://<folder>/<short_id>.
+
+    Если каталог не указан (YANDEX_CLOUD_FOLDER пустой),
+    возвращаем short_id как есть — тогда его можно задать
+    полностью через переменную окружения AIML_MODEL_*.
+    """
     if YANDEX_CLOUD_FOLDER:
+        if short_id.startswith("gpt://"):
+            return short_id
         return f"gpt://{YANDEX_CLOUD_FOLDER}/{short_id}"
     return short_id
 
 
-# Основные модели (по умолчанию — YandexGPT).
-# При желании их можно переопределить через переменные окружения:
-# AIML_MODEL_PRIMARY, AIML_MODEL_FAST, AIML_MODEL_GPT_OSS_120B и т.д. :contentReference[oaicite:1]{index=1}
+# Основные модели YandexGPT
 AIML_MODEL_PRIMARY = os.getenv(
     "AIML_MODEL_PRIMARY",
     _default_model_uri("yandexgpt/latest"),
@@ -53,9 +63,12 @@ AIML_MODEL_FAST = os.getenv(
     "AIML_MODEL_FAST",
     _default_model_uri("yandexgpt-lite/latest"),
 )
+
+# Дополнительные "профили" — для совместимости со старой логикой.
+# Можно переопределить через переменные окружения, если у вас есть другие модели.
 AIML_MODEL_GPT_OSS_120B = os.getenv(
     "AIML_MODEL_GPT_OSS_120B",
-    _default_model_uri("gpt-oss-120b/latest"),
+    AIML_MODEL_PRIMARY,
 )
 AIML_MODEL_DEEPSEEK_REASONER = os.getenv(
     "AIML_MODEL_DEEPSEEK_REASONER",
@@ -63,20 +76,22 @@ AIML_MODEL_DEEPSEEK_REASONER = os.getenv(
 )
 AIML_MODEL_DEEPSEEK_CHAT = os.getenv(
     "AIML_MODEL_DEEPSEEK_CHAT",
-    AIML_MODEL_PRIMARY,
+    AIML_MODEL_FAST,
 )
-
 
 # Лимиты на пользователя (можно переопределить через переменные окружения)
 RATE_LIMIT_PER_MINUTE = int(os.getenv("AIMED_RATE_LIMIT_PER_MINUTE", "20"))
 RATE_LIMIT_PER_DAY = int(os.getenv("AIMED_RATE_LIMIT_PER_DAY", "200"))
 
 
-class RateLimitError(Exception):
-    """Raised when per-user rate limit is exceeded."""
+# === Rate limiting ===
 
-    def __init__(self, scope: str):
-        # scope: "minute" or "day"
+
+class RateLimitError(Exception):
+    """Исключение, когда превышен лимит запросов на пользователя."""
+
+    def __init__(self, scope: str) -> None:
+        # scope: "minute" или "day"
         super().__init__(scope)
         self.scope = scope
 
@@ -128,7 +143,8 @@ class Workspace:
     id: str
     title: str
     mode_key: str = DEFAULT_MODE_KEY
-    model_profile: str = "auto"  # auto | gpt4 | mini | oss | deepseek_reasoner | deepseek_chat
+    # auto | gpt4 | mini | oss | deepseek_reasoner | deepseek_chat
+    model_profile: str = "auto"
     messages: List[dict] = field(default_factory=list)
 
 
@@ -299,11 +315,11 @@ def reset_state(user_id: int) -> None:
 
 _MODEL_PROFILE_LABELS = {
     "auto": "Авто (подбор)",
-    "gpt4": "GPT-4.1",
-    "mini": "GPT-4o mini",
-    "oss": "GPT-OSS 120B",
-    "deepseek_reasoner": "DeepSeek Reasoner",
-    "deepseek_chat": "DeepSeek Chat",
+    "gpt4": "YandexGPT (основная)",
+    "mini": "YandexGPT Lite (быстрее)",
+    "oss": "Экспериментальный профиль",
+    "deepseek_reasoner": "Режим рассуждений (YandexGPT)",
+    "deepseek_chat": "Диалоговый режим (YandexGPT)",
 }
 
 
@@ -322,6 +338,9 @@ def get_model_profile_label(profile: str) -> str:
     return _MODEL_PROFILE_LABELS.get(profile, "Авто (подбор)")
 
 
+# === Выбор модели и пост-обработка ===
+
+
 def _postprocess_reply(text: str) -> str:
     """
     Лёгкая пост-обработка ответа: убираем лишние пробелы и дублирующиеся пустые строки.
@@ -334,16 +353,16 @@ def _postprocess_reply(text: str) -> str:
 
 def _model_human_name(model_id: str) -> str:
     if model_id == AIML_MODEL_PRIMARY:
-        return "GPT-4.1"
+        return "YandexGPT"
     if model_id == AIML_MODEL_FAST:
-        return "GPT-4o mini"
+        return "YandexGPT Lite"
     if model_id == AIML_MODEL_GPT_OSS_120B:
-        return "GPT-OSS 120B"
+        return "YandexGPT Experimental"
     if model_id == AIML_MODEL_DEEPSEEK_REASONER:
-        return "DeepSeek Reasoner"
+        return "YandexGPT Reasoning"
     if model_id == AIML_MODEL_DEEPSEEK_CHAT:
-        return "DeepSeek Chat"
-    return model_id
+        return "YandexGPT Chat"
+    return "LLM"
 
 
 def _model_emoji(model_id: str) -> str:
@@ -352,7 +371,7 @@ def _model_emoji(model_id: str) -> str:
     if model_id == AIML_MODEL_FAST:
         return "⚡️"
     if model_id == AIML_MODEL_GPT_OSS_120B:
-        return "🧬"
+        return "🧪"
     if model_id == AIML_MODEL_DEEPSEEK_REASONER:
         return "🧩"
     if model_id == AIML_MODEL_DEEPSEEK_CHAT:
@@ -361,32 +380,67 @@ def _model_emoji(model_id: str) -> str:
 
 
 def _model_short_desc(model_id: str) -> str:
+    """
+    Краткое описание модели для подписи перед ответом.
+    """
     if model_id == AIML_MODEL_PRIMARY:
-        return "точная и универсальная модель"
+        return "точная и универсальная модель YandexGPT"
     if model_id == AIML_MODEL_FAST:
-        return "быстрые ответы и черновики"
+        return "быстрые ответы и черновики (Lite)"
     if model_id == AIML_MODEL_GPT_OSS_120B:
-        return "open-source модель для идей"
+        return "экспериментальный профиль на базе YandexGPT"
     if model_id == AIML_MODEL_DEEPSEEK_REASONER:
-        return "глубокое рассуждение"
+        return "режим усиленного рассуждения"
     if model_id == AIML_MODEL_DEEPSEEK_CHAT:
-        return "диалоговая модель DeepSeek"
+        return "диалоговый режим"
     return "LLM"
 
 
 def _is_reasoning_task(question: str) -> bool:
     q = question.lower()
-    return any(word in q for word in ["почему", "обоснуй", "объясни ход мыслей", "разбери кейс", "задача", "кейc"])
+    return any(
+        word in q
+        for word in [
+            "почему",
+            "обоснуй",
+            "объясни ход мыслей",
+            "разбери кейс",
+            "задача",
+            "кейс",
+        ]
+    )
 
 
 def _is_brainstorm_task(question: str) -> bool:
     q = question.lower()
-    return any(word in q for word in ["идея", "идеи", "варианты", "мозговой штурм", "придумай", "концепцию"])
+    return any(
+        word in q
+        for word in [
+            "идея",
+            "идеи",
+            "варианты",
+            "мозговой штурм",
+            "придумай",
+            "концепцию",
+        ]
+    )
 
 
 def _is_code_task(question: str) -> bool:
     q = question.lower()
-    return any(word in q for word in ["код", "python", "sql", "javascript", "ошибка", "traceback", "програм", "скрипт"])
+    return any(
+        word in q
+        for word in [
+            "код",
+            "python",
+            "sql",
+            "javascript",
+            "ошибка",
+            "traceback",
+            "програм",
+            "скрипт",
+        ]
+    )
 
 
 def _select_models_for_query(question: str, state: ConversationState) -> List[str]:
@@ -414,11 +468,11 @@ def _select_models_for_query(question: str, state: ConversationState) -> List[st
     is_brainstorm = _is_brainstorm_task(question)
     is_code = _is_code_task(question)
 
-    # Сложные кейсы / код — 2 модели: GPT-4.1 + DeepSeek Reasoner
+    # Сложные кейсы / код — 2 модели: основная + reasoning
     if is_reasoning or is_code:
         return [AIML_MODEL_PRIMARY, AIML_MODEL_DEEPSEEK_REASONER]
 
-    # Брейншторм / креатив — GPT-OSS 120B + GPT-4.1
+    # Брейншторм / креатив — "экспериментальная" + основная
     if is_brainstorm:
         return [AIML_MODEL_GPT_OSS_120B, AIML_MODEL_PRIMARY]
 
@@ -430,12 +484,16 @@ def _select_models_for_query(question: str, state: ConversationState) -> List[st
     return [AIML_MODEL_PRIMARY]
 
 
+# === Низкоуровневый вызов YandexGPT ===
+
+
 async def _call_model(model: str, messages: List[dict]) -> str:
     """
-    Вызов AIMLAPI для одной модели.
+    Вызов YandexGPT (OpenAI-совместимый endpoint) для одной модели.
+    Работает через HTTP-запрос к https://llm.api.cloud.yandex.net/v1/chat/completions.
     """
     if not AIML_API_KEY:
-        raise RuntimeError("AIML_API_KEY is not set")
+        raise RuntimeError("YANDEX_CLOUD_API_KEY (или AIML_API_KEY) не задан")
 
     payload = {
         "model": model,
@@ -449,6 +507,10 @@ async def _call_model(model: str, messages: List[dict]) -> str:
         "Authorization": f"Bearer {AIML_API_KEY}",
         "Content-Type": "application/json",
     }
+    # Для Yandex OpenAI-совместимого API нужно указать каталог
+    # через заголовок OpenAI-Project.
+    if YANDEX_CLOUD_FOLDER:
+        headers["OpenAI-Project"] = YANDEX_CLOUD_FOLDER
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(AIML_API_URL, json=payload, headers=headers)
@@ -456,26 +518,30 @@ async def _call_model(model: str, messages: List[dict]) -> str:
     try:
         data = resp.json()
     except Exception:
-        logger.exception("Failed to parse AIMLAPI response: %s", resp.text[:500])
-        raise RuntimeError("Failed to parse AIMLAPI response")
+        logger.exception("Failed to parse YandexGPT response: %s", resp.text[:500])
+        raise RuntimeError("Failed to parse YandexGPT response")
 
     if resp.status_code >= 400:
         err = data.get("error") if isinstance(data, dict) else data
-        logger.error("AIMLAPI error (%s): %r", resp.status_code, err)
-        raise RuntimeError(f"AIMLAPI error {resp.status_code}: {err}")
+        logger.error("YandexGPT error (%s): %r", resp.status_code, err)
+        raise RuntimeError(f"YandexGPT error {resp.status_code}: {err}")
 
     try:
         content = data["choices"][0]["message"]["content"]
     except Exception:
-        logger.exception("Unexpected AIMLAPI payload: %r", data)
-        raise RuntimeError("Unexpected AIMLAPI response format")
+        logger.exception("Unexpected YandexGPT payload: %r", data)
+        raise RuntimeError("Unexpected YandexGPT response format")
 
     return _postprocess_reply(content)
 
 
+# === Публичный API для обработчиков ===
+
+
 async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> str:
     """
-    Главная точка входа: отправить запрос в ИИ с учётом workspace, режима и истории.
+    Главная точка входа: отправить запрос в ИИ
+    с учётом workspace, режима и истории.
     """
     _check_rate_limit(user_id)
 
@@ -492,8 +558,8 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
     if len(models) == 1:
         reply = await _call_model(models[0], messages)
     else:
-        # Несколько моделей — запускаем параллельно и красиво объединяем ответы
-        tasks = [_call_model(m, messages) for m in models]
+        # Параллельно дёргаем несколько моделей и собираем единый ответ
+        tasks = [asyncio.create_task(_call_model(m, messages)) for m in models]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         blocks: List[str] = []
