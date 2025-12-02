@@ -17,9 +17,16 @@ logging.basicConfig(
 
 
 async def main() -> None:
+    """
+    Точка входа бота.
+
+    Главное изменение по UX:
+    — parse_mode переведён в HTML, чтобы все <b>, <i> и аккуратная верстка,
+      которую мы просим у модели, отображались в Telegram как надо.
+    """
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
     dp = Dispatcher()
