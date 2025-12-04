@@ -33,30 +33,81 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _get_columns(conn: sqlite3.Connection) -> set[str]:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users)")
+    rows = cur.fetchall()
+    return {row["name"] for row in rows}
+
+
 def init_db() -> None:
+    """
+    Инициализация БД + мягкая миграция старой схемы.
+    Раньше таблица users могла быть без полей username / free_tokens_used / paid_until.
+    Здесь мы аккуратно добавляем недостающие колонки.
+    """
     conn = _get_conn()
-    with conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                free_requests_used INTEGER NOT NULL DEFAULT 0,
-                free_tokens_used INTEGER NOT NULL DEFAULT 0,
-                paid_until INTEGER
+    cur = conn.cursor()
+
+    # Есть ли таблица users вообще?
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+    )
+    row = cur.fetchone()
+
+    if not row:
+        # Создаём таблицу с новой схемой
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    free_requests_used INTEGER NOT NULL DEFAULT 0,
+                    free_tokens_used INTEGER NOT NULL DEFAULT 0,
+                    paid_until INTEGER
+                )
+                """
             )
-            """
-        )
+        conn.close()
+        return
+
+    # Таблица есть — проверим колонки и добавим недостающие
+    existing_cols = _get_columns(conn)
+    required_cols: dict[str, str] = {
+        "username": "TEXT",
+        "free_requests_used": "INTEGER NOT NULL DEFAULT 0",
+        "free_tokens_used": "INTEGER NOT NULL DEFAULT 0",
+        "paid_until": "INTEGER",
+    }
+
+    for col, col_type in required_cols.items():
+        if col not in existing_cols:
+            with conn:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+
     conn.close()
 
 
 def _row_to_user(row: sqlite3.Row) -> UserSubscription:
+    # На всякий случай берём через keys(), чтобы не падать,
+    # если вдруг схема ещё не обновилась.
+    keys = set(row.keys())
+    username = row["username"] if "username" in keys else None
+    free_requests_used = (
+        int(row["free_requests_used"]) if "free_requests_used" in keys else 0
+    )
+    free_tokens_used = (
+        int(row["free_tokens_used"]) if "free_tokens_used" in keys else 0
+    )
+    paid_until = row["paid_until"] if "paid_until" in keys else None
+
     return UserSubscription(
         telegram_id=row["telegram_id"],
-        username=row["username"],
-        free_requests_used=row["free_requests_used"],
-        free_tokens_used=row["free_tokens_used"],
-        paid_until=row["paid_until"],
+        username=username,
+        free_requests_used=free_requests_used,
+        free_tokens_used=free_tokens_used,
+        paid_until=paid_until,
     )
 
 
@@ -78,7 +129,8 @@ def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> User
     else:
         with conn:
             conn.execute(
-                "INSERT INTO users (telegram_id, username) VALUES (?, ?)",
+                "INSERT INTO users (telegram_id, username, free_requests_used, free_tokens_used, paid_until) "
+                "VALUES (?, ?, 0, 0, NULL)",
                 (telegram_id, username),
             )
         user = UserSubscription(
@@ -109,8 +161,8 @@ def add_free_usage(telegram_id: int, add_requests: int, add_tokens: int) -> None
         conn.execute(
             """
             UPDATE users
-            SET free_requests_used = free_requests_used + ?,
-                free_tokens_used = free_tokens_used + ?
+            SET free_requests_used = COALESCE(free_requests_used, 0) + ?,
+                free_tokens_used = COALESCE(free_tokens_used, 0) + ?
             WHERE telegram_id = ?
             """,
             (add_requests, add_tokens, telegram_id),
@@ -123,10 +175,17 @@ def grant_subscription(telegram_id: int, days: int) -> None:
     now = int(time.time())
     conn = _get_conn()
     cur = conn.cursor()
+
+    # Убедимся, что колонка paid_until есть (на случай очень старой БД)
+    cols = _get_columns(conn)
+    if "paid_until" not in cols:
+        with conn:
+            conn.execute("ALTER TABLE users ADD COLUMN paid_until INTEGER")
+
     cur.execute("SELECT paid_until FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
     if row and row["paid_until"]:
-        base = max(now, row["paid_until"])
+        base = max(now, int(row["paid_until"]))
     else:
         base = now
 
