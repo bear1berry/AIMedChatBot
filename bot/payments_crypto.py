@@ -1,103 +1,74 @@
-from __future__ import annotations
-
 import os
-from typing import Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+from typing import Optional
 
 import httpx
+
+from .subscription_db import save_payment
+
+load_dotenv()
+
+CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
+CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
+
+# 5 TON / USDT за 30 дней
+PLAN_AMOUNT_TON = "5"
+PLAN_AMOUNT_USDT = "5"
+PLAN_TITLE = "Подписка на 30 дней — Premium доступ к боту"
 
 
 class CryptoPayError(Exception):
     pass
 
 
-CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
-CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
-
-
-async def _request(
-    method: str,
-    endpoint: str,
-    *,
-    json: Optional[dict] = None,
-    params: Optional[dict] = None,
-) -> dict:
+async def _api_request(method: str, payload: Optional[dict] = None) -> dict:
     if not CRYPTO_PAY_API_TOKEN:
         raise CryptoPayError("CRYPTO_PAY_API_TOKEN не указан в .env")
 
+    if payload is None:
+        payload = {}
+
     headers = {
         "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
-        "Content-Type": "application/json",
     }
 
-    url = f"{CRYPTO_PAY_BASE_URL}{endpoint}"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(method.upper(), url, headers=headers, json=json, params=params)
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise CryptoPayError(f"Некорректный ответ от CryptoPay: {resp.text}") from e
-
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{CRYPTO_PAY_API_URL}/{method}",
+            json=payload,
+            headers=headers,
+        )
+    resp.raise_for_status()
+    data = resp.json()
     if not data.get("ok"):
-        description = data.get("description") or "unknown error"
-        raise CryptoPayError(f"CryptoPay error: {description}")
-
+        raise CryptoPayError(str(data))
     return data["result"]
 
 
-async def create_invoice(
-    *,
-    telegram_id: int,
-    username: Optional[str],
-    amount: int,
-    description: str,
-    asset: str = "TON",
-) -> Tuple[str, str]:
+async def create_invoice(user_id: int, plan_code: str) -> str:
     """
-    Создать счёт в CryptoPay.
-
-    Возвращает (invoice_id, pay_url).
+    Создаёт счёт на оплату через Crypto Bot и возвращает ссылку.
+    Пока создаём один инвойс в TON.
     """
-    payload = {
-        "asset": asset,
-        "amount": str(amount),
-        "description": description,
-        "payload": str(telegram_id),
-        "hidden_message": f"Подписка для @{username}" if username else "Подписка",
-        "allow_anonymous": False,
-        "expires_in": 900,
-    }
+    ton_invoice = await _api_request(
+        "createInvoice",
+        {
+            "asset": "TON",
+            "amount": PLAN_AMOUNT_TON,
+            "description": PLAN_TITLE,
+            "payload": f"{plan_code}:{user_id}",
+        },
+    )
 
-    result = await _request("POST", "/createInvoice", json=payload)
+    # фиксируем платёж как ожидающий
+    save_payment(
+        invoice_id=ton_invoice["invoice_id"],
+        telegram_id=user_id,
+        amount=float(PLAN_AMOUNT_TON),
+        currency="TON",
+        status=ton_invoice["status"],
+        created_at=ton_invoice.get("created_at"),
+    )
 
-    invoice_id = str(result.get("invoice_id"))
-    pay_url = result.get("pay_url") or result.get("bot_invoice_url")
-    if not invoice_id or not pay_url:
-        raise CryptoPayError("Не удалось получить invoice_id/pay_url от CryptoPay")
-
-    return invoice_id, pay_url
-
-
-async def fetch_invoices_statuses(invoice_ids: List[str]) -> Dict[str, str]:
-    """
-    Получить статусы счетов по их invoice_id.
-
-    Возвращает dict {invoice_id: status}.
-    """
-    if not invoice_ids:
-        return {}
-
-    params = {
-        "invoice_ids": ",".join(invoice_ids),
-    }
-    result = await _request("GET", "/getInvoices", params=params)
-
-    statuses: Dict[str, str] = {}
-    invoices = result if isinstance(result, list) else result.get("items", [])
-    for inv in invoices:
-        inv_id = str(inv.get("invoice_id"))
-        status = inv.get("status")
-        if inv_id:
-            statuses[inv_id] = status
-    return statuses
+    return ton_invoice["pay_url"]
