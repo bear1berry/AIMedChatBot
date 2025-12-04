@@ -31,14 +31,34 @@ from .payments_crypto import create_invoice, CryptoPayError
 
 subscription_router = Router()
 
-# Лимиты из .env
+# ---------- НАСТРОЙКИ И ЛИМИТЫ ----------
+
 FREE_REQUESTS_LIMIT = int(os.getenv("FREE_REQUESTS_LIMIT", "3"))
 FREE_TOKENS_LIMIT = int(os.getenv("FREE_TOKENS_LIMIT", "6000"))
 
-# Подписка: цена и длительность
 SUBSCRIPTION_DAYS = 30
 SUBSCRIPTION_PRICE_TON = 5.0
 SUBSCRIPTION_PRICE_USDT = 5.0
+
+# Админы по username (берём из .env, без @, регистр игнорируем)
+ADMIN_USERNAMES = {
+    name.lstrip("@").lower()
+    for name in os.getenv("ADMIN_USERNAMES", "").replace(",", " ").split()
+    if name.strip()
+}
+
+
+def is_admin_user(telegram_id: int, username: Optional[str]) -> bool:
+    """
+    Проверяем, является ли пользователь админом.
+    Сейчас привязка по username (без @).
+    При желании можно расширить на ID.
+    """
+    if not ADMIN_USERNAMES:
+        return False
+    if not username:
+        return False
+    return username.lstrip("@").lower() in ADMIN_USERNAMES
 
 
 # ---------- ИНИЦИАЛИЗАЦИЯ БД ----------
@@ -49,7 +69,7 @@ def init_subscriptions_storage() -> None:
     logging.info("Subscription storage initialized")
 
 
-# ---------- УТИЛИТЫ ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
 
 def _format_date(ts: Optional[int]) -> str:
@@ -59,12 +79,28 @@ def _format_date(ts: Optional[int]) -> str:
 
 
 def _build_profile_text(user: UserSubscription) -> str:
-    lines = ["<b>Твой мини-кабинет</b>\n"]
+    lines: list[str] = []
+
+    if is_admin_user(user.telegram_id, user.username):
+        lines.append("<b>Твой мини-кабинет</b>\n")
+        lines.append("Роль: администратор 🔥")
+        lines.append("Статус: полный доступ без ограничений.\n")
+        lines.append(
+            f"Бесплатные запросы (для статистики): {user.free_requests_used}/{FREE_REQUESTS_LIMIT}"
+        )
+        lines.append(
+            f"Бесплатные токены (для статистики): {user.free_tokens_used}/{FREE_TOKENS_LIMIT}"
+        )
+        return "\n".join(lines)
+
+    lines.append("<b>Твой мини-кабинет</b>\n")
+
     if user.has_active_subscription:
         lines.append("Статус: активная подписка ✅")
         lines.append(f"Доступ до: <code>{_format_date(user.paid_until)}</code>")
     else:
         lines.append("Статус: без активной подписки")
+
     lines.append("")
     lines.append(
         f"Бесплатные запросы: {user.free_requests_used}/{FREE_REQUESTS_LIMIT}"
@@ -75,21 +111,28 @@ def _build_profile_text(user: UserSubscription) -> str:
     return "\n".join(lines)
 
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ main.py ----------
+# ---------- ФУНКЦИИ ДЛЯ main.py ----------
 
 
 async def check_user_access(message: Message) -> bool:
-    """True — можно отвечать ИИ, False — нужно показывать экран подписки."""
+    """
+    True — можно отправлять запрос в ИИ,
+    False — нужно показать экран подписки / лимитов.
+    """
     from_user = message.from_user
     if not from_user:
         return False
 
     user = get_or_create_user(from_user.id, from_user.username)
 
+    # Админ всегда с полным доступом, вообще без ограничений
+    if is_admin_user(user.telegram_id, user.username):
+        return True
+
     if user.has_active_subscription:
         return True
 
-    # Проверяем лимиты
+    # Проверяем лимиты бесплатного режима
     limit_requests = user.free_requests_used >= FREE_REQUESTS_LIMIT
     limit_tokens = user.free_tokens_used >= FREE_TOKENS_LIMIT
 
@@ -106,18 +149,25 @@ def register_successful_ai_usage(
     input_tokens: int,
     output_tokens: int,
 ) -> None:
-    """Регистрируем использование ИИ для бесплатного режима."""
+    """
+    Регистрируем использование ИИ в рамках бесплатных лимитов.
+    Для админа ничего не считаем.
+    """
     user = get_user(telegram_id) or get_or_create_user(telegram_id)
 
+    if is_admin_user(user.telegram_id, user.username):
+        # Админ — без ограничений, счётчики не трогаем
+        return
+
     if user.has_active_subscription:
-        # Для платников бесплатные лимиты не трогаем
+        # Для оплаченной подписки бесплатные лимиты не считаем
         return
 
     total_tokens = max(0, int(input_tokens) + int(output_tokens))
     add_free_usage(telegram_id, add_requests=1, add_tokens=total_tokens)
 
 
-# ---------- ХЕНДЛЕРЫ ----------
+# ---------- КОМАНДЫ И КНОПКИ ----------
 
 
 @subscription_router.message(Command("profile"))
@@ -135,6 +185,15 @@ async def cmd_help(message: Message) -> None:
 
 @subscription_router.message(F.text == "💎 Подписка")
 async def cmd_subscription_menu(message: Message) -> None:
+    from_user = message.from_user
+    if from_user and is_admin_user(from_user.id, from_user.username):
+        await message.answer(
+            "Ты админ этого бота, у тебя уже полный доступ без каких-либо ограничений 😉\n\n"
+            "Если хочешь протестировать оплату — выбери вариант ниже и создай счёт.",
+            reply_markup=SUBSCRIPTION_KEYBOARD,
+        )
+        return
+
     await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=SUBSCRIPTION_KEYBOARD)
 
 
@@ -159,7 +218,11 @@ async def cmd_buy_usdt(message: Message) -> None:
 
 
 async def _handle_buy_plan(message: Message, asset: str, price: float) -> None:
-    user_id = message.from_user.id
+    from_user = message.from_user
+    if not from_user:
+        return
+
+    user_id = from_user.id
 
     await message.answer("Создаю счёт на оплату…", reply_markup=SUBSCRIPTION_KEYBOARD)
 
@@ -174,7 +237,7 @@ async def _handle_buy_plan(message: Message, asset: str, price: float) -> None:
             payload=payload,
         )
     except CryptoPayError as e:
-        logging.exception("Не удалось создать счёт через Crypto Pay")
+        logging.error("Не удалось создать счёт через Crypto Pay: %s", e)
         await message.answer(
             "Не удалось создать счёт на оплату. Попробуй чуть позже 🙏\n"
             "Если ошибка повторяется — свяжись с владельцем бота.",
@@ -190,6 +253,7 @@ async def _handle_buy_plan(message: Message, asset: str, price: float) -> None:
     )
     await message.answer(text, reply_markup=SUBSCRIPTION_KEYBOARD)
 
-    # Простой вариант: считаем, что подписка активна после выдачи счёта.
-    # (Если захочешь — потом сделаем вебхук по факту оплаты.)
-    grant_subscription(user_id, SUBSCRIPTION_DAYS)
+    # Продление подписки для обычных пользователей.
+    # Админу подписка не нужна, но создавать счёт он всё равно может (для тестов).
+    if not is_admin_user(from_user.id, from_user.username):
+        grant_subscription(user_id, SUBSCRIPTION_DAYS)
