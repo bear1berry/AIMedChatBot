@@ -33,7 +33,6 @@ except ImportError:
         # Простая заглушка, чтобы код не падал
         return f"Эхо: {user_text}"
 
-
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -80,4 +79,56 @@ async def handle_ai(message: Message):
     # - ask_ai -> str
     # - ask_ai -> (str, input_tokens, output_tokens)
     reply_text: str
-    input_tokens: in_
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    if isinstance(result, tuple):
+        reply_text = str(result[0])
+
+        if len(result) > 1:
+            try:
+                input_tokens = int(result[1])
+            except Exception:
+                input_tokens = None
+
+        if len(result) > 2:
+            try:
+                output_tokens = int(result[2])
+            except Exception:
+                output_tokens = None
+    else:
+        reply_text = str(result)
+
+    # Если usage не пришёл — оцениваем по длине текста
+    if input_tokens is None:
+        input_tokens = max(1, len(user_text) // 4)
+    if output_tokens is None:
+        output_tokens = max(1, len(reply_text) // 4)
+
+    # 3. Отправляем ответ
+    await message.answer(reply_text)
+
+    # 4. Фиксируем использование лимитов
+    register_successful_ai_usage(
+        telegram_id=user_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+
+    # Инициализируем БД подписок
+    init_subscriptions_storage()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
