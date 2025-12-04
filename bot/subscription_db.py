@@ -1,171 +1,190 @@
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+# Подгружаем .env, чтобы взять путь к БД
 load_dotenv()
 
 DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscription.db")
 
 
-@contextmanager
-def _get_conn():
+def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.row_factory = sqlite3.Row
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db() -> None:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE NOT NULL,
-                username TEXT,
-                is_admin INTEGER NOT NULL DEFAULT 0,
-                free_messages_used INTEGER NOT NULL DEFAULT 0,
-                total_messages INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                premium_until INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-            """
+    """
+    Инициализация БД + мягкие миграции:
+    - создаём таблицы, если их нет
+    - добавляем недостающие колонки в users / payments
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+
+    # Базовая схема users
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE NOT NULL,
+            username TEXT,
+            is_admin INTEGER DEFAULT 0,
+            free_messages_used INTEGER DEFAULT 0,
+            total_messages INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            premium_until INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                invoice_id TEXT UNIQUE NOT NULL,
-                telegram_id INTEGER NOT NULL,
-                amount REAL,
-                currency TEXT,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                paid_at INTEGER
-            )
-            """
+        """
+    )
+
+    # Базовая схема payments
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER UNIQUE NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER,
+            paid_at INTEGER,
+            payload TEXT
         )
+        """
+    )
+
+    # Миграции для users
+    cur.execute("PRAGMA table_info(users)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+
+    needed_user_columns = {
+        "username": "TEXT",
+        "is_admin": "INTEGER DEFAULT 0",
+        "free_messages_used": "INTEGER DEFAULT 0",
+        "total_messages": "INTEGER DEFAULT 0",
+        "total_tokens": "INTEGER DEFAULT 0",
+        "premium_until": "INTEGER",
+        "created_at": "INTEGER",
+        "updated_at": "INTEGER",
+    }
+
+    for col_name, col_def in needed_user_columns.items():
+        if col_name not in existing_cols:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+
+    # Миграции для payments
+    cur.execute("PRAGMA table_info(payments)")
+    existing_payment_cols = {row[1] for row in cur.fetchall()}
+
+    needed_payment_columns = {
+        "amount": "REAL NOT NULL DEFAULT 0",
+        "currency": "TEXT NOT NULL DEFAULT 'TON'",
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "created_at": "INTEGER",
+        "paid_at": "INTEGER",
+        "payload": "TEXT",
+    }
+
+    for col_name, col_def in needed_payment_columns.items():
+        if col_name not in existing_payment_cols:
+            cur.execute(f"ALTER TABLE payments ADD COLUMN {col_name} {col_def}")
+
+    conn.commit()
+    conn.close()
 
 
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
+def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "telegram_id": row["telegram_id"],
+        "username": row["username"],
+        "is_admin": bool(row["is_admin"]),
+        "free_messages_used": row["free_messages_used"],
+        "total_messages": row["total_messages"],
+        "total_tokens": row["total_tokens"],
+        "premium_until": row["premium_until"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
-def get_or_create_user(telegram_id: int, username: str, is_admin: bool) -> Dict[str, Any]:
+def get_or_create_user(telegram_id: int, username: Optional[str], is_admin: bool = False) -> Dict[str, Any]:
+    """
+    Возвращает пользователя из БД или создаёт нового.
+    Флаг is_admin обновляется, если ты добавил себя в ADMIN_USERNAMES.
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
     now_ts = int(time.time())
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM users WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            # при каждом заходе обновляем username и is_admin
-            cur.execute(
-                """
-                UPDATE users
-                SET username = ?, is_admin = ?, updated_at = ?
-                WHERE telegram_id = ?
-                """,
-                (username, int(is_admin), now_ts, telegram_id),
-            )
-            conn.commit()
-            cur.execute(
-                "SELECT * FROM users WHERE telegram_id = ?",
-                (telegram_id,),
-            )
-            return _row_to_dict(cur.fetchone())
 
-        cur.execute(
-            """
-            INSERT INTO users (
-                telegram_id, username, is_admin,
-                free_messages_used, total_messages, total_tokens,
-                premium_until, created_at, updated_at
-            )
-            VALUES (?, ?, ?, 0, 0, 0, NULL, ?, ?)
-            """,
-            (telegram_id, username, int(is_admin), now_ts, now_ts),
-        )
-        conn.commit()
-        cur.execute(
-            "SELECT * FROM users WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        return _row_to_dict(cur.fetchone())
-
-
-def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM users WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        return _row_to_dict(row) if row else None
-
-
-def increment_free_messages_used(telegram_id: int, delta: int = 1) -> None:
-    with _get_conn() as conn:
-        cur = conn.cursor()
+    if row:
+        # Обновляем username / is_admin при необходимости
         cur.execute(
             """
             UPDATE users
-            SET free_messages_used = free_messages_used + ?,
+            SET username = COALESCE(?, username),
+                is_admin = CASE WHEN ? THEN 1 ELSE is_admin END,
                 updated_at = ?
             WHERE telegram_id = ?
             """,
-            (delta, int(time.time()), telegram_id),
+            (username, int(is_admin), now_ts, telegram_id),
         )
+        conn.commit()
+
+        cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = cur.fetchone()
+        user = _row_to_user(row)
+        conn.close()
+        return user
+
+    # Создаём нового
+    cur.execute(
+        """
+        INSERT INTO users (
+            telegram_id, username, is_admin,
+            free_messages_used, total_messages, total_tokens,
+            premium_until, created_at, updated_at
+        )
+        VALUES (?, ?, ?, 0, 0, 0, NULL, ?, ?)
+        """,
+        (telegram_id, username, int(is_admin), now_ts, now_ts),
+    )
+    conn.commit()
+
+    cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    user = _row_to_user(row)
+    conn.close()
+    return user
+
+
+def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _row_to_user(row)
 
 
 def increment_usage(
     telegram_id: int,
-    messages_delta: int = 0,
-    tokens_delta: int = 0,
+    tokens_used: int = 0,
+    count_free_message: bool = True,
 ) -> None:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE users
-            SET
-                total_messages = total_messages + ?,
-                total_tokens = total_tokens + ?,
-                updated_at = ?
-            WHERE telegram_id = ?
-            """,
-            (messages_delta, tokens_delta, int(time.time()), telegram_id),
-        )
-        # считаем эти сообщения и как бесплатные (для лимита),
-        # лимит всё равно игнорируется для активного премиума/админа
-        if messages_delta > 0:
-            cur.execute(
-                """
-                UPDATE users
-                SET free_messages_used = free_messages_used + ?
-                WHERE telegram_id = ?
-                """,
-                (messages_delta, telegram_id),
-            )
-
-
-def upgrade_user_to_premium(telegram_id: int, days: int = 30, paid_at: Optional[int] = None) -> None:
-    if paid_at is None:
-        paid_at = int(time.time())
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT premium_u_
+    """
+    Обновляем статистику использ
