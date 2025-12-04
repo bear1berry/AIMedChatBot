@@ -26,31 +26,15 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        raise RuntimeError(f"Environment variable {name} must be an integer, got {raw!r}")
+        raise RuntimeError(
+            f"Environment variable {name} must be an integer, got {raw!r}"
+        )
 
 
 @dataclass
 class Settings:
     # Telegram
     bot_token: str = field(default_factory=lambda: _env_required("BOT_TOKEN"))
-
-    # Yandex Cloud / YandexGPT
-    # Ключ и каталог для доступа к YandexGPT через OpenAI-совместимый API.
-    yandex_api_key: str = field(
-        default_factory=lambda: _env_required("YANDEX_CLOUD_API_KEY")
-    )
-    yandex_folder_id: str = field(
-        default_factory=lambda: _env_required("YANDEX_CLOUD_FOLDER")
-    )
-    # Имя модели только для информации, логика выбора модели живёт в ai_client.
-    model_name: str = field(
-        default_factory=lambda: os.getenv(
-            "MODEL_NAME",
-            "gpt://{folder}/yandexgpt/latest".format(
-                folder=os.getenv("YANDEX_CLOUD_FOLDER", "<folder_id>")
-            ),
-        )
-    )
 
     # Путь к базе данных для хранения заметок/истории
     db_path: str = field(
