@@ -4,10 +4,13 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 DB_PATH = os.getenv("BOT_DB_PATH", "bot.db")
+
+# Лимит бесплатных запросов и токенов
 FREE_REQUESTS_LIMIT = int(os.getenv("FREE_REQUESTS_LIMIT", "3"))
+FREE_TOKENS_LIMIT = int(os.getenv("FREE_TOKENS_LIMIT", "6000"))  # условно ~ 6k токенов
 
 
 def _utcnow() -> datetime:
@@ -26,20 +29,24 @@ def get_conn():
 
 
 def init_db() -> None:
-    """Создаём таблицы для пользователей и платежей (если их ещё нет)."""
+    """Создаём таблицы и недостающие колонки (миграция для токенов и т.п.)."""
     with get_conn() as conn:
+        # users
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE NOT NULL,
                 free_requests_used INTEGER NOT NULL DEFAULT 0,
+                free_tokens_used INTEGER NOT NULL DEFAULT 0,
                 subscription_until TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+
+        # payments
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS payments (
@@ -55,6 +62,15 @@ def init_db() -> None:
             )
             """
         )
+
+        # Мягкая миграция, если таблица users уже была без free_tokens_used
+        try:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN free_tokens_used INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            # колонка уже есть – игнорируем
+            pass
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -80,10 +96,11 @@ def get_or_create_user(telegram_id: int) -> sqlite3.Row:
         conn.execute(
             """
             INSERT INTO users (
-                telegram_id, free_requests_used, subscription_until, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
+                telegram_id, free_requests_used, free_tokens_used,
+                subscription_until, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (telegram_id, 0, None, now, now),
+            (telegram_id, 0, 0, None, now, now),
         )
         cur = conn.execute(
             "SELECT * FROM users WHERE telegram_id = ?",
@@ -117,20 +134,32 @@ def get_usage_info(telegram_id: int) -> Dict[str, Any]:
     """
     Возвращает словарь:
     {
-        "used": int,
-        "remaining": int,
-        "limit": int,
+        "used": int,                # сколько бесплатных запросов потратил
+        "remaining": int,           # сколько осталось бесплатных запросов
+        "limit": int,               # общий лимит бесплатных запросов
+
+        "tokens_used": int,         # сколько бесплатных токенов израсходовано
+        "tokens_remaining": int,    # сколько бесплатных токенов осталось
+        "tokens_limit": int,        # общий лимит бесплатных токенов
+
         "has_subscription": bool
     }
     """
     user = get_or_create_user(telegram_id)
     used = int(user["free_requests_used"])
     remaining = max(FREE_REQUESTS_LIMIT - used, 0)
+
+    tokens_used = int(user["free_tokens_used"] or 0)
+    tokens_remaining = max(FREE_TOKENS_LIMIT - tokens_used, 0)
+
     active = has_active_subscription(telegram_id)
     return {
         "used": used,
         "remaining": remaining,
         "limit": FREE_REQUESTS_LIMIT,
+        "tokens_used": tokens_used,
+        "tokens_remaining": tokens_remaining,
+        "tokens_limit": FREE_TOKENS_LIMIT,
         "has_subscription": active,
     }
 
@@ -150,14 +179,32 @@ def register_ai_usage(telegram_id: int) -> None:
         )
 
 
+def register_free_tokens_usage(telegram_id: int, tokens: int) -> None:
+    """Добавляем использованные токены (только для бесплатного режима)."""
+    if tokens <= 0:
+        return
+    now = _utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET free_tokens_used = free_tokens_used + ?,
+                updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (tokens, now, telegram_id),
+        )
+
+
 def reset_free_counter(telegram_id: int) -> None:
-    """Обнуление счётчика бесплатных запросов (на будущее, если пригодится)."""
+    """Обнуление счётчиков бесплатных запросов и токенов (если когда-то пригодится)."""
     now = _utcnow().isoformat()
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE users
             SET free_requests_used = 0,
+                free_tokens_used = 0,
                 updated_at = ?
             WHERE telegram_id = ?
             """,
@@ -242,3 +289,34 @@ def get_payment(invoice_id: str) -> Optional[sqlite3.Row]:
             (invoice_id,),
         )
         return cur.fetchone()
+
+
+def list_payments_for_user(telegram_id: int, limit: int = 10) -> List[sqlite3.Row]:
+    """Последние N платежей пользователя по дате создания (DESC)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE telegram_id = ?
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            """,
+            (telegram_id, limit),
+        )
+        return cur.fetchall()
+
+
+def can_consume_free_tokens(telegram_id: int, tokens_needed: int) -> bool:
+    """
+    Проверяем, хватает ли бесплатного токен-лимита для очередного запроса.
+    Если есть подписка — всегда True.
+    """
+    if tokens_needed <= 0:
+        return True
+
+    info = get_usage_info(telegram_id)
+    if info["has_subscription"]:
+        return True
+
+    return info["tokens_remaining"] >= tokens_needed
