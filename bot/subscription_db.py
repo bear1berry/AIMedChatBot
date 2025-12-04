@@ -426,6 +426,27 @@ def get_recent_payments(limit: int = 30) -> List[Payment]:
     return [_row_to_payment(r) for r in rows]
 
 
+def get_pending_payments(limit: int = 100) -> List[Payment]:
+    """
+    Вернуть список платежей в статусе 'pending' для поллинга CryptoBot.
+    Используется в /admin и фоновой синхронизации.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM payments
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [_row_to_payment(r) for r in rows]
+
+
 def export_users_and_payments(max_rows: int = 500) -> str:
     """
     Возвращает CSV-подобный текст для /admin export.
