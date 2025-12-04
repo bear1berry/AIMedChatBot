@@ -13,6 +13,7 @@ CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 
 
 class CryptoPayError(Exception):
+    """Ошибка при работе с Crypto Bot API."""
     pass
 
 
@@ -30,8 +31,8 @@ async def create_invoice(
     description: Optional[str] = None,
 ) -> str:
     """
-    Создаёт инвойс в CryptoBot и сохраняет черновик платежа в БД.
-    Возвращает invoice_url.
+    Создаёт инвойс в Crypto Bot и сохраняет его в БД как 'pending'.
+    Возвращает URL для оплаты.
     """
     headers = _get_auth_headers()
     payload: Dict[str, Any] = {
@@ -46,21 +47,22 @@ async def create_invoice(
         data = resp.json()
 
     if not data.get("ok"):
-        raise CryptoPayError(f"Ошибка CryptoPay: {data!r}")
+        raise CryptoPayError(f"Ошибка CryptoPay (createInvoice): {data!r}")
 
     result = data["result"]
     invoice_id = int(result["invoice_id"])
     invoice_url = result["pay_url"]
+    created_at = int(result.get("created_at", 0)) or 0
     raw_json = json.dumps(result, ensure_ascii=False)
 
-    # Создаём запись о платеже в статусе "pending"
+    # Сохраняем платёж в статусе pending
     create_payment(
         telegram_id=telegram_id,
         invoice_id=invoice_id,
         currency=currency,
         amount=amount,
         status="pending",
-        created_at=int(result.get("created_at", 0)) or 0,
+        created_at=created_at,
         paid_at=None,
         raw_json=raw_json,
     )
@@ -72,19 +74,20 @@ async def fetch_invoices(
     *,
     invoice_ids: Optional[List[int]] = None,
     status: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
-    Вспомогательный метод для /admin, чтобы подтянуть реальные статусы инвойсов.
+    Базовый вызов getInvoices.
+    Возвращает список инвойсов так, как его отдаёт Crypto Bot.
     """
     headers = _get_auth_headers()
-    payload: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
     if invoice_ids:
-        payload["invoice_ids"] = ",".join(str(i) for i in invoice_ids)
+        params["invoice_ids"] = ",".join(str(i) for i in invoice_ids)
     if status:
-        payload["status"] = status
+        params["status"] = status
 
     async with httpx.AsyncClient(base_url=CRYPTO_PAY_BASE_URL, timeout=10.0) as client:
-        resp = await client.get("/getInvoices", params=payload, headers=headers)
+        resp = await client.get("/getInvoices", params=params, headers=headers)
         data = resp.json()
 
     if not data.get("ok"):
@@ -93,18 +96,42 @@ async def fetch_invoices(
     return data["result"]
 
 
+async def fetch_invoices_statuses(invoice_ids: List[int]) -> Dict[int, str]:
+    """
+    Функция, которую ждёт main.py:
+    принимает список invoice_id и возвращает словарь {invoice_id: status}.
+    """
+    if not invoice_ids:
+        return {}
+
+    invoices = await fetch_invoices(invoice_ids=invoice_ids)
+    result: Dict[int, str] = {}
+    for inv in invoices:
+        try:
+            inv_id = int(inv["invoice_id"])
+            status = str(inv.get("status", ""))
+            result[inv_id] = status
+        except (KeyError, ValueError, TypeError):
+            continue
+    return result
+
+
 async def sync_paid_invoices_from_cryptobot(invoice_ids: List[int]) -> None:
     """
-    Пример поллинга: берём список invoice_id из БД,
-    спрашиваем у CryptoPay их статус, все 'paid' помечаем оплаченными.
+    Утилита для /admin: подтягиваем реальные статусы по списку инвойсов
+    и помечаем оплаченные как paid (с выдачей подписки).
     """
     if not invoice_ids:
         return
 
-    result = await fetch_invoices(invoice_ids=invoice_ids)
-    # result — список инвойсов
-    for inv in result:
-        if inv.get("status") == "paid":
-            inv_id = int(inv["invoice_id"])
-            paid_at = int(inv.get("paid_at", 0)) or None
-            mark_payment_paid(inv_id, paid_at=paid_at)
+    invoices = await fetch_invoices(invoice_ids=invoice_ids)
+    for inv in invoices:
+        if str(inv.get("status")) == "paid":
+            try:
+                inv_id = int(inv["invoice_id"])
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            paid_at = inv.get("paid_at")
+            try:
+                paid_ts = int(paid_at) if paid_at is not None else N_
