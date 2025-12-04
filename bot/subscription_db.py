@@ -1,4 +1,3 @@
-# bot/subscription_db.py
 from __future__ import annotations
 
 import logging
@@ -9,15 +8,15 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 import threading
 
-# Файл БД лежит в корне проекта рядом с папкой bot
+# База лежит в корне проекта как subscriptions.sqlite3
 DB_PATH = (Path(__file__).resolve().parent.parent / "subscriptions.sqlite3").as_posix()
 
 logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 
-# Сколько бесплатных запросов есть у обычного пользователя
+# Сколько бесплатных сообщений доступно без оплаты
 FREE_MESSAGES_LIMIT = 3
-# Сколько дней добавляем к подписке за один оплаченный счёт
+# На сколько дней продляется премиум за один успешный платёж
 PREMIUM_DAYS_PER_PAYMENT = 30
 
 
@@ -46,16 +45,14 @@ class Payment:
 
 
 def _connect() -> sqlite3.Connection:
+    """Создать соединение с БД."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """
-    Создание / мягкая миграция таблиц.
-    Вызывается при каждом обращении, поэтому можно безопасно обновлять схему.
-    """
+    """Создать / мигрировать схему БД, если нужно."""
     cur = conn.cursor()
 
     # Таблица пользователей
@@ -67,8 +64,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             username TEXT,
             is_admin INTEGER NOT NULL DEFAULT 0,
             free_messages_used INTEGER NOT NULL DEFAULT 0,
-            premium_until TIMESTAMP NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            premium_until TEXT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
@@ -83,34 +80,32 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             amount REAL NOT NULL,
             currency TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            paid_at TIMESTAMP NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            paid_at TEXT NULL,
             raw_payload TEXT,
             FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
         )
         """
     )
 
-    # Мягкая миграция: если в старой БД не было нужных колонок — добавляем
+    # На всякий случай — утилита для добавления колонок (если в будущем расширишь)
     def ensure_column(table: str, name: str, ddl: str) -> None:
         cur.execute(f"PRAGMA table_info({table})")
         cols = [row[1] for row in cur.fetchall()]
         if name not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
-    ensure_column("users", "is_admin", "INTEGER NOT NULL DEFAULT 0")
-    ensure_column("users", "free_messages_used", "INTEGER NOT NULL DEFAULT 0")
-    ensure_column("users", "premium_until", "TIMESTAMP NULL")
+    # Здесь уже всё создано правильным CREATE, но оставляю пример:
+    # ensure_column("users", "is_admin", "INTEGER NOT NULL DEFAULT 0")
+    # ensure_column("users", "free_messages_used", "INTEGER NOT NULL DEFAULT 0")
+    # ensure_column("users", "premium_until", "TEXT NULL")
     ensure_column("payments", "raw_payload", "TEXT")
 
     conn.commit()
 
 
 def init_subscription_storage() -> None:
-    """
-    Инициализация БД.
-    Вызови один раз при старте приложения (это уже делается в main.py).
-    """
+    """Инициализация БД (вызывается при старте бота)."""
     with _lock:
         conn = _connect()
         try:
@@ -120,17 +115,24 @@ def init_subscription_storage() -> None:
     logger.info("Subscription storage initialized")
 
 
+# ---- ВАЖНО ----
+# Алиас для старого кода, который импортирует init_db
+def init_db() -> None:
+    init_subscription_storage()
+
+
+def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
 def _row_to_user(row: sqlite3.Row) -> User:
-    premium_until = None
-    if row["premium_until"]:
-        # В SQLite TIMESTAMP обычно хранится как текст (ISO-строка)
-        premium_until = datetime.fromisoformat(row["premium_until"])
-
-    if isinstance(row["created_at"], str):
-        created_at = datetime.fromisoformat(row["created_at"])
-    else:
-        created_at = datetime.utcnow()
-
+    premium_until = _parse_dt(row["premium_until"])
+    created_at = _parse_dt(row["created_at"]) or datetime.utcnow()
     return User(
         id=row["id"],
         telegram_id=row["telegram_id"],
@@ -143,15 +145,8 @@ def _row_to_user(row: sqlite3.Row) -> User:
 
 
 def _row_to_payment(row: sqlite3.Row) -> Payment:
-    paid_at = None
-    if row["paid_at"]:
-        paid_at = datetime.fromisoformat(row["paid_at"])
-
-    if isinstance(row["created_at"], str):
-        created_at = datetime.fromisoformat(row["created_at"])
-    else:
-        created_at = datetime.utcnow()
-
+    created_at = _parse_dt(row["created_at"]) or datetime.utcnow()
+    paid_at = _parse_dt(row["paid_at"])
     return Payment(
         id=row["id"],
         telegram_id=row["telegram_id"],
@@ -165,11 +160,12 @@ def _row_to_payment(row: sqlite3.Row) -> Payment:
     )
 
 
+# --------------------
+#   USERS
+# --------------------
+
 def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> User:
-    """
-    Получить пользователя по telegram_id.
-    Если его нет — создать.
-    """
+    """Получить пользователя или создать, если его нет."""
     with _lock:
         conn = _connect()
         try:
@@ -180,7 +176,7 @@ def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> User
             row = cur.fetchone()
             if row:
                 user = _row_to_user(row)
-                # Обновляем username, если поменялся
+                # Обновим username, если изменился
                 if username and user.username != username:
                     cur.execute(
                         "UPDATE users SET username = ? WHERE telegram_id = ?",
@@ -190,52 +186,15 @@ def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> User
                     user.username = username
                 return user
 
-            # Если пользователя нет — создаём
+            # Создаём нового
             cur.execute(
                 "INSERT INTO users (telegram_id, username) VALUES (?, ?)",
                 (telegram_id, username),
             )
             conn.commit()
-
             cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
             row = cur.fetchone()
             return _row_to_user(row)
-        finally:
-            conn.close()
-
-
-def mark_admin(telegram_id: int, username: Optional[str] = None) -> User:
-    """
-    Сделать пользователя админом (для /admin, расширенных лимитов и т.п.).
-    """
-    with _lock:
-        conn = _connect()
-        try:
-            _ensure_schema(conn)
-            cur = conn.cursor()
-
-            cur.execute(
-                """
-                UPDATE users
-                SET is_admin = 1,
-                    username = COALESCE(?, username)
-                WHERE telegram_id = ?
-                """,
-                (username, telegram_id),
-            )
-            if cur.rowcount == 0:
-                cur.execute(
-                    """
-                    INSERT INTO users (telegram_id, username, is_admin)
-                    VALUES (?, ?, 1)
-                    """,
-                    (telegram_id, username),
-                )
-
-            conn.commit()
-
-            cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-            return _row_to_user(cur.fetchone())
         finally:
             conn.close()
 
@@ -253,11 +212,42 @@ def get_user(telegram_id: int) -> Optional[User]:
             conn.close()
 
 
+def mark_admin(telegram_id: int, username: Optional[str] = None) -> User:
+    """Отметить пользователя как администратора (или создать его как админа)."""
+    with _lock:
+        conn = _connect()
+        try:
+            _ensure_schema(conn)
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                UPDATE users
+                SET is_admin = 1,
+                    username = COALESCE(?, username)
+                WHERE telegram_id = ?
+                """,
+                (username, telegram_id),
+            )
+
+            if cur.rowcount == 0:
+                cur.execute(
+                    """
+                    INSERT INTO users (telegram_id, username, is_admin)
+                    VALUES (?, ?, 1)
+                    """,
+                    (telegram_id, username),
+                )
+
+            conn.commit()
+            cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+            return _row_to_user(cur.fetchone())
+        finally:
+            conn.close()
+
+
 def increment_free_usage(telegram_id: int) -> None:
-    """
-    Увеличивает счётчик использованных бесплатных запросов.
-    Вызывается, когда не админ и не премиум делает запрос к ИИ.
-    """
+    """Увеличить счётчик бесплатных использований для пользователя."""
     with _lock:
         conn = _connect()
         try:
@@ -273,11 +263,7 @@ def increment_free_usage(telegram_id: int) -> None:
 
 
 def set_premium(telegram_id: int, days: int = PREMIUM_DAYS_PER_PAYMENT) -> None:
-    """
-    Продлевает пользователю премиум:
-    - если премиум уже есть — добавляем дни к текущей дате окончания
-    - если нет — считаем от текущего момента
-    """
+    """Выдать / продлить премиум-подписку пользователю."""
     with _lock:
         conn = _connect()
         try:
@@ -289,13 +275,13 @@ def set_premium(telegram_id: int, days: int = PREMIUM_DAYS_PER_PAYMENT) -> None:
                 (telegram_id,),
             )
             row = cur.fetchone()
-            now = datetime.utcnow()
 
-            if row and row[0]:
-                current = datetime.fromisoformat(row[0])
-                base = current if current > now else now
-            else:
-                base = now
+            now = datetime.utcnow()
+            base = now
+            if row and row["premium_until"]:
+                current = _parse_dt(row["premium_until"])
+                if current and current > now:
+                    base = current
 
             new_until = base + timedelta(days=days)
 
@@ -310,16 +296,15 @@ def set_premium(telegram_id: int, days: int = PREMIUM_DAYS_PER_PAYMENT) -> None:
 
 def user_has_access(user: User) -> bool:
     """
-    Есть ли у пользователя доступ к ИИ:
+    Правила доступа:
     - админ — всегда True
-    - есть активный premium_until в будущем — True
-    - иначе проверяем лимит бесплатных запросов
+    - если премиум активен — True
+    - иначе пока free_messages_used < FREE_MESSAGES_LIMIT — True
     """
     if user.is_admin:
         return True
 
     now = datetime.utcnow()
-
     if user.premium_until and user.premium_until > now:
         return True
 
@@ -329,6 +314,10 @@ def user_has_access(user: User) -> bool:
     return False
 
 
+# --------------------
+#   PAYMENTS
+# --------------------
+
 def create_payment(
     telegram_id: int,
     invoice_id: str,
@@ -337,9 +326,7 @@ def create_payment(
     status: str,
     raw_payload: Optional[str] = None,
 ) -> Payment:
-    """
-    Создать запись о платеже (после успешного createInvoice в CryptoBot).
-    """
+    """Создать запись о платеже."""
     with _lock:
         conn = _connect()
         try:
@@ -353,6 +340,7 @@ def create_payment(
                 (telegram_id, invoice_id, amount, currency, status, raw_payload),
             )
             conn.commit()
+
             cur.execute("SELECT * FROM payments WHERE invoice_id = ?", (invoice_id,))
             row = cur.fetchone()
             return _row_to_payment(row)
@@ -362,7 +350,8 @@ def create_payment(
 
 def update_payment_status(invoice_id: str, status: str, mark_paid: bool = False) -> None:
     """
-    Обновить статус платежа. Если mark_paid=True — проставляем paid_at и активируем подписку.
+    Обновить статус платежа.
+    Если mark_paid=True — ставим paid_at и продлеваем премиум пользователю.
     """
     with _lock:
         conn = _connect()
@@ -371,23 +360,20 @@ def update_payment_status(invoice_id: str, status: str, mark_paid: bool = False)
             cur = conn.cursor()
 
             if mark_paid:
+                now = datetime.utcnow().isoformat()
                 cur.execute(
-                    """
-                    UPDATE payments
-                    SET status = ?, paid_at = ?
-                    WHERE invoice_id = ?
-                    """,
-                    (status, datetime.utcnow().isoformat(), invoice_id),
+                    "UPDATE payments SET status = ?, paid_at = ? WHERE invoice_id = ?",
+                    (status, now, invoice_id),
                 )
             else:
                 cur.execute(
                     "UPDATE payments SET status = ? WHERE invoice_id = ?",
                     (status, invoice_id),
                 )
+
             conn.commit()
 
             if mark_paid:
-                # Активируем премиум после успешной оплаты
                 cur.execute(
                     "SELECT telegram_id FROM payments WHERE invoice_id = ?",
                     (invoice_id,),
@@ -401,10 +387,8 @@ def update_payment_status(invoice_id: str, status: str, mark_paid: bool = False)
 
 def get_pending_payments(limit: int = 100) -> List[Payment]:
     """
-    Вернуть список "ожидающих" платежей для проверки статусов через CryptoBot.
-
-    Используем статусы 'pending' и 'active' — под эти значения
-    ты можешь адаптировать логику в зависимости от реальных ответов API.
+    Получить список платежей, которые ещё не завершены:
+    статусы 'pending' или 'active' — для периодической проверки через API.
     """
     with _lock:
         conn = _connect()
@@ -428,9 +412,7 @@ def get_pending_payments(limit: int = 100) -> List[Payment]:
 
 
 def get_user_payments(telegram_id: int, limit: int = 20) -> List[Payment]:
-    """
-    Последние платежи конкретного пользователя.
-    """
+    """История платежей пользователя."""
     with _lock:
         conn = _connect()
         try:
@@ -453,35 +435,38 @@ def get_user_payments(telegram_id: int, limit: int = 20) -> List[Payment]:
 
 
 def get_admin_stats() -> Dict[str, Any]:
-    """
-    Краткая аналитика для админ-панели (/admin).
-    """
+    """Агрегированная статистика для админ-панели."""
     with _lock:
         conn = _connect()
         try:
             _ensure_schema(conn)
             cur = conn.cursor()
 
+            # всего пользователей
             cur.execute("SELECT COUNT(*) FROM users")
             total_users = cur.fetchone()[0]
 
+            # админы
             cur.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
             admins = cur.fetchone()[0]
 
-            now_iso = datetime.utcnow().isoformat()
+            # активные премиумы
+            now = datetime.utcnow().isoformat()
             cur.execute(
                 """
                 SELECT COUNT(*)
                 FROM users
                 WHERE premium_until IS NOT NULL AND premium_until > ?
                 """,
-                (now_iso,),
+                (now,),
             )
             active_premium = cur.fetchone()[0]
 
+            # всего платежей
             cur.execute("SELECT COUNT(*) FROM payments")
             total_payments = cur.fetchone()[0]
 
+            # выручка по успешным платежам
             cur.execute(
                 """
                 SELECT SUM(amount)
