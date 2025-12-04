@@ -101,19 +101,49 @@ def init_db() -> None:
     conn.close()
 
 
-def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_user(row):
+    """
+    Преобразует строку из таблицы users в питоновский словарь.
+    Работает и со старой схемой (без колонки id), и с новой.
+    """
+    if row is None:
+        return None
+
+    # Какие ключи реально есть в строке
+    keys = set(row.keys())
+
+    # Определяем основной идентификатор пользователя
+    tg_id = None
+    if "telegram_id" in keys:
+        tg_id = row["telegram_id"]
+    elif "user_id" in keys:
+        tg_id = row["user_id"]
+    elif "id" in keys:
+        tg_id = row["id"]
+
+    # Базовые поля с безопасными значениями по умолчанию
+    username = row["username"] if "username" in keys else None
+    first_name = row["first_name"] if "first_name" in keys else None
+    last_name = row["last_name"] if "last_name" in keys else None
+
+    is_admin = row["is_admin"] if "is_admin" in keys else 0
+    is_premium = row["is_premium"] if "is_premium" in keys else 0
+    premium_until = row["premium_until"] if "premium_until" in keys else 0
+    total_messages = row["total_messages"] if "total_messages" in keys else 0
+
+    # Возвращаем и "id" (для обратной совместимости), и telegram_id
     return {
-        "id": row["id"],
-        "telegram_id": row["telegram_id"],
-        "username": row["username"],
-        "is_admin": bool(row["is_admin"]),
-        "free_messages_used": row["free_messages_used"],
-        "total_messages": row["total_messages"],
-        "total_tokens": row["total_tokens"],
-        "premium_until": row["premium_until"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "id": tg_id,                    # чтобы старый код, который ждал user["id"], не упал
+        "telegram_id": tg_id,
+        "username": username,
+        "first_name": first_name,
+        "last_name": last_name,
+        "is_admin": bool(is_admin),
+        "is_premium": bool(is_premium),
+        "premium_until": int(premium_until or 0),
+        "total_messages": int(total_messages or 0),
     }
+
 
 
 def get_or_create_user(telegram_id: int, username: Optional[str], is_admin: bool = False) -> Dict[str, Any]:
