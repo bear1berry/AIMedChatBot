@@ -1,111 +1,100 @@
 from __future__ import annotations
 
-import os
 import logging
-from typing import Dict, List
+import os
+from typing import Any, Dict, List
 
 import httpx
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-API_BASE_URL = "https://pay.crypt.bot/api"
+load_dotenv()
+
+CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
+CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 
 
 class CryptoPayError(Exception):
-    """Ошибка при работе с Crypto Bot API."""
     pass
 
 
-def _get_api_token() -> str:
-    token = os.getenv("CRYPTO_PAY_API_TOKEN")
-    if not token:
-        raise CryptoPayError("CRYPTO_PAY_API_TOKEN не указан в .env")
-    return token
+def _require_token() -> str:
+    if not CRYPTO_PAY_API_TOKEN:
+        raise CryptoPayError(
+            "CRYPTO_PAY_API_TOKEN не указан в .env, оплата через CryptoBot недоступна"
+        )
+    return CRYPTO_PAY_API_TOKEN
+
+
+async def _call_api(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    token = _require_token()
+    url = f"{CRYPTO_PAY_BASE_URL}/{method}"
+    headers = {"Crypto-Pay-API-Token": token}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+    try:
+        data = resp.json()
+    except Exception as e:  # защитный код
+        logger.exception("CryptoPay: invalid JSON response: %s", resp.text)
+        raise CryptoPayError(f"Некорректный ответ CryptoPay: {e}") from e
+
+    if not data.get("ok"):
+        logger.error("CryptoPay API error: %s", data)
+        raise CryptoPayError(str(data.get("error", "Unknown CryptoPay error")))
+    return data["result"]
 
 
 async def create_invoice(
+    asset: str,
     amount: float,
-    currency: str,
     description: str,
-    payload: str,
-) -> tuple[str, str]:
-    """Создать счёт в Crypto Bot и вернуть (pay_url, invoice_id)."""
-    token = _get_api_token()
-    headers = {"Crypto-Pay-API-Token": token}
-    json_data = {
-        "amount": amount,
-        "asset": currency,      # USDT, TON и т.п.
-        "description": description,
-        "payload": payload,     # сюда можно прокинуть свой идентификатор
-    }
-
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=20.0) as client:
-        resp = await client.post("/createInvoice", headers=headers, json=json_data)
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        logger.exception("CryptoPay invalid JSON on createInvoice: %s", resp.text)
-        raise CryptoPayError("Некорректный ответ от Crypto Bot") from exc
-
-    if not data.get("ok"):
-        logger.error("CryptoPay error response on createInvoice: %s", data)
-        raise CryptoPayError("Не удалось создать счёт через Crypto Bot")
-
-    result = data.get("result") or {}
-
-    # Обычный кейс: result — объект с полями pay_url, invoice_id
-    if isinstance(result, dict) and "pay_url" in result:
-        pay_url = result["pay_url"]
-        invoice_id = str(result.get("invoice_id") or result.get("invoiceId"))
-        return pay_url, invoice_id
-
-    # На всякий случай: если result — объект с items
-    items = result.get("items") if isinstance(result, dict) else None
-    if items:
-        item = items[0]
-        pay_url = item["pay_url"]
-        invoice_id = str(item.get("invoice_id") or item.get("invoiceId"))
-        return pay_url, invoice_id
-
-    logger.error("CryptoPay unexpected result structure on createInvoice: %s", data)
-    raise CryptoPayError("Не удалось разобрать ответ от Crypto Bot при создании счёта")
-
-
-async def fetch_invoices_statuses(invoice_ids: List[str]) -> Dict[str, str]:
+    payload: str | None = None,
+) -> Dict[str, Any]:
     """
-    Получить статусы нескольких инвойсов: {invoice_id: status}.
+    Create CryptoBot invoice.
+    Returns full invoice dict from API.
+    """
+    req: Dict[str, Any] = {
+        "asset": asset,
+        "amount": amount,
+        "description": description,
+        "allow_comments": False,
+        "allow_anonymous": True,
+    }
+    if payload:
+        req["payload"] = payload
 
-    status может быть: active, paid, expired, cancelled и т.п.
+    result = await _call_api("createInvoice", req)
+    # API returns dict with 'invoice_id', 'status', 'pay_url', etc.
+    return result
+
+
+async def get_invoice(invoice_id: str) -> Dict[str, Any]:
+    """
+    Fetch single invoice by id.
+    """
+    result = await _call_api("getInvoices", {"invoice_ids": [invoice_id]})
+    invoices = result.get("items") or result.get("invoices") or []
+    if not invoices:
+        raise CryptoPayError(f"Invoice {invoice_id} not found")
+    return invoices[0]
+
+
+async def fetch_invoices_statuses(invoice_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Backwards-compatible helper: return mapping invoice_id -> invoice dict.
+    (на случай, если где-то ещё импортируется)
     """
     if not invoice_ids:
         return {}
-
-    token = _get_api_token()
-    headers = {"Crypto-Pay-API-Token": token}
-    params = {"invoice_ids": ",".join(map(str, invoice_ids))}
-
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=20.0) as client:
-        resp = await client.get("/getInvoices", headers=headers, params=params)
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        logger.exception("CryptoPay invalid JSON on getInvoices: %s", resp.text)
-        raise CryptoPayError("Некорректный ответ от Crypto Bot при получении статусов") from exc
-
-    if not data.get("ok"):
-        logger.error("CryptoPay error response on getInvoices: %s", data)
-        raise CryptoPayError("Не удалось получить статусы счетов Crypto Bot")
-
-    result = data.get("result") or {}
-    items = result.get("items") or []
-
-    statuses: Dict[str, str] = {}
-    for item in items:
-        inv_id = str(item.get("invoice_id") or item.get("invoiceId"))
-        status = item.get("status", "")
-        if inv_id:
-            statuses[inv_id] = status
-
-    return statuses
+    out: Dict[str, Dict[str, Any]] = {}
+    for inv_id in invoice_ids:
+        try:
+            inv = await get_invoice(inv_id)
+        except CryptoPayError as e:
+            logger.error("Failed to fetch invoice %s: %s", inv_id, e)
+            continue
+        out[inv_id] = inv
+    return out
