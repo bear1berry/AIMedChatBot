@@ -6,7 +6,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "subscriptions.sqlite3"
@@ -28,6 +28,18 @@ class UserSubscription:
         return self.paid_until > int(time.time())
 
 
+@dataclass
+class Payment:
+    id: int
+    telegram_id: int
+    invoice_id: int
+    currency: str
+    amount: float
+    status: str
+    created_at: int
+    paid_at: Optional[int]
+
+
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -36,12 +48,12 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     """
-    Создаёт таблицу users, если её нет,
-    и гарантирует наличие всех нужных колонок.
+    Создаёт / мигрирует таблицы users и payments.
     """
     conn = _get_conn()
     cur = conn.cursor()
 
+    # --- USERS ---
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -55,8 +67,7 @@ def init_db() -> None:
         """
     )
 
-    # Проверяем наличие колонок и добавляем недостающие (на случай старой БД)
-    required_cols = {
+    required_user_cols = {
         "telegram_id": "INTEGER PRIMARY KEY",
         "username": "TEXT",
         "free_requests_used": "INTEGER DEFAULT 0",
@@ -66,11 +77,45 @@ def init_db() -> None:
     }
 
     cur.execute("PRAGMA table_info(users)")
-    existing_cols = {row["name"] for row in cur.fetchall()}
+    existing_user_cols = {row["name"] for row in cur.fetchall()}
 
-    for col_name, col_def in required_cols.items():
-        if col_name not in existing_cols:
+    for col_name, col_def in required_user_cols.items():
+        if col_name not in existing_user_cols:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+
+    # --- PAYMENTS ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            invoice_id INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            paid_at INTEGER
+        )
+        """
+    )
+
+    required_payment_cols = {
+        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "telegram_id": "INTEGER NOT NULL",
+        "invoice_id": "INTEGER NOT NULL",
+        "currency": "TEXT NOT NULL",
+        "amount": "REAL NOT NULL",
+        "status": "TEXT NOT NULL",
+        "created_at": "INTEGER NOT NULL",
+        "paid_at": "INTEGER",
+    }
+
+    cur.execute("PRAGMA table_info(payments)")
+    existing_payment_cols = {row["name"] for row in cur.fetchall()}
+
+    for col_name, col_def in required_payment_cols.items():
+        if col_name not in existing_payment_cols:
+            cur.execute(f"ALTER TABLE payments ADD COLUMN {col_name} {col_def}")
 
     conn.commit()
     conn.close()
@@ -87,6 +132,19 @@ def _row_to_user(row: sqlite3.Row) -> UserSubscription:
     )
 
 
+def _row_to_payment(row: sqlite3.Row) -> Payment:
+    return Payment(
+        id=row["id"],
+        telegram_id=row["telegram_id"],
+        invoice_id=row["invoice_id"],
+        currency=row["currency"],
+        amount=row["amount"],
+        status=row["status"],
+        created_at=row["created_at"],
+        paid_at=row["paid_at"],
+    )
+
+
 def get_or_create_user(telegram_id: int, username: Optional[str]) -> UserSubscription:
     conn = _get_conn()
     cur = conn.cursor()
@@ -97,7 +155,8 @@ def get_or_create_user(telegram_id: int, username: Optional[str]) -> UserSubscri
     if row is None:
         cur.execute(
             """
-            INSERT INTO users (telegram_id, username, free_requests_used, free_tokens_used, paid_until, current_mode)
+            INSERT INTO users
+                (telegram_id, username, free_requests_used, free_tokens_used, paid_until, current_mode)
             VALUES (?, ?, 0, 0, NULL, NULL)
             """,
             (telegram_id, username),
@@ -163,7 +222,6 @@ def grant_subscription(telegram_id: int, months: int = 1) -> None:
     else:
         base_ts = now_ts
 
-    # Простейшая модель: 30 дней * months
     added_seconds = 30 * 24 * 60 * 60 * months
     new_paid_until = base_ts + added_seconds
 
@@ -177,10 +235,6 @@ def grant_subscription(telegram_id: int, months: int = 1) -> None:
 
 
 def set_user_mode(telegram_id: int, mode_key: Optional[str]) -> None:
-    """
-    Сохраняет текущий режим работы бота для пользователя.
-    mode_key должен быть либо ключом из MODES, либо None.
-    """
     conn = _get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -191,25 +245,79 @@ def set_user_mode(telegram_id: int, mode_key: Optional[str]) -> None:
     conn.close()
 
 
-def get_stats() -> Dict[str, Any]:
+def create_payment(
+    telegram_id: int,
+    invoice_id: int,
+    currency: str,
+    amount: float,
+    status: str,
+    created_at: int,
+) -> int:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO payments
+            (telegram_id, invoice_id, currency, amount, status, created_at, paid_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (telegram_id, invoice_id, currency, amount, status, created_at),
+    )
+    conn.commit()
+    payment_id = int(cur.lastrowid)
+    conn.close()
+    return payment_id
+
+
+def get_pending_payments() -> List[Payment]:
     """
-    Простая статистика для /admin.
+    Все активные (ещё не оплаченные / не истекшие) инвойсы.
     """
     conn = _get_conn()
     cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) as cnt FROM users")
-    total_users = cur.fetchone()["cnt"]
-
-    now_ts = int(time.time())
     cur.execute(
-        "SELECT COUNT(*) as cnt FROM users WHERE paid_until IS NOT NULL AND paid_until > ?",
-        (now_ts,),
+        """
+        SELECT * FROM payments
+        WHERE status = 'active'
+        ORDER BY created_at ASC
+        """
     )
-    active_premium_users = cur.fetchone()["cnt"]
-
+    rows = cur.fetchall()
     conn.close()
-    return {
-        "total_users": int(total_users),
-        "active_premium_users": int(active_premium_users),
-    }
+    return [_row_to_payment(r) for r in rows]
+
+
+def mark_payment_paid(invoice_id: int, paid_at: int) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE payments
+        SET status = 'paid', paid_at = ?
+        WHERE invoice_id = ?
+        """,
+        (paid_at, invoice_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_payments(limit: int = 30) -> List[Payment]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM payments ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [_row_to_payment(r) for r in rows]
+
+
+def get_premium_users(limit: Optional[int] = None) -> List[UserSubscription]:
+    now_ts = int(time.time())
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    sql = """
+        SELECT
