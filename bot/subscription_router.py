@@ -13,9 +13,13 @@ from .subscription_db import (
     init_db,
     get_usage_info,
     register_ai_usage,
+    register_free_tokens_usage,
     extend_subscription,
     get_payment,
     mark_payment_paid,
+    list_payments_for_user,
+    can_consume_free_tokens,
+    get_user,
 )
 from .subscriptions import PLANS, get_plan
 from .payments_crypto import create_invoice, get_invoice_status, CryptoPayError
@@ -23,33 +27,71 @@ from .payments_crypto import create_invoice, get_invoice_status, CryptoPayError
 router = Router(name="subscriptions")
 
 
-# Инициализация БД — вызови init_subscriptions_storage() один раз при старте бота
+# ------------ ИНИЦИАЛИЗАЦИЯ ------------
+
 def init_subscriptions_storage() -> None:
     init_db()
+
+
+# ------------ УТИЛИТЫ ------------
+
+def _estimate_tokens_from_text(text: str | None) -> int:
+    """
+    Грубая оценка токенов по длине текста.
+    ~1 токен ≈ 4 символа. Нам важно не точное число, а порядок.
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 async def check_user_access(message: Message) -> bool:
     """
     Проверяем, может ли пользователь сейчас сделать запрос к ИИ.
-    Возвращаем True, если можно продолжать, False — если нужно оформить подписку.
+    Сюда же добавляем ограничение по длине / токенам.
     """
     user_id = message.from_user.id
     info = get_usage_info(user_id)
 
-    # Если есть активная подписка — всё ок.
+    approx_tokens = _estimate_tokens_from_text(message.text)
+
+    # Если есть активная подписка — пропускаем без ограничений.
     if info["has_subscription"]:
         return True
 
-    # Если остались бесплатные запросы — пускаем.
+    # Проверяем лимит токенов для бесплатного режима
+    if not can_consume_free_tokens(user_id, approx_tokens):
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="💎 Оформить подписку",
+                        callback_data="subs:open_plans",
+                    )
+                ]
+            ]
+        )
+        await message.answer(
+            (
+                "Твой запрос получился слишком длинным для бесплатного режима ✂️\n\n"
+                f"Бесплатный лимит: <b>{info['tokens_limit']}</b> токенов.\n"
+                f"Уже израсходовано: <b>{info['tokens_used']}</b>.\n\n"
+                "Подключи подписку, чтобы снимать с меня длинные и глубокие ответы без ограничений."
+            ),
+            reply_markup=kb,
+        )
+        return False
+
+    # Проверяем счётчик бесплатных запросов
     if info["remaining"] > 0:
         return True
 
-    # Лимит бесплатных запросов исчерпан.
+    # Лимит бесплатных запросов исчерпан
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Оформить подписку",
+                    text="💎 Оформить подписку",
                     callback_data="subs:open_plans",
                 )
             ]
@@ -58,67 +100,137 @@ async def check_user_access(message: Message) -> bool:
     await message.answer(
         (
             "Ты уже использовал свои 3 бесплатных запроса ✨\n\n"
-            "Чтобы продолжить пользоваться ботом без ограничений, оформи подписку."
+            "Чтобы продолжить, подключи подписку и получай ответы без жестких ограничений по длине."
         ),
         reply_markup=kb,
     )
     return False
 
 
-def register_successful_ai_usage(telegram_id: int) -> None:
+def register_successful_ai_usage(
+    telegram_id: int,
+    *,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> None:
     """
-    Вызови эту функцию ПОСЛЕ успешного ответа ИИ пользователю,
-    чтобы списать один бесплатный запрос (если пользователь без подписки).
+    Вызови эту функцию ПОСЛЕ успешного ответа ИИ пользователю.
+
+    Она:
+    - спишет 1 бесплатный запрос (если пользователь без подписки и ещё не выбил лимит),
+    - добавит использование токенов (если передать input_tokens/output_tokens).
     """
     info = get_usage_info(telegram_id)
+
+    # Подписка — бесплатные лимиты не трогаем
     if info["has_subscription"]:
         return
-    if info["remaining"] <= 0:
-        return
-    register_ai_usage(telegram_id)
+
+    # Списываем бесплатный запрос, если ещё есть
+    if info["remaining"] > 0:
+        register_ai_usage(telegram_id)
+
+    # Списываем токены (бесплатный лимит)
+    total_tokens = 0
+    if input_tokens:
+        total_tokens += input_tokens
+    if output_tokens:
+        total_tokens += output_tokens
+
+    if total_tokens > 0:
+        register_free_tokens_usage(telegram_id, total_tokens)
 
 
-@router.message(Command("profile"))
+# ------------ КАБИНЕТ / ПРОФИЛЬ ------------
+
+@router.message(Command("profile", "cabinet"))
 async def cmd_profile(message: Message):
-    """Профиль: показываем, сколько запросов осталось и до какого числа подписка."""
+    """Мини-кабинет: статус, лимиты, история оплат."""
     user_id = message.from_user.id
     info = get_usage_info(user_id)
-
-    text_lines = [
-        "👤 Профиль",
-        "",
-        f"Бесплатные запросы: {info['used']} из {info['limit']}",
-    ]
-    from .subscription_db import get_user  # локальный импорт, чтобы избежать циклов
     user = get_user(user_id)
+    payments = list_payments_for_user(user_id, limit=5)
+
+    lines: list[str] = []
+
+    lines.append("💻 <b>Твой мини-кабинет</b>")
+    lines.append("")
+    # Статус
     if info["has_subscription"] and user and user["subscription_until"]:
-        text_lines.append(f"Подписка: активна до {user['subscription_until']}")
+        lines.append("Статус: <b>Premium</b> 💎")
+        lines.append(f"Активна до: <code>{user['subscription_until']}</code>")
     else:
-        text_lines.append("Подписка: ❌ нет активной подписки")
+        lines.append("Статус: <b>Free</b> ⚪️")
+        lines.append("Подписка: <b>нет</b>")
+
+    lines.append("")
+    # Лимиты
+    lines.append("📊 <b>Лимиты</b>")
+    lines.append(
+        f"Запросы: <b>{info['used']}</b> из <b>{info['limit']}</b> бесплатных"
+    )
+    lines.append(
+        f"Токены: <b>{info['tokens_used']}</b> из <b>{info['tokens_limit']}</b> бесплатных"
+    )
+
+    lines.append("")
+    # История оплат
+    lines.append("💳 <b>История оплат</b> (последние 5):")
+    if not payments:
+        lines.append("Пока нет ни одного платежа.")
+    else:
+        for p in payments:
+            status = p["status"]
+            if status == "paid":
+                status_emoji = "✅"
+            elif status == "pending":
+                status_emoji = "⏳"
+            else:
+                status_emoji = "⚠️"
+
+            created = p["created_at"]
+            plan_code = p["plan_code"]
+            asset = p["asset"]
+            amount = p["amount"]
+
+            lines.append(
+                f"{status_emoji} {created} — {amount} {asset} — тариф <code>{plan_code}</code> ({status})"
+            )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Оформить / продлить подписку",
+                    text="💎 Оформить / продлить подписку",
                     callback_data="subs:open_plans",
                 )
             ]
         ]
     )
 
-    await message.answer("\n".join(text_lines), reply_markup=kb)
+    await message.answer("\n".join(lines), reply_markup=kb)
 
+
+# ------------ ЭКРАНЫ ПОДПИСОК (тексты в стиле «дорого-минималистично») ------------
 
 @router.callback_query(F.data == "subs:open_plans")
 async def cb_open_plans(callback: CallbackQuery):
     """Показываем список тарифов."""
-    lines = ["🔥 Тарифы подписки:"]
+    lines: list[str] = []
+
+    lines.append("💎 <b>Premium-доступ к боту</b>")
+    lines.append("")
+    lines.append(
+        "Без ограничений по глубине ответов, без нервов из-за лимитов. "
+        "Просто задаёшь вопрос — я разбираю и отвечаю максимально развернуто."
+    )
+
     for plan in PLANS.values():
-        lines.append(f"\n<b>{plan.title}</b>")
+        lines.append("")
+        lines.append(f"<b>{plan.title}</b>")
         lines.append(plan.description)
         lines.append(
-            f"Стоимость: {plan.price_ton} TON / {plan.price_usdt} USDT"
+            f"Стоимость: <b>{plan.price_ton} TON</b> или <b>{plan.price_usdt} USDT</b>"
         )
 
     kb_rows = []
@@ -126,7 +238,7 @@ async def cb_open_plans(callback: CallbackQuery):
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{plan.title} — TON",
+                    text=f"{plan.title} — оплатить в TON",
                     callback_data=f"subs:buy:{code}:TON",
                 )
             ]
@@ -134,11 +246,12 @@ async def cb_open_plans(callback: CallbackQuery):
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{plan.title} — USDT",
+                    text=f"{plan.title} — оплатить в USDT",
                     callback_data=f"subs:buy:{code}:USDT",
                 )
             ]
         )
+
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     await callback.message.answer("\n".join(lines), reply_markup=kb)
@@ -182,13 +295,13 @@ async def cb_buy_plan(callback: CallbackQuery):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"Оплатить ({asset})",
+                    text=f"💸 Оплатить ({asset})",
                     url=pay_url,
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Проверить оплату",
+                    text="🔁 Проверить оплату",
                     callback_data=f"subs:check:{invoice_id}:{plan.code}",
                 )
             ],
@@ -199,8 +312,9 @@ async def cb_buy_plan(callback: CallbackQuery):
         (
             f"Счёт создан ✅\n\n"
             f"Тариф: <b>{plan.title}</b>\n"
-            f"Сумма: {amount} {asset}\n\n"
-            "Нажми кнопку «Оплатить», а после оплаты вернись в бот и нажми «Проверить оплату»."
+            f"Сумма: <b>{amount} {asset}</b>\n\n"
+            "1) Нажми «Оплатить» и заверши перевод в Telegram-кошельке.\n"
+            "2) Вернись в этого бота и нажми «Проверить оплату»."
         ),
         reply_markup=kb,
     )
@@ -261,6 +375,7 @@ async def cb_check_payment(callback: CallbackQuery):
         (
             "Оплата получена ✅\n\n"
             f"Подписка <b>{plan.title}</b> активирована.\n"
-            f"Новая дата окончания: <code>{new_until}</code>"
+            f"Новая дата окончания: <code>{new_until}</code>\n\n"
+            "Добро пожаловать в премиальный режим. Теперь можем копать глубже."
         ),
     )
