@@ -1,9 +1,8 @@
 import os
-
-from dotenv import load_dotenv
-from typing import Optional
+from typing import Any, Dict, List
 
 import httpx
+from dotenv import load_dotenv
 
 from .subscription_db import save_payment
 
@@ -12,63 +11,85 @@ load_dotenv()
 CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
 CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
 
-# 5 TON / USDT за 30 дней
-PLAN_AMOUNT_TON = "5"
-PLAN_AMOUNT_USDT = "5"
-PLAN_TITLE = "Подписка на 30 дней — Premium доступ к боту"
+SUBSCRIPTION_PRICE_TON = float(os.getenv("SUBSCRIPTION_PRICE_TON", "1.0"))
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
+SUBSCRIPTION_ASSET = os.getenv("SUBSCRIPTION_ASSET", "TON")
 
 
 class CryptoPayError(Exception):
     pass
 
 
-async def _api_request(method: str, payload: Optional[dict] = None) -> dict:
+async def _request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not CRYPTO_PAY_API_TOKEN:
-        raise CryptoPayError("CRYPTO_PAY_API_TOKEN не указан в .env")
-
-    if payload is None:
-        payload = {}
+        raise CryptoPayError("CRYPTO_PAY_API_TOKEN is not set")
 
     headers = {
+        "Content-Type": "application/json",
         "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{CRYPTO_PAY_API_URL}/{method}",
-            json=payload,
-            headers=headers,
-        )
-    resp.raise_for_status()
-    data = resp.json()
+    async with httpx.AsyncClient(base_url=CRYPTO_PAY_API_URL, timeout=15.0) as client:
+        resp = await client.post(method, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
     if not data.get("ok"):
         raise CryptoPayError(str(data))
+
     return data["result"]
 
 
-async def create_invoice(user_id: int, plan_code: str) -> str:
+async def create_invoice(telegram_id: int) -> Dict[str, Any]:
     """
-    Создаёт счёт на оплату через Crypto Bot и возвращает ссылку.
-    Пока создаём один инвойс в TON.
+    Создаёт счёт на подписку для пользователя.
+    Возвращает объект инвойса CryptoBot.
     """
-    ton_invoice = await _api_request(
-        "createInvoice",
-        {
-            "asset": "TON",
-            "amount": PLAN_AMOUNT_TON,
-            "description": PLAN_TITLE,
-            "payload": f"{plan_code}:{user_id}",
-        },
-    )
+    payload = {
+        "asset": SUBSCRIPTION_ASSET,
+        "amount": SUBSCRIPTION_PRICE_TON,
+        "description": "Подписка AI Medicine Premium",
+        "payload": str(telegram_id),
+        "allow_anonymous": False,
+        "allow_comments": False,
+    }
 
-    # фиксируем платёж как ожидающий
+    result = await _request("/createInvoice", payload)
+    invoice_id = result["invoice_id"]
+    amount = float(result.get("amount", SUBSCRIPTION_PRICE_TON))
+    currency = result.get("asset", SUBSCRIPTION_ASSET)
+    created_at = result.get("created_at")
+
     save_payment(
-        invoice_id=ton_invoice["invoice_id"],
-        telegram_id=user_id,
-        amount=float(PLAN_AMOUNT_TON),
-        currency="TON",
-        status=ton_invoice["status"],
-        created_at=ton_invoice.get("created_at"),
+        invoice_id=invoice_id,
+        telegram_id=telegram_id,
+        amount=amount,
+        currency=currency,
+        status=result.get("status", "active"),
+        created_at=created_at,
+        payload=payload["payload"],
     )
 
-    return ton_invoice["pay_url"]
+    return result
+
+
+async def fetch_invoices_statuses(invoice_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Возвращает статусы указанных счетов.
+    Сейчас не используется в main.py, но
+    оставил на будущее, если захочешь сделать авто-проверку оплат.
+    """
+    if not invoice_ids:
+        return {}
+
+    payload = {
+        "invoice_ids": invoice_ids,
+    }
+    result = await _request("/getInvoices", payload)
+
+    statuses: Dict[int, Dict[str, Any]] = {}
+    for inv in result:
+        inv_id = inv["invoice_id"]
+        statuses[inv_id] = inv
+
+    return statuses
