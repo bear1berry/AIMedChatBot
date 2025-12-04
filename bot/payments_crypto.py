@@ -1,4 +1,3 @@
-# bot/payments_crypto.py
 from __future__ import annotations
 
 import os
@@ -20,7 +19,6 @@ class CryptoPayError(Exception):
 def _get_api_token() -> str:
     token = os.getenv("CRYPTO_PAY_API_TOKEN")
     if not token:
-        # В логах у тебя как раз такая ошибка и была — оставляем её же
         raise CryptoPayError("CRYPTO_PAY_API_TOKEN не указан в .env")
     return token
 
@@ -31,19 +29,14 @@ async def create_invoice(
     description: str,
     payload: str,
 ) -> tuple[str, str]:
-    """
-    Создать счёт в Crypto Bot.
-
-    Возвращает:
-        (pay_url, invoice_id)
-    """
+    """Создать счёт в Crypto Bot и вернуть (pay_url, invoice_id)."""
     token = _get_api_token()
     headers = {"Crypto-Pay-API-Token": token}
     json_data = {
         "amount": amount,
-        "asset": currency,       # USDT, TON, BTC и т.п.
+        "asset": currency,      # USDT, TON и т.п.
         "description": description,
-        "payload": payload,      # строка, которую ты потом можешь использовать
+        "payload": payload,     # сюда можно прокинуть свой идентификатор
     }
 
     async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=20.0) as client:
@@ -59,15 +52,15 @@ async def create_invoice(
         logger.error("CryptoPay error response on createInvoice: %s", data)
         raise CryptoPayError("Не удалось создать счёт через Crypto Bot")
 
-    result = data.get("result") or data.get("result", {})
+    result = data.get("result") or {}
 
-    # В одних версиях API result — это объект с полями pay_url / invoice_id
+    # Обычный кейс: result — объект с полями pay_url, invoice_id
     if isinstance(result, dict) and "pay_url" in result:
         pay_url = result["pay_url"]
         invoice_id = str(result.get("invoice_id") or result.get("invoiceId"))
         return pay_url, invoice_id
 
-    # В других — result = {"items": [ {...}, ... ]}
+    # На всякий случай: если result — объект с items
     items = result.get("items") if isinstance(result, dict) else None
     if items:
         item = items[0]
@@ -81,12 +74,9 @@ async def create_invoice(
 
 async def fetch_invoices_statuses(invoice_ids: List[str]) -> Dict[str, str]:
     """
-    Получить статусы нескольких инвойсов.
+    Получить статусы нескольких инвойсов: {invoice_id: status}.
 
-    Возвращает словарь:
-        {invoice_id: status}
-
-    Используется в main.py / админ-панели для массовой проверки и активации подписок.
+    status может быть: active, paid, expired, cancelled и т.п.
     """
     if not invoice_ids:
         return {}
