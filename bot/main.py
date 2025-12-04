@@ -8,6 +8,7 @@ from typing import Optional
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from dotenv import load_dotenv
@@ -22,9 +23,6 @@ from .subscription_router import (
 from .subscription_db import init_db
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------- LLM client ----------------------
 
 
 SYSTEM_PROMPT = (
@@ -134,10 +132,6 @@ class LLMClient:
 
 llm_client = LLMClient()
 
-
-# ---------------------- Bot setup ----------------------
-
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -149,16 +143,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 dp.include_router(subscription_router)
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """
-    Приветственный экран.
-    """
     is_admin = is_admin_username(message.from_user.username)
     kb = build_main_menu(is_admin=is_admin)
 
@@ -188,15 +182,13 @@ async def msg_subscription(message: Message) -> None:
 
 @dp.message(F.text == "🛠 Админ-панель")
 async def msg_admin_shortcut(message: Message) -> None:
-    # Реальная логика админки — в subscription_router, здесь просто чтобы текст не ушёл в общий обработчик
-    pass
+    # Вся логика админки реализована в subscription_router
+    await message.answer("Открываю админ-панель…\nКоманда: /admin")
+    await cmd_help(message)
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_ai_chat(message: Message) -> None:
-    """
-    Главный обработчик AI-диалога.
-    """
     if not await check_user_access(message):
         return
 
