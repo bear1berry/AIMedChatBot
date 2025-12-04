@@ -3,7 +3,7 @@
 import os
 from typing import Literal, Optional, Dict, Any
 
-import httpx
+import httpx  # убедись, что httpx есть в requirements.txt
 
 from .subscription_db import create_payment
 
@@ -26,7 +26,11 @@ async def create_invoice(
     """
     Создаём invoice в Crypto Pay и сохраняем его в БД.
 
-    Возвращаем dict с полями invoice_id и pay_url.
+    Возвращаем dict с полями:
+    {
+        "invoice_id": str,
+        "pay_url": str
+    }
     """
     if not CRYPTO_PAY_API_TOKEN:
         raise CryptoPayError("CRYPTO_PAY_API_TOKEN не задан в переменных окружения")
@@ -39,12 +43,10 @@ async def create_invoice(
         "asset": asset,
         "amount": float(amount),
         "description": description,
-        # payload — произвольная строка, сюда кладём user_id и plan_code,
-        # чтобы потом однозначно сопоставить платеж.
         "payload": f"user:{telegram_id}|plan:{plan_code}",
         "allow_comments": False,
         "allow_anonymous": True,
-        "expires_in": 3600,  # 1 час на оплату
+        "expires_in": 3600,
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -53,6 +55,7 @@ async def create_invoice(
             headers=headers,
             json=payload,
         )
+
     data = resp.json()
     if not data.get("ok"):
         raise CryptoPayError(f"Ошибка Crypto Pay: {data!r}")
@@ -61,7 +64,6 @@ async def create_invoice(
     invoice_id = str(invoice["invoice_id"])
     pay_url = invoice.get("pay_url") or invoice.get("bot_invoice_url")
 
-    # сохраняем платёж как pending
     create_payment(
         invoice_id=invoice_id,
         telegram_id=telegram_id,
@@ -78,7 +80,7 @@ async def create_invoice(
 
 async def get_invoice_status(invoice_id: str) -> Optional[str]:
     """
-    Возвращаем статус инвойса: active / paid / cancelled / expired и т.п.
+    Возвращаем статус инвойса: active / paid / cancelled / expired и т.д.
     """
     if not CRYPTO_PAY_API_TOKEN:
         raise CryptoPayError("CRYPTO_PAY_API_TOKEN не задан в переменных окружения")
@@ -92,17 +94,18 @@ async def get_invoice_status(invoice_id: str) -> Optional[str]:
             headers=headers,
             params=params,
         )
+
     data = resp.json()
     if not data.get("ok"):
         raise CryptoPayError(f"Ошибка Crypto Pay (getInvoices): {data!r}")
 
     result = data.get("result")
-    # В новых версиях API result может быть dict с items, в старых — просто list.
     items = []
     if isinstance(result, dict) and "items" in result:
         items = result["items"]
     elif isinstance(result, list):
         items = result
+
     if not items:
         return None
 
