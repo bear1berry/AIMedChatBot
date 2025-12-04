@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
-DB_PATH = Path(os.getenv("BOT_DB_PATH", "bot.db"))
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "subscriptions.sqlite3"
 
 
 @dataclass
@@ -18,11 +18,12 @@ class UserSubscription:
     username: Optional[str]
     free_requests_used: int
     free_tokens_used: int
-    paid_until: Optional[int]  # unix timestamp или None
+    paid_until: Optional[int]
+    current_mode: Optional[str] = None
 
     @property
     def has_active_subscription(self) -> bool:
-        if not self.paid_until:
+        if self.paid_until is None:
             return False
         return self.paid_until > int(time.time())
 
@@ -33,115 +34,80 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def _get_columns(conn: sqlite3.Connection) -> set[str]:
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(users)")
-    rows = cur.fetchall()
-    return {row["name"] for row in rows}
-
-
 def init_db() -> None:
     """
-    Инициализация БД + мягкая миграция старой схемы.
-    Раньше таблица users могла быть без полей username / free_tokens_used / paid_until.
-    Здесь мы аккуратно добавляем недостающие колонки.
+    Создаёт таблицу users, если её нет,
+    и гарантирует наличие всех нужных колонок.
     """
     conn = _get_conn()
     cur = conn.cursor()
 
-    # Есть ли таблица users вообще?
     cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT,
+            free_requests_used INTEGER DEFAULT 0,
+            free_tokens_used INTEGER DEFAULT 0,
+            paid_until INTEGER,
+            current_mode TEXT
+        )
+        """
     )
-    row = cur.fetchone()
 
-    if not row:
-        # Создаём таблицу с новой схемой
-        with conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    telegram_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    free_requests_used INTEGER NOT NULL DEFAULT 0,
-                    free_tokens_used INTEGER NOT NULL DEFAULT 0,
-                    paid_until INTEGER
-                )
-                """
-            )
-        conn.close()
-        return
-
-    # Таблица есть — проверим колонки и добавим недостающие
-    existing_cols = _get_columns(conn)
-    required_cols: dict[str, str] = {
+    # Проверяем наличие колонок и добавляем недостающие (на случай старой БД)
+    required_cols = {
+        "telegram_id": "INTEGER PRIMARY KEY",
         "username": "TEXT",
-        "free_requests_used": "INTEGER NOT NULL DEFAULT 0",
-        "free_tokens_used": "INTEGER NOT NULL DEFAULT 0",
+        "free_requests_used": "INTEGER DEFAULT 0",
+        "free_tokens_used": "INTEGER DEFAULT 0",
         "paid_until": "INTEGER",
+        "current_mode": "TEXT",
     }
 
-    for col, col_type in required_cols.items():
-        if col not in existing_cols:
-            with conn:
-                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
+    cur.execute("PRAGMA table_info(users)")
+    existing_cols = {row["name"] for row in cur.fetchall()}
 
+    for col_name, col_def in required_cols.items():
+        if col_name not in existing_cols:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+
+    conn.commit()
     conn.close()
 
 
 def _row_to_user(row: sqlite3.Row) -> UserSubscription:
-    # На всякий случай берём через keys(), чтобы не падать,
-    # если вдруг схема ещё не обновилась.
-    keys = set(row.keys())
-    username = row["username"] if "username" in keys else None
-    free_requests_used = (
-        int(row["free_requests_used"]) if "free_requests_used" in keys else 0
-    )
-    free_tokens_used = (
-        int(row["free_tokens_used"]) if "free_tokens_used" in keys else 0
-    )
-    paid_until = row["paid_until"] if "paid_until" in keys else None
-
     return UserSubscription(
         telegram_id=row["telegram_id"],
-        username=username,
-        free_requests_used=free_requests_used,
-        free_tokens_used=free_tokens_used,
-        paid_until=paid_until,
+        username=row["username"],
+        free_requests_used=row["free_requests_used"],
+        free_tokens_used=row["free_tokens_used"],
+        paid_until=row["paid_until"],
+        current_mode=row["current_mode"],
     )
 
 
-def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> UserSubscription:
+def get_or_create_user(telegram_id: int, username: Optional[str]) -> UserSubscription:
     conn = _get_conn()
     cur = conn.cursor()
+
     cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
-    if row:
-        user = _row_to_user(row)
-        # обновим username при необходимости
-        if username and username != user.username:
-            with conn:
-                conn.execute(
-                    "UPDATE users SET username = ? WHERE telegram_id = ?",
-                    (username, telegram_id),
-                )
-            user.username = username
-    else:
-        with conn:
-            conn.execute(
-                "INSERT INTO users (telegram_id, username, free_requests_used, free_tokens_used, paid_until) "
-                "VALUES (?, ?, 0, 0, NULL)",
-                (telegram_id, username),
-            )
-        user = UserSubscription(
-            telegram_id=telegram_id,
-            username=username,
-            free_requests_used=0,
-            free_tokens_used=0,
-            paid_until=None,
+
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO users (telegram_id, username, free_requests_used, free_tokens_used, paid_until, current_mode)
+            VALUES (?, ?, 0, 0, NULL, NULL)
+            """,
+            (telegram_id, username),
         )
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = cur.fetchone()
+
     conn.close()
-    return user
+    return _row_to_user(row)  # type: ignore[arg-type]
 
 
 def get_user(telegram_id: int) -> Optional[UserSubscription]:
@@ -150,50 +116,100 @@ def get_user(telegram_id: int) -> Optional[UserSubscription]:
     cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
     conn.close()
-    if not row:
+    if row is None:
         return None
     return _row_to_user(row)
 
 
-def add_free_usage(telegram_id: int, add_requests: int, add_tokens: int) -> None:
-    conn = _get_conn()
-    with conn:
-        conn.execute(
-            """
-            UPDATE users
-            SET free_requests_used = COALESCE(free_requests_used, 0) + ?,
-                free_tokens_used = COALESCE(free_tokens_used, 0) + ?
-            WHERE telegram_id = ?
-            """,
-            (add_requests, add_tokens, telegram_id),
-        )
-    conn.close()
-
-
-def grant_subscription(telegram_id: int, days: int) -> None:
-    """Добавляем/продлеваем подписку на N дней."""
-    now = int(time.time())
+def update_usage(telegram_id: int, add_requests: int, add_tokens: int) -> None:
     conn = _get_conn()
     cur = conn.cursor()
 
-    # Убедимся, что колонка paid_until есть (на случай очень старой БД)
-    cols = _get_columns(conn)
-    if "paid_until" not in cols:
-        with conn:
-            conn.execute("ALTER TABLE users ADD COLUMN paid_until INTEGER")
+    cur.execute("SELECT free_requests_used, free_tokens_used FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return
+
+    new_requests = (row["free_requests_used"] or 0) + max(0, add_requests)
+    new_tokens = (row["free_tokens_used"] or 0) + max(0, add_tokens)
+
+    cur.execute(
+        """
+        UPDATE users
+        SET free_requests_used = ?, free_tokens_used = ?
+        WHERE telegram_id = ?
+        """,
+        (new_requests, new_tokens, telegram_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def grant_subscription(telegram_id: int, months: int = 1) -> None:
+    """
+    Продлевает (или создаёт) подписку на указанный срок в месяцах.
+    """
+    now_ts = int(time.time())
+    conn = _get_conn()
+    cur = conn.cursor()
 
     cur.execute("SELECT paid_until FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
+
     if row and row["paid_until"]:
-        base = max(now, int(row["paid_until"]))
+        base_ts = max(now_ts, row["paid_until"])
     else:
-        base = now
+        base_ts = now_ts
 
-    new_paid_until = base + days * 86400
+    # Простейшая модель: 30 дней * months
+    added_seconds = 30 * 24 * 60 * 60 * months
+    new_paid_until = base_ts + added_seconds
 
-    with conn:
-        conn.execute(
-            "UPDATE users SET paid_until = ? WHERE telegram_id = ?",
-            (new_paid_until, telegram_id),
-        )
+    cur.execute(
+        "UPDATE users SET paid_until = ? WHERE telegram_id = ?",
+        (new_paid_until, telegram_id),
+    )
+
+    conn.commit()
     conn.close()
+
+
+def set_user_mode(telegram_id: int, mode_key: Optional[str]) -> None:
+    """
+    Сохраняет текущий режим работы бота для пользователя.
+    mode_key должен быть либо ключом из MODES, либо None.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET current_mode = ? WHERE telegram_id = ?",
+        (mode_key, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stats() -> Dict[str, Any]:
+    """
+    Простая статистика для /admin.
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) as cnt FROM users")
+    total_users = cur.fetchone()["cnt"]
+
+    now_ts = int(time.time())
+    cur.execute(
+        "SELECT COUNT(*) as cnt FROM users WHERE paid_until IS NOT NULL AND paid_until > ?",
+        (now_ts,),
+    )
+    active_premium_users = cur.fetchone()["cnt"]
+
+    conn.close()
+    return {
+        "total_users": int(total_users),
+        "active_premium_users": int(active_premium_users),
+    }
