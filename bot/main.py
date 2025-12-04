@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import os
-from typing import Any, Tuple
+from typing import Any
+
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,6 +20,9 @@ from .subscription_router import (
     register_successful_ai_usage,
 )
 
+# Загружаем переменные окружения из .env
+load_dotenv()
+
 # Пытаемся импортировать твой реальный клиент ИИ.
 # Ожидается async-функция:
 # async def ask_ai(user_text: str, user_id: int) -> str | tuple[str, int, int]
@@ -31,8 +36,9 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Укажи BOT_TOKEN или TELEGRAM_BOT_TOKEN в переменных окружения / .env")
-
+    raise RuntimeError(
+        "Укажи BOT_TOKEN или TELEGRAM_BOT_TOKEN в переменных окружения / .env"
+    )
 
 dp = Dispatcher()
 dp.include_router(subscription_router)
@@ -74,54 +80,4 @@ async def handle_ai(message: Message):
     # - ask_ai -> str
     # - ask_ai -> (str, input_tokens, output_tokens)
     reply_text: str
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-
-    if isinstance(result, tuple):
-        # берём максимум первые три элемента
-        reply_text = str(result[0])
-        if len(result) > 1:
-            try:
-                input_tokens = int(result[1])
-            except Exception:
-                input_tokens = None
-        if len(result) > 2:
-            try:
-                output_tokens = int(result[2])
-            except Exception:
-                output_tokens = None
-    else:
-        reply_text = str(result)
-
-    # Если usage не пришёл — оцениваем по длине текста
-    if input_tokens is None:
-        input_tokens = max(1, len(user_text) // 4)
-    if output_tokens is None:
-        output_tokens = max(1, len(reply_text) // 4)
-
-    # 3. Отправляем ответ
-    await message.answer(reply_text)
-
-    # 4. Фиксируем использование лимитов
-    register_successful_ai_usage(
-        telegram_id=user_id,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
-
-
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    # Инициализируем БД подписок
-    init_subscriptions_storage()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    input_tokens: in_
