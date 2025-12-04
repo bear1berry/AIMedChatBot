@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Union
 
 import httpx
+from dotenv import load_dotenv
+
+# --------------------------------------------------------------------
+# ГРУЗИМ .env ЗДЕСЬ, ДО ЧТЕНИЯ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# --------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent.parent  # /home/.../AIMedChatBot
+ENV_PATH = BASE_DIR / ".env"
+
+# Загружаем переменные из .env (если уже загружены — не страшно)
+load_dotenv(ENV_PATH, override=False)
 
 CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
 CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
@@ -18,7 +30,7 @@ class CryptoPayError(Exception):
 
 async def crypto_pay_get_me() -> None:
     """
-    Одноразовая проверка токена при старте (можно вызвать из main, не обязательно).
+    Одноразовая проверка токена при старте (опционально).
     Пишет результат в лог.
     """
     if not CRYPTO_PAY_API_TOKEN:
@@ -101,7 +113,6 @@ async def create_invoice(
         raise CryptoPayError(f"{name}: {message}")
 
     result = body.get("result") or {}
-    # по новым спецификациям основной URL — bot_invoice_url
     invoice_url = result.get("bot_invoice_url") or result.get("pay_url")
     if not invoice_url:
         logging.error(
