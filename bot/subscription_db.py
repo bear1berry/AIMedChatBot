@@ -1,45 +1,21 @@
-from __future__ import annotations
-
 import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscription.db")
 
 
-@dataclass
-class User:
-    telegram_id: int
-    username: Optional[str]
-    is_admin: bool
-    free_messages_used: int
-    paid_until: Optional[int]
-    created_at: int
-    updated_at: int
-
-
-@dataclass
-class Payment:
-    id: int
-    telegram_id: int
-    username: Optional[str]
-    invoice_id: str
-    invoice_url: str
-    amount: int
-    currency: str
-    status: str
-    created_at: int
-    paid_at: Optional[int]
-
-
 @contextmanager
-def get_conn() -> Iterable[sqlite3.Connection]:
+def _get_conn():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         yield conn
         conn.commit()
     finally:
@@ -47,281 +23,149 @@ def get_conn() -> Iterable[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """Создать таблицы, если их ещё нет. Безопасно вызывать при каждом старте."""
-    with get_conn() as conn:
+    with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id       INTEGER PRIMARY KEY,
-                username          TEXT,
-                is_admin          INTEGER NOT NULL DEFAULT 0,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
                 free_messages_used INTEGER NOT NULL DEFAULT 0,
-                paid_until        INTEGER,
-                created_at        INTEGER NOT NULL,
-                updated_at        INTEGER NOT NULL
+                total_messages INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                premium_until INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS payments (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id TEXT UNIQUE NOT NULL,
                 telegram_id INTEGER NOT NULL,
-                username    TEXT,
-                invoice_id  TEXT NOT NULL UNIQUE,
-                invoice_url TEXT NOT NULL,
-                amount      INTEGER NOT NULL,
-                currency    TEXT NOT NULL,
-                status      TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                paid_at     INTEGER
+                amount REAL,
+                currency TEXT,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                paid_at INTEGER
             )
             """
         )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_invoice_id ON payments(invoice_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_telegram_id ON payments(telegram_id)")
 
 
-def _row_to_user(row: sqlite3.Row) -> User:
-    return User(
-        telegram_id=row["telegram_id"],
-        username=row["username"],
-        is_admin=bool(row["is_admin"]),
-        free_messages_used=row["free_messages_used"],
-        paid_until=row["paid_until"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
 
 
-def _admin_usernames() -> Tuple[str, ...]:
-    raw = os.getenv("ADMIN_USERNAMES", "bear1berry")
-    items = [x.strip().lower() for x in raw.split(",") if x.strip()]
-    return tuple(items)
-
-
-def get_or_create_user(telegram_id: int, username: Optional[str]) -> User:
+def get_or_create_user(telegram_id: int, username: str, is_admin: bool) -> Dict[str, Any]:
     now_ts = int(time.time())
-    with get_conn() as conn:
+    with _get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        cur.execute(
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
         row = cur.fetchone()
         if row:
-            user = _row_to_user(row)
-            # обновим username, если изменился
-            if username and username != user.username:
-                cur.execute(
-                    "UPDATE users SET username = ?, updated_at = ? WHERE telegram_id = ?",
-                    (username, now_ts, telegram_id),
-                )
-                user.username = username
-                user.updated_at = now_ts
-            return user
-
-        is_admin = 1 if username and username.lower() in _admin_usernames() else 0
-        cur.execute(
-            """
-            INSERT INTO users (telegram_id, username, is_admin, free_messages_used, paid_until, created_at, updated_at)
-            VALUES (?, ?, ?, 0, NULL, ?, ?)
-            """,
-            (telegram_id, username, is_admin, now_ts, now_ts),
-        )
-        return User(
-            telegram_id=telegram_id,
-            username=username,
-            is_admin=bool(is_admin),
-            free_messages_used=0,
-            paid_until=None,
-            created_at=now_ts,
-            updated_at=now_ts,
-        )
-
-
-def increment_free_usage(telegram_id: int, username: Optional[str]) -> int:
-    """Увеличить счётчик бесплатных сообщений и вернуть новое значение."""
-    now_ts = int(time.time())
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT free_messages_used FROM users WHERE telegram_id = ?", (telegram_id,))
-        row = cur.fetchone()
-        if row is None:
-            # создадим пользователя
-            get_or_create_user(telegram_id, username)
-            cur.execute("SELECT free_messages_used FROM users WHERE telegram_id = ?", (telegram_id,))
-            row = cur.fetchone()
-        free_used = int(row["free_messages_used"]) + 1
-        cur.execute(
-            "UPDATE users SET free_messages_used = ?, updated_at = ? WHERE telegram_id = ?",
-            (free_used, now_ts, telegram_id),
-        )
-        return free_used
-
-
-def user_has_active_subscription(user: User) -> bool:
-    if not user.paid_until:
-        return False
-    return user.paid_until > int(time.time())
-
-
-def set_subscription_month(telegram_id: int, months: int = 1) -> None:
-    """Добавить N месяцев подписки пользователю (от текущей даты или от paid_until, если она в будущем)."""
-    now_ts = int(time.time())
-    add_seconds = int(30 * 24 * 3600 * months)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT paid_until FROM users WHERE telegram_id = ?", (telegram_id,))
-        row = cur.fetchone()
-        if row and row["paid_until"] and row["paid_until"] > now_ts:
-            base = int(row["paid_until"])
-        else:
-            base = now_ts
-        new_paid_until = base + add_seconds
-        cur.execute(
-            "UPDATE users SET paid_until = ?, updated_at = ? WHERE telegram_id = ?",
-            (new_paid_until, now_ts, telegram_id),
-        )
-
-
-def reset_free_counter(telegram_id: int) -> None:
-    now_ts = int(time.time())
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET free_messages_used = 0, updated_at = ? WHERE telegram_id = ?",
-            (now_ts, telegram_id),
-        )
-
-
-def create_payment(
-    telegram_id: int,
-    username: Optional[str],
-    invoice_id: str,
-    invoice_url: str,
-    amount: int,
-    currency: str,
-) -> Payment:
-    now_ts = int(time.time())
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO payments (telegram_id, username, invoice_id, invoice_url, amount, currency, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (telegram_id, username, invoice_id, invoice_url, amount, currency, now_ts),
-        )
-        payment_id = cur.lastrowid
-        return Payment(
-            id=payment_id,
-            telegram_id=telegram_id,
-            username=username,
-            invoice_id=invoice_id,
-            invoice_url=invoice_url,
-            amount=amount,
-            currency=currency,
-            status="pending",
-            created_at=now_ts,
-            paid_at=None,
-        )
-
-
-def mark_payment_paid(invoice_id: str, paid_ts: Optional[int] = None) -> None:
-    paid_ts = paid_ts or int(time.time())
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE payments SET status = 'paid', paid_at = ? WHERE invoice_id = ?",
-            (paid_ts, invoice_id),
-        )
-
-
-def get_payment_by_invoice(invoice_id: str) -> Optional[Payment]:
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM payments WHERE invoice_id = ?", (invoice_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return Payment(
-            id=row["id"],
-            telegram_id=row["telegram_id"],
-            username=row["username"],
-            invoice_id=row["invoice_id"],
-            invoice_url=row["invoice_url"],
-            amount=row["amount"],
-            currency=row["currency"],
-            status=row["status"],
-            created_at=row["created_at"],
-            paid_at=row["paid_at"],
-        )
-
-
-def list_active_subscriptions(limit: int = 50) -> List[User]:
-    now_ts = int(time.time())
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT * FROM users
-            WHERE paid_until IS NOT NULL AND paid_until > ?
-            ORDER BY paid_until DESC
-            LIMIT ?
-            """,
-            (now_ts, limit),
-        )
-        rows = cur.fetchall()
-        return [_row_to_user(r) for r in rows]
-
-
-def list_recent_payments(limit: int = 50) -> List[Payment]:
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM payments ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
-        rows = cur.fetchall()
-        res: List[Payment] = []
-        for row in rows:
-            res.append(
-                Payment(
-                    id=row["id"],
-                    telegram_id=row["telegram_id"],
-                    username=row["username"],
-                    invoice_id=row["invoice_id"],
-                    invoice_url=row["invoice_url"],
-                    amount=row["amount"],
-                    currency=row["currency"],
-                    status=row["status"],
-                    created_at=row["created_at"],
-                    paid_at=row["paid_at"],
-                )
+            # при каждом заходе обновляем username и is_admin
+            cur.execute(
+                """
+                UPDATE users
+                SET username = ?, is_admin = ?, updated_at = ?
+                WHERE telegram_id = ?
+                """,
+                (username, int(is_admin), now_ts, telegram_id),
             )
-        return res
-
-
-def get_admin_stats() -> dict:
-    now_ts = int(time.time())
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        total_users = cur.fetchone()[0]
+            conn.commit()
+            cur.execute(
+                "SELECT * FROM users WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            return _row_to_dict(cur.fetchone())
 
         cur.execute(
-            "SELECT COUNT(*) FROM users WHERE paid_until IS NOT NULL AND paid_until > ?",
-            (now_ts,),
+            """
+            INSERT INTO users (
+                telegram_id, username, is_admin,
+                free_messages_used, total_messages, total_tokens,
+                premium_until, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 0, 0, 0, NULL, ?, ?)
+            """,
+            (telegram_id, username, int(is_admin), now_ts, now_ts),
         )
-        active_subs = cur.fetchone()[0]
-
+        conn.commit()
         cur.execute(
-            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments WHERE status = 'paid'"
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        return _row_to_dict(cur.fetchone())
+
+
+def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM users WHERE telegram_id = ?",
+            (telegram_id,),
         )
         row = cur.fetchone()
-        total_payments = row[0]
-        total_revenue = row[1]
+        return _row_to_dict(row) if row else None
 
-        return {
-            "total_users": total_users,
-            "active_subscriptions": active_subs,
-            "total_payments": total_payments,
-            "total_revenue": total_revenue,
-        }
+
+def increment_free_messages_used(telegram_id: int, delta: int = 1) -> None:
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE users
+            SET free_messages_used = free_messages_used + ?,
+                updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (delta, int(time.time()), telegram_id),
+        )
+
+
+def increment_usage(
+    telegram_id: int,
+    messages_delta: int = 0,
+    tokens_delta: int = 0,
+) -> None:
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE users
+            SET
+                total_messages = total_messages + ?,
+                total_tokens = total_tokens + ?,
+                updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (messages_delta, tokens_delta, int(time.time()), telegram_id),
+        )
+        # считаем эти сообщения и как бесплатные (для лимита),
+        # лимит всё равно игнорируется для активного премиума/админа
+        if messages_delta > 0:
+            cur.execute(
+                """
+                UPDATE users
+                SET free_messages_used = free_messages_used + ?
+                WHERE telegram_id = ?
+                """,
+                (messages_delta, telegram_id),
+            )
+
+
+def upgrade_user_to_premium(telegram_id: int, days: int = 30, paid_at: Optional[int] = None) -> None:
+    if paid_at is None:
+        paid_at = int(time.time())
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT premium_u_
