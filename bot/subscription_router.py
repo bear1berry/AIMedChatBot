@@ -1,447 +1,296 @@
 from __future__ import annotations
 
 import logging
-import os
+import math
 import time
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message
-
-from .subscriptions import (
-    MAIN_MENU_KEYBOARD,
-    SUBSCRIPTION_KEYBOARD,
-    MODE_SELECT_KEYBOARD,
-    START_TEXT,
-    LIMIT_REACHED_TEXT,
-    SUBSCRIPTION_INFO_TEXT,
-    HELP_TEXT,
-    get_mode_key_from_button,
-    get_mode_title,
-    MODE_BUTTON_TEXTS,
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
+
 from .subscription_db import (
     init_db,
     get_or_create_user,
-    get_user,
-    update_usage,
-    grant_subscription,
-    set_user_mode,
-    get_stats,
-    get_premium_users,
-    get_recent_payments,
-    export_users_and_payments,
-    create_payment,
-    Payment,
+    increment_free_usage,
+    user_has_active_subscription,
+    set_subscription_month,
+    get_admin_stats,
+    list_active_subscriptions,
+    list_recent_payments,
+    User,
 )
-from .payments_crypto import create_invoice, CryptoPayError
+from .payments_crypto import create_invoice, get_invoice, CryptoPayError
 
 logger = logging.getLogger(__name__)
 
-subscription_router = Router(name="subscription_router")
+subscription_router = Router(name="subscription")
 
-# Лимиты бесплатного режима
-FREE_REQUESTS_LIMIT = int(os.getenv("FREE_REQUESTS_LIMIT", "3"))
-FREE_TOKENS_LIMIT = int(os.getenv("FREE_TOKENS_LIMIT", "6000"))
+# Настройки
+ADMIN_USERNAMES = {"bear1berry"}
+FREE_REQUESTS_LIMIT = 3
+FREE_TOKENS_LIMIT = 8000  # условно, считаем 1 символ ~ 1 токен
+SUB_PRICE_USD = 5.0
+SUB_MONTHS = 1
 
-# Админ (владелец бота)
-ADMIN_USERNAMES = {
-    (os.getenv("ADMIN_USERNAME") or "bear1berry").lstrip("@").lower(),
-}
-
-
-# --- ИНИЦИАЛИЗАЦИЯ ХРАНИЛИЩА ПОДПИСОК ---
+TON_ASSET = "TON"
+USDT_ASSET = "USDT"
 
 
-def init_subscriptions_storage() -> None:
-    init_db()
-    logger.info("Subscription storage initialized")
+def is_admin_username(username: Optional[str]) -> bool:
+    return bool(username) and username.lstrip("@") in {u.lstrip("@") for u in ADMIN_USERNAMES}
 
 
-def is_admin_user(telegram_id: Optional[int], username: Optional[str]) -> bool:
-    """
-    Проверяем, является ли пользователь админом по username.
-    """
-    if username:
-        uname = username.lstrip("@").lower()
-        if uname in ADMIN_USERNAMES:
-            return True
-    return False
+def build_main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    buttons_row1 = [
+        KeyboardButton(text="💬 Чат"),
+        KeyboardButton(text="🔥 Режим"),
+    ]
+    buttons_row2 = [
+        KeyboardButton(text="⭐ Подписка"),
+        KeyboardButton(text="❓ Помощь"),
+    ]
+    rows = [buttons_row1, buttons_row2]
+    if is_admin:
+        rows.append([KeyboardButton(text="🛠 Админ-панель")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Напиши вопрос…",
+    )
+
+
+def _subscription_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💎 Оплатить в TON", callback_data="sub_buy_ton"
+                ),
+                InlineKeyboardButton(
+                    text="💎 Оплатить в USDT", callback_data="sub_buy_usdt"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Я оплатил", callback_data="sub_check_payment"
+                )
+            ],
+        ]
+    )
+
+
+async def show_subscription_menu(message: Message) -> None:
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    now = int(time.time())
+    status_lines = []
+
+    if user_has_active_subscription(user):
+        left_days = (user.paid_until_ts - now) / 86400 if user.paid_until_ts else 0
+        status_lines.append(
+            f"✅ У тебя уже есть активная подписка.\n"
+            f"Осталось примерно <b>{max(1, math.ceil(left_days))}</b> дн."
+        )
+    else:
+        left_free = max(0, FREE_REQUESTS_LIMIT - user.free_requests)
+        status_lines.append(
+            "👋 У тебя есть лимит на 3 бесплатных запроса к ИИ.\n"
+            f"Осталось бесплатных запросов: <b>{left_free}</b>."
+        )
+
+    text = (
+        "✨ <b>AI Medicine / Alexander Bot — премиум режим</b>\n\n"
+        "🔓 Подписка открывает:\n"
+        "• Безлимитный доступ к ИИ (в разумных пределах)\n"
+        "• Приоритетные ответы\n"
+        "• Дополнительные режимы и фишки\n\n"
+        f"💰 Стоимость: <b>{SUB_PRICE_USD}$</b> в TON или USDT за {SUB_MONTHS} мес.\n\n"
+        + "\n".join(status_lines)
+        + "\n\nПосле оплаты нажми кнопку «✅ Я оплатил»."
+    )
+
+    await message.answer(text, reply_markup=_subscription_inline_kb())
 
 
 async def check_user_access(message: Message) -> bool:
     """
-    Проверка: можно ли сейчас отвечать пользователю на запрос к ИИ.
-    Админ и активные подписчики — без лимитов.
-    Остальные — по лимитам запросов/токенов.
+    Проверяем, можно ли дать пользователю доступ к ИИ.
+    Если нет — показываем экран подписки и возвращаем False.
     """
-    if not message.from_user:
-        return False
+    from_user = message.from_user
 
-    user = get_or_create_user(message.from_user.id, message.from_user.username)
-
-    # Админ — всегда полный доступ
-    if is_admin_user(user.telegram_id, user.username):
+    # Админы всегда проходят
+    if is_admin_username(from_user.username):
+        get_or_create_user(from_user.id, from_user.username)  # чтобы админ тоже был в БД
         return True
 
-    # Если есть активная подписка — без ограничений
-    if user.has_active_subscription:
+    user = get_or_create_user(from_user.id, from_user.username)
+
+    # Платная подписка
+    if user_has_active_subscription(user):
         return True
 
-    # Лимиты бесплатного режима
-    if user.free_requests_used >= FREE_REQUESTS_LIMIT or user.free_tokens_used >= FREE_TOKENS_LIMIT:
-        await message.answer(LIMIT_REACHED_TEXT, reply_markup=SUBSCRIPTION_KEYBOARD)
-        return False
+    # Бесплатный лимит
+    text = message.text or ""
+    tokens_estimate = len(text)
 
-    return True
+    if user.free_requests < FREE_REQUESTS_LIMIT and (
+        user.free_tokens + tokens_estimate <= FREE_TOKENS_LIMIT
+    ):
+        increment_free_usage(user.telegram_id, tokens_estimate)
+        return True
 
-
-def register_successful_ai_usage(
-    telegram_id: int,
-    input_tokens: int,
-    output_tokens: int,
-) -> None:
-    """
-    Регистрируем использование ИИ.
-    Для админа и подписчиков счетчики не увеличиваем.
-    """
-    user = get_user(telegram_id)
-    if not user:
-        return
-
-    if is_admin_user(user.telegram_id, user.username):
-        return
-
-    if user.has_active_subscription:
-        return
-
-    total_tokens = max(0, input_tokens) + max(0, output_tokens)
-    update_usage(telegram_id, add_requests=1, add_tokens=total_tokens)
+    # Лимит закончился — шлем на экран подписки
+    await show_subscription_menu(message)
+    return False
 
 
-def _build_profile_text(telegram_id: int) -> str:
-    """
-    Текст «мини-кабинета» пользователя.
-    """
-    user = get_user(telegram_id)
-    if not user:
-        return "Профиль не найден. Попробуй ещё раз."
-
-    mode_title = get_mode_title(user.current_mode)
-
-    if user.has_active_subscription:
-        paid_until_dt = datetime.fromtimestamp(user.paid_until or 0)
-        sub_status = f"💎 Подписка активна до <b>{paid_until_dt:%d.%m.%Y}</b>"
-    else:
-        if user.free_requests_used == 0:
-            sub_status = "🧪 Бесплатный доступ: ещё ни одного запроса не использовано"
-        elif user.free_requests_used < FREE_REQUESTS_LIMIT:
-            sub_status = (
-                "🧪 Бесплатный доступ: "
-                f"<b>{FREE_REQUESTS_LIMIT - user.free_requests_used}</b> запрос(ов) осталось"
-            )
-        else:
-            sub_status = "⛔ Бесплатный лимит исчерпан"
-
-    text_lines = [
-        "<b>Твой мини-кабинет</b>",
-        "",
-        f"Режим: <b>{mode_title}</b>",
-        "",
-        sub_status,
-        "",
-        f"Запросы: <b>{user.free_requests_used}</b> из {FREE_REQUESTS_LIMIT} в бесплатном режиме",
-        f"Токены: <b>{user.free_tokens_used}</b> из {FREE_TOKENS_LIMIT} (примерная оценка)",
-        "",
-        "Если хочешь стабильный доступ без ограничений — оформи премиум за 5$ в TON или USDT.",
-        "Нажми «💎 Подписка» внизу, чтобы открыть экран с оплатой.",
-    ]
-
-    return "\n".join(text_lines)
+@subscription_router.message(Command("subscription"))
+@subscription_router.message(F.text == "⭐ Подписка")
+async def cmd_subscription(message: Message) -> None:
+    await show_subscription_menu(message)
 
 
-# --- ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ / КНОПКИ ---
-
-
-@subscription_router.message(Command("profile"))
-async def cmd_profile(message: Message) -> None:
-    if not message.from_user:
-        return
-    text = _build_profile_text(message.from_user.id)
-    await message.answer(text, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(Command("faq"))
-async def cmd_faq(message: Message) -> None:
-    await message.answer(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "❓ Помощь")
-async def on_help_button(message: Message) -> None:
-    await message.answer(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "💎 Подписка")
-async def on_subscription_button(message: Message) -> None:
-    await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=SUBSCRIPTION_KEYBOARD)
-
-
-@subscription_router.message(F.text == "🔄 Перезапуск")
-async def on_restart_button(message: Message) -> None:
-    await message.answer("Диалог очищен. Можем начинать с чистого листа.", reply_markup=MAIN_MENU_KEYBOARD)
-    await message.answer(START_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "⬅️ Назад в меню")
-async def on_back_to_menu(message: Message) -> None:
-    await message.answer("Возвращаю в главное меню.", reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "✨ Режим")
-async def on_mode_button(message: Message) -> None:
-    """
-    Экран выбора режима.
-    """
-    if not message.from_user:
-        return
-
-    user = get_or_create_user(message.from_user.id, message.from_user.username)
-    mode_title = get_mode_title(user.current_mode)
-
-    text = (
-        "<b>Режимы работы бота</b>\n\n"
-        "Режим определяет стиль и глубину моих ответов.\n"
-        "Можешь переключать их в любой момент.\n\n"
-        f"Текущий режим: <b>{mode_title}</b>.\n\n"
-        "Выбери режим ниже — я подстроюсь под задачу."
-    )
-    await message.answer(text, reply_markup=MODE_SELECT_KEYBOARD)
-
-
-@subscription_router.message(F.text.in_(MODE_BUTTON_TEXTS))
-async def on_mode_selected(message: Message) -> None:
-    """
-    Пользователь выбрал режим.
-    """
-    if not message.from_user:
-        return
-
-    mode_key = get_mode_key_from_button(message.text or "")
-    if not mode_key:
-        await message.answer("Не удалось распознать режим. Попробуй ещё раз.", reply_markup=MODE_SELECT_KEYBOARD)
-        return
-
-    set_user_mode(message.from_user.id, mode_key)
-    title = get_mode_title(mode_key)
-
-    text = (
-        f"Режим обновлён: <b>{title}</b>.\n\n"
-        "Теперь мои ответы будут подстраиваться под этот фокус.\n"
-        "Можешь в любой момент снова открыть «✨ Режим» и сменить формат."
-    )
-    await message.answer(text, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "Подписка на 30 дней — TON")
-async def on_buy_ton(message: Message) -> None:
-    await _handle_buy_plan(message, currency="TON")
-
-
-@subscription_router.message(F.text == "Подписка на 30 дней — USDT")
-async def on_buy_usdt(message: Message) -> None:
-    await _handle_buy_plan(message, currency="USDT")
-
-
-async def _handle_buy_plan(message: Message, currency: str) -> None:
-    """
-    Создание инвойса через Crypto Pay и сохранение его в БД.
-    """
-    if not message.from_user:
-        return
-
-    user = get_or_create_user(message.from_user.id, message.from_user.username)
-    amount = 5.0  # 5$ в выбранной валюте
-
-    try:
-        invoice = await create_invoice(
-            amount=amount,
-            currency=currency,
-            description="AI Medicine — премиум-доступ на 30 дней",
-            payer_username=message.from_user.username,
-        )
-    except CryptoPayError:
-        logger.exception("Не удалось создать счёт через Crypto Pay")
-        await message.answer(
-            "Сейчас не удалось создать платёжный счёт через @CryptoBot.\n"
-            "Попробуй ещё раз чуть позже.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-        return
-
-    invoice_id = int(invoice["invoice_id"])
-    status = str(invoice["status"])
-    asset = str(invoice["currency"])
-    amount_value = float(invoice["amount"])
-    created_at = int(invoice["created_at"])
-    url = str(invoice["url"])
-
-    # Сохраняем платёж как active
-    create_payment(
-        telegram_id=user.telegram_id,
-        invoice_id=invoice_id,
-        currency=asset,
-        amount=amount_value,
-        status=status,
-        created_at=created_at,
-    )
-
-    await message.answer(
-        "Я создал для тебя платёжный счёт через @CryptoBot.\n\n"
-        f"Нажми по ссылке ниже, чтобы оплатить <b>5 {currency}</b> за 30 дней доступа:\n"
-        f"{url}\n\n"
-        "После оплаты вернись в бота — доступ будет активирован автоматически в течение пары секунд.",
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
-
-
-# --- АДМИН-РАЗДЕЛЫ ---
-
-
+@subscription_router.message(F.text == "🛠 Админ-панель")
 @subscription_router.message(Command("admin"))
 async def cmd_admin(message: Message) -> None:
-    """
-    Главный экран админ-панели.
-    """
-    if not message.from_user:
+    if not is_admin_username(message.from_user.username):
+        await message.answer("⛔ У тебя нет прав доступа к админ-панели.")
         return
 
-    if not is_admin_user(message.from_user.id, message.from_user.username):
-        await message.answer("Эта команда доступна только владельцу бота.")
-        return
-
-    stats = get_stats()
-    total_users = stats["total_users"]
-    active_premium = stats["active_premium_users"]
-    total_paid_invoices = stats["total_paid_invoices"]
-    estimated_mrr = active_premium * 5  # 5$ за подписку
-
+    stats = get_admin_stats()
     text_lines = [
-        "<b>Админ-панель</b>",
+        "🛠 <b>Админ-панель</b>",
         "",
-        f"Всего пользователей: <b>{total_users}</b>",
-        f"Активных премиум-подписок: <b>{active_premium}</b>",
-        f"Всего оплаченных инвойсов: <b>{total_paid_invoices}</b>",
+        f"👥 Всего пользователей: <b>{stats['total_users']}</b>",
+        f"✅ Активных подписок: <b>{stats['active_subscriptions']}</b>",
+        f"🧪 Пользовались бесплатно: <b>{stats['used_free']}</b>",
+        f"🕳 Никогда не заходили: <b>{stats['never_used']}</b>",
         "",
-        f"Оценочный текущий MRR: <b>{estimated_mrr}$</b> (5$ × активные премиум-подписки).",
-        "",
-        "<b>Разделы:</b>",
-        "• /admin_premium — список активных премиум-пользователей",
-        "• /admin_payments — последние платежи",
-        "• /admin_export — выгрузка CSV (юзеры + платежи)",
+        "Активные подписки (топ 10):",
     ]
 
-    await message.answer("\n".join(text_lines), reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(Command("admin_premium"))
-async def cmd_admin_premium(message: Message) -> None:
-    """
-    Список активных премиум-пользователей.
-    """
-    if not message.from_user:
-        return
-
-    if not is_admin_user(message.from_user.id, message.from_user.username):
-        await message.answer("Эта команда доступна только владельцу бота.")
-        return
-
-    users = get_premium_users(limit=50)
-    if not users:
-        await message.answer("Пока нет активных премиум-подписок.")
-        return
-
-    now_ts = int(time.time())
-    lines = ["<b>Активные премиум-пользователи</b>", ""]
-
-    for u in users:
-        days_left = max(0, int((u.paid_until or now_ts) - now_ts) // (24 * 60 * 60))
-        paid_until_dt = datetime.fromtimestamp(u.paid_until or now_ts)
-        uname = f"@{u.username}" if u.username else "(без username)"
-        lines.append(
-            f"• {uname} | id: <code>{u.telegram_id}</code>\n"
-            f"  до: {paid_until_dt:%d.%m.%Y} (~{days_left} дн.)"
+    for u in list_active_subscriptions(limit=10):
+        left_days = (
+            (u.paid_until_ts - int(time.time())) / 86400 if u.paid_until_ts else 0
+        )
+        uname = f"@{u.username}" if u.username else str(u.telegram_id)
+        text_lines.append(
+            f"• {uname}: ещё ~{max(1, math.ceil(left_days))} дн."
         )
 
-    await message.answer("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(Command("admin_payments"))
-async def cmd_admin_payments(message: Message) -> None:
-    """
-    Список последних платежей.
-    """
-    if not message.from_user:
-        return
-
-    if not is_admin_user(message.from_user.id, message.from_user.username):
-        await message.answer("Эта команда доступна только владельцу бота.")
-        return
-
-    payments = get_recent_payments(limit=30)
-    if not payments:
-        await message.answer("Платежей ещё не было.")
-        return
-
-    lines = ["<b>Последние платежи</b>", ""]
-
-    for p in payments:
-        user = get_user(p.telegram_id)
-        uname = f"@{user.username}" if user and user.username else "(без username)"
-        created_dt = datetime.fromtimestamp(p.created_at)
-        paid_dt_str = (
-            datetime.fromtimestamp(p.paid_at).strftime("%d.%m.%Y %H:%M")
-            if p.paid_at
-            else "—"
-        )
-        lines.append(
-            f"• #{p.id} | invoice_id: <code>{p.invoice_id}</code>\n"
-            f"  user: {uname} (id: <code>{p.telegram_id}</code>)\n"
-            f"  {p.amount} {p.currency} | статус: <b>{p.status}</b>\n"
-            f"  создан: {created_dt:%d.%m.%Y %H:%M} | оплачен: {paid_dt_str}"
+    text_lines.append("")
+    text_lines.append("Последние платежи (топ 10):")
+    for p in list_recent_payments(limit=10):
+        uname = str(p.telegram_id)
+        text_lines.append(
+            f"• {uname}: {p.amount} {p.asset} — {p.status}"
         )
 
-    await message.answer("\n".join(lines), reply_markup=MAIN_MENU_KEYBOARD)
+    await message.answer("\n".join(text_lines))
 
 
-def _split_text(text: str, max_len: int = 3800) -> List[str]:
-    chunks: List[str] = []
-    while text:
-        chunk = text[:max_len]
-        text = text[max_len:]
-        chunks.append(chunk)
-    return chunks
+@subscription_router.callback_query(F.data == "sub_buy_ton")
+async def callback_buy_ton(callback: CallbackQuery) -> None:
+    await _process_buy(callback, TON_ASSET)
 
 
-@subscription_router.message(Command("admin_export"))
-async def cmd_admin_export(message: Message) -> None:
-    """
-    CSV-выгрузка пользователей + их платежей (текстом, чтобы скопировать в Excel/GS).
-    """
-    if not message.from_user:
+@subscription_router.callback_query(F.data == "sub_buy_usdt")
+async def callback_buy_usdt(callback: CallbackQuery) -> None:
+    await _process_buy(callback, USDT_ASSET)
+
+
+async def _process_buy(callback: CallbackQuery, asset: str) -> None:
+    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    payload = f"user:{user.telegram_id}"
+    description = f"Подписка на AI бот ({SUB_MONTHS} мес.)"
+    try:
+        invoice = await create_invoice(
+            asset=asset,
+            amount=SUB_PRICE_USD,
+            description=description,
+            payload=payload,
+        )
+    except CryptoPayError as e:
+        logger.exception("Failed to create CryptoPay invoice")
+        await callback.message.answer(
+            "⚠️ Не удалось создать ссылку на оплату. Попробуй ещё раз чуть позже.\n"
+            f"Техническая ошибка: {e}"
+        )
+        await callback.answer()
         return
 
-    if not is_admin_user(message.from_user.id, message.from_user.username):
-        await message.answer("Эта команда доступна только владельцу бота.")
-        return
+    pay_url = invoice.get("pay_url") or invoice.get("pay_url".upper()) or ""
+    invoice_id = invoice.get("invoice_id") or invoice.get("invoiceId") or ""
+    # Сохраняем платёж в БД
+    from .subscription_db import create_payment  # локальный импорт, чтобы избежать циклов
 
-    csv_text = export_users_and_payments(max_rows=500)
-    chunks = _split_text(csv_text, max_len=3500)
-
-    await message.answer(
-        "Выгрузка CSV (первые 500 строк). Можно скопировать и вставить в Excel / Google Sheets:"
+    create_payment(
+        telegram_id=user.telegram_id,
+        invoice_id=str(invoice_id),
+        asset=asset,
+        amount=float(SUB_PRICE_USD),
+        payload=payload,
+        status=invoice.get("status", "active"),
     )
 
-    for chunk in chunks:
-        await message.answer(f"<code>{chunk}</code>")
+    text = (
+        f"💳 Счёт на оплату создан.\n\n"
+        f"Оплати <b>{SUB_PRICE_USD} {asset}</b> по ссылке:\n{pay_url}\n\n"
+        "После оплаты вернись в чат и нажми «✅ Я оплатил»."
+    )
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@subscription_router.callback_query(F.data == "sub_check_payment")
+async def callback_check_payment(callback: CallbackQuery) -> None:
+    from .subscription_db import get_last_payment, mark_payment_paid  # локальный импорт
+
+    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    payment = get_last_payment(user.telegram_id)
+    if not payment:
+        await callback.message.answer(
+            "❌ Не нашёл твои последние счета.\nПопробуй сначала нажать кнопку оплаты."
+        )
+        await callback.answer()
+        return
+
+    try:
+        invoice = await get_invoice(payment.invoice_id)
+    except CryptoPayError as e:
+        logger.exception("Failed to fetch invoice")
+        await callback.message.answer(
+            "⚠️ Не удалось проверить статус оплаты. Попробуй ещё раз позже.\n"
+            f"Техническая ошибка: {e}"
+        )
+        await callback.answer()
+        return
+
+    status = invoice.get("status")
+    if status == "paid":
+        mark_payment_paid(payment.invoice_id)
+        set_subscription_month(user.telegram_id, months=SUB_MONTHS)
+        await callback.message.answer(
+            "✅ Оплата подтверждена.\n"
+            "Подписка активна! Можно продолжать пользоваться ИИ без ограничений (в разумных пределах)."
+        )
+    elif status in ("active", "pending"):
+        await callback.message.answer(
+            "⌛ Платёж ещё не зафиксирован.\n"
+            "Подожди 10–30 секунд и нажми «✅ Я оплатил» снова."
+        )
+    else:
+        await callback.message.answer(
+            f"❌ Не удалось активировать подписку. Текущий статус счёта: <b>{status}</b>."
+        )
+
+    await callback.answer()
