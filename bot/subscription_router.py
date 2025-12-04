@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime
 
 from aiogram import Router, F
@@ -30,6 +31,11 @@ from .subscription_db import (
     grant_subscription,
     set_user_mode,
     get_stats,
+    get_premium_users,
+    get_recent_payments,
+    export_users_and_payments,
+    create_payment,
+    Payment,
 )
 from .payments_crypto import create_invoice, CryptoPayError
 
@@ -56,7 +62,6 @@ def is_admin_user(telegram_id: int | None, username: str | None) -> bool:
         uname = username.lstrip("@").lower()
         if uname in ADMIN_USERNAMES:
             return True
-    # При желании можно добавить проверку по telegram_id через переменную окружения
     return False
 
 
@@ -148,7 +153,7 @@ def _build_profile_text(telegram_id: int) -> str:
     return "\n".join(text_lines)
 
 
-# ---- ХЕНДЛЕРЫ ----
+# ---- ХЕНДЛЕРЫ ДЛЯ ЮЗЕРА ----
 
 
 @subscription_router.message(Command("profile"))
@@ -195,100 +200,4 @@ async def on_mode_button(message: Message) -> None:
 
     text = (
         "<b>Режимы работы бота</b>\n\n"
-        "Режим определяет стиль и глубину моих ответов.\n"
-        "Можешь переключать их в любой момент.\n\n"
-        f"Текущий режим: <b>{mode_title}</b>.\n\n"
-        "Выбери режим ниже — я подстроюсь под задачу."
-    )
-    await message.answer(text, reply_markup=MODE_SELECT_KEYBOARD)
-
-
-@subscription_router.message(F.text.in_(MODE_BUTTON_TEXTS))
-async def on_mode_selected(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    mode_key = get_mode_key_from_button(message.text or "")
-    if not mode_key:
-        await message.answer("Не удалось распознать режим. Попробуй ещё раз.", reply_markup=MODE_SELECT_KEYBOARD)
-        return
-
-    set_user_mode(message.from_user.id, mode_key)
-    title = get_mode_title(mode_key)
-
-    text = (
-        f"Режим обновлён: <b>{title}</b>.\n\n"
-        "Теперь мои ответы будут подстраиваться под этот фокус.\n"
-        "Можешь в любой момент снова открыть «✨ Режим» и сменить формат."
-    )
-    await message.answer(text, reply_markup=MAIN_MENU_KEYBOARD)
-
-
-@subscription_router.message(F.text == "Подписка на 30 дней — TON")
-async def on_buy_ton(message: Message) -> None:
-    await _handle_buy_plan(message, currency="TON")
-
-
-@subscription_router.message(F.text == "Подписка на 30 дней — USDT")
-async def on_buy_usdt(message: Message) -> None:
-    await _handle_buy_plan(message, currency="USDT")
-
-
-async def _handle_buy_plan(message: Message, currency: str) -> None:
-    if not message.from_user:
-        return
-
-    amount = 5.0  # 5$ в выбранной валюте (TON или USDT)
-
-    try:
-        invoice_url = await create_invoice(
-            amount=amount,
-            currency=currency,
-            description="AI Medicine — премиум-доступ на 30 дней",
-            payer_username=message.from_user.username,
-        )
-    except CryptoPayError:
-        logger.exception("Не удалось создать счёт через Crypto Pay")
-        await message.answer(
-            "Сейчас не удалось создать платёжный счёт через @CryptoBot.\n"
-            "Попробуй ещё раз чуть позже.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-        return
-
-    await message.answer(
-        "Я создал для тебя платёжный счёт через @CryptoBot.\n\n"
-        f"Нажми по ссылке ниже, чтобы оплатить <b>5 {currency}</b> за 30 дней доступа:\n"
-        f"{invoice_url}\n\n"
-        "После оплаты вернись в бота — доступ будет активирован автоматически в течение пары секунд.",
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
-
-
-@subscription_router.message(Command("admin"))
-async def cmd_admin(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    username = message.from_user.username
-    if not is_admin_user(message.from_user.id, username):
-        await message.answer("Эта команда доступна только владельцу бота.")
-        return
-
-    stats = get_stats()
-    total_users = stats["total_users"]
-    active_premium = stats["active_premium_users"]
-    estimated_mrr = active_premium * 5
-
-    text_lines = [
-        "<b>Админ-панель</b>",
-        "",
-        f"Всего пользователей: <b>{total_users}</b>",
-        f"Активных премиум-подписок: <b>{active_premium}</b>",
-        "",
-        f"Оценочный текущий MRR: <b>{estimated_mrr}$</b> в эквиваленте (5$ × премиум-подписки).",
-        "",
-        "Дальше можно добавить: список последних оплат, выгрузку активных пользователей и т.д.",
-    ]
-
-    await message.answer("\n".join(text_lines), reply_markup=MAIN_MENU_KEYBOARD)
+        "Режим определяет стиль и глубину мо
