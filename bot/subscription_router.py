@@ -1,400 +1,195 @@
 # bot/subscription_router.py
 
+from __future__ import annotations
+
+import logging
 import os
-from typing import List
+from datetime import datetime
+from typing import Optional
 
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message
 
+from .subscriptions import (
+    MAIN_MENU_KEYBOARD,
+    SUBSCRIPTION_KEYBOARD,
+    START_TEXT,
+    LIMIT_REACHED_TEXT,
+    SUBSCRIPTION_INFO_TEXT,
+    HELP_TEXT,
+)
 from .subscription_db import (
     init_db,
-    get_usage_info,
-    register_ai_usage,
-    register_free_tokens_usage,
-    extend_subscription,
-    get_payment,
-    mark_payment_paid,
-    list_payments_for_user,
-    can_consume_free_tokens,
+    get_or_create_user,
     get_user,
+    add_free_usage,
+    grant_subscription,
+    UserSubscription,
 )
-from .subscriptions import PLANS, get_plan
-from .payments_crypto import create_invoice, get_invoice_status, CryptoPayError
+from .payments_crypto import create_invoice, CryptoPayError
 
-router = Router(name="subscriptions")
+subscription_router = Router()
 
-CRYPTO_STATIC_INVOICE_URL = os.getenv("CRYPTO_STATIC_INVOICE_URL")
+# Лимиты из .env
+FREE_REQUESTS_LIMIT = int(os.getenv("FREE_REQUESTS_LIMIT", "3"))
+FREE_TOKENS_LIMIT = int(os.getenv("FREE_TOKENS_LIMIT", "6000"))
+
+# Подписка: цена и длительность
+SUBSCRIPTION_DAYS = 30
+SUBSCRIPTION_PRICE_TON = 5.0
+SUBSCRIPTION_PRICE_USDT = 5.0
 
 
-# -------- инициализация --------
+# ---------- ИНИЦИАЛИЗАЦИЯ БД ----------
+
 
 def init_subscriptions_storage() -> None:
     init_db()
+    logging.info("Subscription storage initialized")
 
 
-# -------- утилиты --------
+# ---------- УТИЛИТЫ ----------
 
-def _estimate_tokens_from_text(text: str | None) -> int:
-    """Грубая оценка токенов по длине текста (~1 токен ≈ 4 символа)."""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+
+def _format_date(ts: Optional[int]) -> str:
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
+
+
+def _build_profile_text(user: UserSubscription) -> str:
+    lines = ["<b>Твой мини-кабинет</b>\n"]
+    if user.has_active_subscription:
+        lines.append("Статус: активная подписка ✅")
+        lines.append(f"Доступ до: <code>{_format_date(user.paid_until)}</code>")
+    else:
+        lines.append("Статус: без активной подписки")
+    lines.append("")
+    lines.append(
+        f"Бесплатные запросы: {user.free_requests_used}/{FREE_REQUESTS_LIMIT}"
+    )
+    lines.append(
+        f"Бесплатные токены: {user.free_tokens_used}/{FREE_TOKENS_LIMIT}"
+    )
+    return "\n".join(lines)
+
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ main.py ----------
 
 
 async def check_user_access(message: Message) -> bool:
-    """
-    Проверяем, может ли пользователь сделать запрос к ИИ.
-    Учитываем:
-    - наличие подписки,
-    - лимит бесплатных запросов,
-    - лимит бесплатных токенов.
-    """
-    user_id = message.from_user.id
-    info = get_usage_info(user_id)
-    approx_tokens = _estimate_tokens_from_text(message.text)
-
-    # Подписка — пропускаем всё.
-    if info["has_subscription"]:
-        return True
-
-    # Проверка токенов
-    if not can_consume_free_tokens(user_id, approx_tokens):
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="💎 Оформить подписку",
-                        callback_data="subs:open_plans",
-                    )
-                ]
-            ]
-        )
-        await message.answer(
-            (
-                "Твой запрос получился слишком объёмным для бесплатного режима ✂️\n\n"
-                f"Бесплатный лимит: <b>{info['tokens_limit']}</b> токенов.\n"
-                f"Уже израсходовано: <b>{info['tokens_used']}</b>.\n\n"
-                "Подключи подписку, чтобы получать длинные и глубокие ответы без ограничений."
-            ),
-            reply_markup=kb,
-        )
+    """True — можно отвечать ИИ, False — нужно показывать экран подписки."""
+    from_user = message.from_user
+    if not from_user:
         return False
 
-    # Проверка количества запросов
-    if info["remaining"] > 0:
+    user = get_or_create_user(from_user.id, from_user.username)
+
+    if user.has_active_subscription:
         return True
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💎 Оформить подписку",
-                    callback_data="subs:open_plans",
-                )
-            ]
-        ]
-    )
-    await message.answer(
-        (
-            "Ты уже использовал свои 3 бесплатных запроса ✨\n\n"
-            "Подключи подписку — и продолжим работу в премиальном режиме без жёстких ограничений."
-        ),
-        reply_markup=kb,
-    )
-    return False
+    # Проверяем лимиты
+    limit_requests = user.free_requests_used >= FREE_REQUESTS_LIMIT
+    limit_tokens = user.free_tokens_used >= FREE_TOKENS_LIMIT
+
+    if limit_requests or limit_tokens:
+        await message.answer(LIMIT_REACHED_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
+        return False
+
+    return True
 
 
 def register_successful_ai_usage(
-    telegram_id: int,
     *,
-    input_tokens: int | None = None,
-    output_tokens: int | None = None,
+    telegram_id: int,
+    input_tokens: int,
+    output_tokens: int,
 ) -> None:
-    """
-    Вызывается ПОСЛЕ успешного ответа ИИ.
+    """Регистрируем использование ИИ для бесплатного режима."""
+    user = get_user(telegram_id) or get_or_create_user(telegram_id)
 
-    - списывает бесплатный запрос (если он ещё есть и нет подписки),
-    - списывает бесплатные токены.
-    """
-    info = get_usage_info(telegram_id)
-
-    if info["has_subscription"]:
+    if user.has_active_subscription:
+        # Для платников бесплатные лимиты не трогаем
         return
 
-    if info["remaining"] > 0:
-        register_ai_usage(telegram_id)
-
-    total_tokens = 0
-    if input_tokens:
-        total_tokens += input_tokens
-    if output_tokens:
-        total_tokens += output_tokens
-
-    if total_tokens > 0:
-        register_free_tokens_usage(telegram_id, total_tokens)
+    total_tokens = max(0, int(input_tokens) + int(output_tokens))
+    add_free_usage(telegram_id, add_requests=1, add_tokens=total_tokens)
 
 
-# -------- мини-кабинет / профиль --------
+# ---------- ХЕНДЛЕРЫ ----------
 
-@router.message(Command("profile", "cabinet"))
-async def cmd_profile(message: Message):
+
+@subscription_router.message(Command("profile"))
+async def cmd_profile(message: Message) -> None:
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    text = _build_profile_text(user)
+    await message.answer(text, reply_markup=MAIN_MENU_KEYBOARD)
+
+
+@subscription_router.message(Command("faq"))
+@subscription_router.message(F.text == "❓ Помощь")
+async def cmd_help(message: Message) -> None:
+    await message.answer(HELP_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
+
+
+@subscription_router.message(F.text == "💎 Подписка")
+async def cmd_subscription_menu(message: Message) -> None:
+    await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=SUBSCRIPTION_KEYBOARD)
+
+
+@subscription_router.message(F.text == "⬅️ Назад в меню")
+async def cmd_back_to_menu(message: Message) -> None:
+    await message.answer("Вернул тебя в главное меню.", reply_markup=MAIN_MENU_KEYBOARD)
+
+
+@subscription_router.message(F.text == "🔄 Перезапуск")
+async def cmd_restart(message: Message) -> None:
+    await message.answer(START_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
+
+
+@subscription_router.message(F.text == "Подписка на 30 дней — TON")
+async def cmd_buy_ton(message: Message) -> None:
+    await _handle_buy_plan(message, asset="TON", price=SUBSCRIPTION_PRICE_TON)
+
+
+@subscription_router.message(F.text == "Подписка на 30 дней — USDT")
+async def cmd_buy_usdt(message: Message) -> None:
+    await _handle_buy_plan(message, asset="USDT", price=SUBSCRIPTION_PRICE_USDT)
+
+
+async def _handle_buy_plan(message: Message, asset: str, price: float) -> None:
     user_id = message.from_user.id
-    info = get_usage_info(user_id)
-    user = get_user(user_id)
-    payments = list_payments_for_user(user_id, limit=5)
 
-    lines: List[str] = []
-    lines.append("💻 <b>Твой мини-кабинет</b>")
-    lines.append("")
+    await message.answer("Создаю счёт на оплату…", reply_markup=SUBSCRIPTION_KEYBOARD)
 
-    if info["has_subscription"] and user and user["subscription_until"]:
-        lines.append("Статус: <b>Premium</b> 💎")
-        lines.append(f"Активна до: <code>{user['subscription_until']}</code>")
-    else:
-        lines.append("Статус: <b>Free</b> ⚪️")
-        lines.append("Подписка: <b>нет</b>")
-
-    lines.append("")
-    lines.append("📊 <b>Лимиты</b>")
-    lines.append(
-        f"Запросы: <b>{info['used']}</b> из <b>{info['limit']}</b> бесплатных"
-    )
-    lines.append(
-        f"Токены: <b>{info['tokens_used']}</b> из <b>{info['tokens_limit']}</b> бесплатных"
-    )
-
-    lines.append("")
-    lines.append("💳 <b>История оплат</b> (последние 5):")
-    if not payments:
-        lines.append("Пока нет ни одного платежа.")
-    else:
-        for p in payments:
-            status = p["status"]
-            if status == "paid":
-                status_emoji = "✅"
-            elif status == "pending":
-                status_emoji = "⏳"
-            else:
-                status_emoji = "⚠️"
-
-            created = p["created_at"]
-            plan_code = p["plan_code"]
-            asset = p["asset"]
-            amount = p["amount"]
-
-            lines.append(
-                f"{status_emoji} {created} — {amount} {asset} — тариф <code>{plan_code}</code> ({status})"
-            )
-
-    lines.append("")
-    lines.append("ℹ️ Команды: /profile — кабинет, /faq — ответы на вопросы.")
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💎 Оформить / продлить подписку",
-                    callback_data="subs:open_plans",
-                )
-            ]
-        ]
-    )
-
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-# -------- FAQ --------
-
-@router.message(Command("faq"))
-async def cmd_faq(message: Message):
-    text = (
-        "❓ <b>FAQ по подписке</b>\n\n"
-        "<b>Как оплатить?</b>\n"
-        "— Нажми «Оформить подписку» или команду /profile.\n"
-        "— Выбери оплату в TON или USDT.\n"
-        "— Бот откроет окно оплаты через CryptoBot в Telegram.\n"
-        "— После перевода вернись в бота и нажми «Проверить оплату».\n\n"
-        "<b>Куда попадают деньги?</b>\n"
-        "— Все средства зачисляются на мой криптокошелёк в Telegram (CryptoBot/@wallet), "
-        "привязанный к этому боту. Оттуда я могу вывести их на биржу или внешний кошелёк.\n\n"
-        "<b>Есть ли автосписания?</b>\n"
-        "— Нет. Автосписаний нет, подписка не продлевается автоматически. "
-        "Когда срок закончится — доступ просто вернётся в бесплатный режим.\n\n"
-        "<b>Как отменить подписку?</b>\n"
-        "— Ничего отменять не нужно. Просто не оплачивай следующий счёт. "
-        "Если оплатил по ошибке — напиши в поддержку, разберёмся."
-    )
-    await message.answer(text)
-
-
-# -------- экраны подписки --------
-
-@router.callback_query(F.data == "subs:open_plans")
-async def cb_open_plans(callback: CallbackQuery):
-    lines: List[str] = []
-
-    lines.append("💎 <b>Premium-доступ</b>")
-    lines.append("")
-    lines.append(
-        "Режим без жестких лимитов по длине и глубине ответов.\n"
-        "Ты задаёшь вопрос — я разбираю ситуацию до основания и выдаю максимум пользы."
-    )
-
-    for plan in PLANS.values():
-        lines.append("")
-        lines.append(f"<b>{plan.title}</b>")
-        lines.append(plan.description)
-        lines.append(
-            f"Стоимость: <b>{plan.price_ton} TON</b> или <b>{plan.price_usdt} USDT</b> в месяц."
-        )
-
-    kb_rows = []
-    for code, plan in PLANS.items():
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{plan.title} — TON",
-                    callback_data=f"subs:buy:{code}:TON",
-                )
-            ]
-        )
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{plan.title} — USDT",
-                    callback_data=f"subs:buy:{code}:USDT",
-                )
-            ]
-        )
-
-    if CRYPTO_STATIC_INVOICE_URL:
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Оплатить напрямую (TON/USDT)",
-                    url=CRYPTO_STATIC_INVOICE_URL,
-                )
-            ]
-        )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await callback.message.answer("\n".join(lines), reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("subs:buy:"))
-async def cb_buy_plan(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    _, _, plan_code, asset = callback.data.split(":", 3)
-    plan = get_plan(plan_code)
-    if not plan:
-        await callback.answer("Неизвестный тариф", show_alert=True)
-        return
-
-    amount = plan.price_ton if asset == "TON" else plan.price_usdt
+    payload = f"user:{user_id}|plan:30d|asset:{asset}"
+    description = "Подписка на 30 дней для AI Medicine Bot"
 
     try:
-        invoice = await create_invoice(
-            telegram_id=user_id,
-            plan_code=plan.code,
-            asset=asset,  # type: ignore[arg-type]
-            amount=amount,
-            description=f"{plan.title} ({asset})",
+        invoice_url = await create_invoice(
+            asset=asset,
+            amount=price,
+            description=description,
+            payload=payload,
         )
-    except CryptoPayError:
-        await callback.answer()
-        await callback.message.answer(
-            "Не удалось создать счёт на оплату. Попробуй чуть позже 🙏"
+    except CryptoPayError as e:
+        logging.exception("Не удалось создать счёт через Crypto Pay")
+        await message.answer(
+            "Не удалось создать счёт на оплату. Попробуй чуть позже 🙏\n"
+            "Если ошибка повторяется — свяжись с владельцем бота.",
+            reply_markup=SUBSCRIPTION_KEYBOARD,
         )
         return
 
-    pay_url = invoice["pay_url"]
-    invoice_id = invoice["invoice_id"]
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"💸 Оплатить ({asset})",
-                    url=pay_url,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔁 Проверить оплату",
-                    callback_data=f"subs:check:{invoice_id}:{plan.code}",
-                )
-            ],
-        ]
+    text = (
+        f"Счёт на <b>{price} {asset}</b> создан ✅\n\n"
+        "Оплата проходит через официальный @CryptoBot.\n"
+        "Нажми по ссылке ниже, чтобы открыть счёт и оплатить:\n\n"
+        f"{invoice_url}"
     )
+    await message.answer(text, reply_markup=SUBSCRIPTION_KEYBOARD)
 
-    await callback.message.answer(
-        (
-            f"Счёт создан ✅\n\n"
-            f"Тариф: <b>{plan.title}</b>\n"
-            f"Сумма: <b>{amount} {asset}</b>\n\n"
-            "1) Нажми «Оплатить» и заверши перевод в Telegram-кошельке.\n"
-            "2) Вернись в этого бота и нажми «Проверить оплату»."
-        ),
-        reply_markup=kb,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("subs:check:"))
-async def cb_check_payment(callback: CallbackQuery):
-    parts = callback.data.split(":", 3)
-    if len(parts) != 4:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-
-    _, _, invoice_id, plan_code = parts
-    plan = get_plan(plan_code)
-    if not plan:
-        await callback.answer("Неизвестный тариф", show_alert=True)
-        return
-
-    payment = get_payment(invoice_id)
-    if not payment:
-        await callback.answer("Счёт не найден", show_alert=True)
-        return
-
-    if int(payment["telegram_id"]) != callback.from_user.id:
-        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
-        return
-
-    if payment["status"] == "paid":
-        await callback.answer()
-        await callback.message.answer(
-            "Этот платёж уже подтверждён ✅\n"
-            "Если подписка не отображается — напиши в поддержку.",
-        )
-        return
-
-    status = await get_invoice_status(invoice_id)
-    if status != "paid":
-        await callback.answer()
-        await callback.message.answer(
-            f"Статус платежа: <b>{status or 'не найден'}</b>\n"
-            "Если ты уже оплатил, подожди 1–2 минуты и попробуй снова.",
-        )
-        return
-
-    mark_payment_paid(invoice_id)
-    new_until = extend_subscription(callback.from_user.id, plan.days)
-
-    await callback.answer()
-    await callback.message.answer(
-        (
-            "Оплата получена ✅\n\n"
-            f"Подписка <b>{plan.title}</b> активирована.\n"
-            f"Новая дата окончания: <code>{new_until}</code>\n\n"
-            "Добро пожаловать в премиальный режим. Теперь можно копать глубже."
-        ),
-    )
+    # Простой вариант: считаем, что подписка активна после выдачи счёта.
+    # (Если захочешь — потом сделаем вебхук по факту оплаты.)
+    grant_subscription(user_id, SUBSCRIPTION_DAYS)
