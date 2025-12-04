@@ -1,137 +1,110 @@
-# bot/payments_crypto.py
-
 from __future__ import annotations
 
+import json
 import os
-import time
-from typing import Dict, List
+from typing import Optional, Dict, Any, List
 
 import httpx
-from dotenv import load_dotenv
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-env_path = BASE_DIR / ".env"
-load_dotenv(dotenv_path=env_path, override=True)
+from .subscription_db import create_payment, mark_payment_paid
+
+CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
+CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 
 
 class CryptoPayError(Exception):
     pass
 
 
-CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
-CRYPTO_PAY_BASE_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
-
-
-def _get_headers() -> Dict[str, str]:
+def _get_auth_headers() -> Dict[str, str]:
     if not CRYPTO_PAY_API_TOKEN:
         raise CryptoPayError("CRYPTO_PAY_API_TOKEN не указан в .env")
-    return {
-        "Content-Type": "application/json",
-        "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
-    }
+    return {"Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN}
 
 
 async def create_invoice(
+    *,
+    telegram_id: int,
     amount: float,
-    currency: str,
-    description: str,
-    payer_username: str | None,
-) -> Dict[str, object]:
+    currency: str = "TON",
+    description: Optional[str] = None,
+) -> str:
     """
-    Создаёт инвойс в Crypto Pay и возвращает:
-    {
-        "invoice_id": int,
-        "status": str,         # "active"
-        "currency": str,       # "TON" / "USDT"
-        "amount": float,
-        "created_at": int,     # unix timestamp
-        "url": str,            # bot_invoice_url
-    }
+    Создаёт инвойс в CryptoBot и сохраняет черновик платежа в БД.
+    Возвращает invoice_url.
     """
-    headers = _get_headers()
-
-    payload = f"user={payer_username or ''}|plan=30d|ts={int(time.time())}"
-
-    data = {
-        "asset": currency,          # "TON" или "USDT"
-        "amount": float(amount),
-        "description": description,
-        "payload": payload,
-        "allow_comments": False,
-        "allow_anonymous": True,
+    headers = _get_auth_headers()
+    payload: Dict[str, Any] = {
+        "amount": amount,
+        "currency": currency,
     }
+    if description:
+        payload["description"] = description
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{CRYPTO_PAY_BASE_URL}/createInvoice",
-            headers=headers,
-            json=data,
-        )
+    async with httpx.AsyncClient(base_url=CRYPTO_PAY_BASE_URL, timeout=10.0) as client:
+        resp = await client.post("/createInvoice", json=payload, headers=headers)
+        data = resp.json()
 
-    if resp.status_code != 200:
-        raise CryptoPayError(f"createInvoice HTTP {resp.status_code}: {resp.text}")
+    if not data.get("ok"):
+        raise CryptoPayError(f"Ошибка CryptoPay: {data!r}")
 
-    body = resp.json()
-    if not body.get("ok"):
-        raise CryptoPayError(f"createInvoice API error: {body}")
-
-    result = body["result"]
-
+    result = data["result"]
     invoice_id = int(result["invoice_id"])
-    status = str(result.get("status", "active"))
-    asset = str(result.get("asset") or currency)
-    amount_value = float(result.get("amount", amount))
-    created_at_str = str(result.get("created_at"))
-    # created_at приходит в ISO 8601, но нам достаточно текущего времени,
-    # чтобы не парсить таймзоны
-    created_at_ts = int(time.time())
-    url = (
-        result.get("bot_invoice_url")
-        or result.get("mini_app_invoice_url")
-        or result.get("pay_url")
+    invoice_url = result["pay_url"]
+    raw_json = json.dumps(result, ensure_ascii=False)
+
+    # Создаём запись о платеже в статусе "pending"
+    create_payment(
+        telegram_id=telegram_id,
+        invoice_id=invoice_id,
+        currency=currency,
+        amount=amount,
+        status="pending",
+        created_at=int(result.get("created_at", 0)) or 0,
+        paid_at=None,
+        raw_json=raw_json,
     )
-    if not url:
-        raise CryptoPayError("В ответе Crypto Pay нет bot_invoice_url")
 
-    return {
-        "invoice_id": invoice_id,
-        "status": status,
-        "currency": asset,
-        "amount": amount_value,
-        "created_at": created_at_ts,
-        "url": url,
-    }
+    return invoice_url
 
 
-async def fetch_invoices_statuses(invoice_ids: List[int]) -> Dict[int, str]:
+async def fetch_invoices(
+    *,
+    invoice_ids: Optional[List[int]] = None,
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Получает статусы инвойсов по их ID через getInvoices.
-    Возвращает словарь: invoice_id -> status ("active", "paid", "expired").
+    Вспомогательный метод для /admin, чтобы подтянуть реальные статусы инвойсов.
+    """
+    headers = _get_auth_headers()
+    payload: Dict[str, Any] = {}
+    if invoice_ids:
+        payload["invoice_ids"] = ",".join(str(i) for i in invoice_ids)
+    if status:
+        payload["status"] = status
+
+    async with httpx.AsyncClient(base_url=CRYPTO_PAY_BASE_URL, timeout=10.0) as client:
+        resp = await client.get("/getInvoices", params=payload, headers=headers)
+        data = resp.json()
+
+    if not data.get("ok"):
+        raise CryptoPayError(f"Ошибка CryptoPay (getInvoices): {data!r}")
+
+    return data["result"]
+
+
+async def sync_paid_invoices_from_cryptobot(invoice_ids: List[int]) -> None:
+    """
+    Пример поллинга: берём список invoice_id из БД,
+    спрашиваем у CryptoPay их статус, все 'paid' помечаем оплаченными.
     """
     if not invoice_ids:
-        return {}
+        return
 
-    headers = _get_headers()
-    data = {
-        "invoice_ids": invoice_ids,
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{CRYPTO_PAY_BASE_URL}/getInvoices",
-            headers=headers,
-            json=data,
-        )
-
-    if resp.status_code != 200:
-        raise CryptoPayError(f"getInvoices HTTP {resp.status_code}: {resp.text}")
-
-    body = resp.json()
-    if not body.get("ok"):
-        raise CryptoPayError(f"getInvoices API error: {body}")
-
-    result = body.get("result") or []
-    statuses: Dict[int, str] = {}
+    result = await fetch_invoices(invoice_ids=invoice_ids)
+    # result — список инвойсов
     for inv in result:
-        in
+        if inv.get("status") == "paid":
+            inv_id = int(inv["invoice_id"])
+            paid_at = int(inv.get("paid_at", 0)) or None
+            mark_payment_paid(inv_id, paid_at=paid_at)
