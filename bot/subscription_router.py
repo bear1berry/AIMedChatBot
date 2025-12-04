@@ -1,5 +1,8 @@
 # bot/subscription_router.py
 
+import os
+from typing import List
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -26,20 +29,19 @@ from .payments_crypto import create_invoice, get_invoice_status, CryptoPayError
 
 router = Router(name="subscriptions")
 
+CRYPTO_STATIC_INVOICE_URL = os.getenv("CRYPTO_STATIC_INVOICE_URL")
 
-# ------------ ИНИЦИАЛИЗАЦИЯ ------------
+
+# -------- инициализация --------
 
 def init_subscriptions_storage() -> None:
     init_db()
 
 
-# ------------ УТИЛИТЫ ------------
+# -------- утилиты --------
 
 def _estimate_tokens_from_text(text: str | None) -> int:
-    """
-    Грубая оценка токенов по длине текста.
-    ~1 токен ≈ 4 символа. Нам важно не точное число, а порядок.
-    """
+    """Грубая оценка токенов по длине текста (~1 токен ≈ 4 символа)."""
     if not text:
         return 0
     return max(1, len(text) // 4)
@@ -47,19 +49,21 @@ def _estimate_tokens_from_text(text: str | None) -> int:
 
 async def check_user_access(message: Message) -> bool:
     """
-    Проверяем, может ли пользователь сейчас сделать запрос к ИИ.
-    Сюда же добавляем ограничение по длине / токенам.
+    Проверяем, может ли пользователь сделать запрос к ИИ.
+    Учитываем:
+    - наличие подписки,
+    - лимит бесплатных запросов,
+    - лимит бесплатных токенов.
     """
     user_id = message.from_user.id
     info = get_usage_info(user_id)
-
     approx_tokens = _estimate_tokens_from_text(message.text)
 
-    # Если есть активная подписка — пропускаем без ограничений.
+    # Подписка — пропускаем всё.
     if info["has_subscription"]:
         return True
 
-    # Проверяем лимит токенов для бесплатного режима
+    # Проверка токенов
     if not can_consume_free_tokens(user_id, approx_tokens):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -73,20 +77,19 @@ async def check_user_access(message: Message) -> bool:
         )
         await message.answer(
             (
-                "Твой запрос получился слишком длинным для бесплатного режима ✂️\n\n"
+                "Твой запрос получился слишком объёмным для бесплатного режима ✂️\n\n"
                 f"Бесплатный лимит: <b>{info['tokens_limit']}</b> токенов.\n"
                 f"Уже израсходовано: <b>{info['tokens_used']}</b>.\n\n"
-                "Подключи подписку, чтобы снимать с меня длинные и глубокие ответы без ограничений."
+                "Подключи подписку, чтобы получать длинные и глубокие ответы без ограничений."
             ),
             reply_markup=kb,
         )
         return False
 
-    # Проверяем счётчик бесплатных запросов
+    # Проверка количества запросов
     if info["remaining"] > 0:
         return True
 
-    # Лимит бесплатных запросов исчерпан
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -100,7 +103,7 @@ async def check_user_access(message: Message) -> bool:
     await message.answer(
         (
             "Ты уже использовал свои 3 бесплатных запроса ✨\n\n"
-            "Чтобы продолжить, подключи подписку и получай ответы без жестких ограничений по длине."
+            "Подключи подписку — и продолжим работу в премиальном режиме без жёстких ограничений."
         ),
         reply_markup=kb,
     )
@@ -114,23 +117,19 @@ def register_successful_ai_usage(
     output_tokens: int | None = None,
 ) -> None:
     """
-    Вызови эту функцию ПОСЛЕ успешного ответа ИИ пользователю.
+    Вызывается ПОСЛЕ успешного ответа ИИ.
 
-    Она:
-    - спишет 1 бесплатный запрос (если пользователь без подписки и ещё не выбил лимит),
-    - добавит использование токенов (если передать input_tokens/output_tokens).
+    - списывает бесплатный запрос (если он ещё есть и нет подписки),
+    - списывает бесплатные токены.
     """
     info = get_usage_info(telegram_id)
 
-    # Подписка — бесплатные лимиты не трогаем
     if info["has_subscription"]:
         return
 
-    # Списываем бесплатный запрос, если ещё есть
     if info["remaining"] > 0:
         register_ai_usage(telegram_id)
 
-    # Списываем токены (бесплатный лимит)
     total_tokens = 0
     if input_tokens:
         total_tokens += input_tokens
@@ -141,21 +140,19 @@ def register_successful_ai_usage(
         register_free_tokens_usage(telegram_id, total_tokens)
 
 
-# ------------ КАБИНЕТ / ПРОФИЛЬ ------------
+# -------- мини-кабинет / профиль --------
 
 @router.message(Command("profile", "cabinet"))
 async def cmd_profile(message: Message):
-    """Мини-кабинет: статус, лимиты, история оплат."""
     user_id = message.from_user.id
     info = get_usage_info(user_id)
     user = get_user(user_id)
     payments = list_payments_for_user(user_id, limit=5)
 
-    lines: list[str] = []
-
+    lines: List[str] = []
     lines.append("💻 <b>Твой мини-кабинет</b>")
     lines.append("")
-    # Статус
+
     if info["has_subscription"] and user and user["subscription_until"]:
         lines.append("Статус: <b>Premium</b> 💎")
         lines.append(f"Активна до: <code>{user['subscription_until']}</code>")
@@ -164,7 +161,6 @@ async def cmd_profile(message: Message):
         lines.append("Подписка: <b>нет</b>")
 
     lines.append("")
-    # Лимиты
     lines.append("📊 <b>Лимиты</b>")
     lines.append(
         f"Запросы: <b>{info['used']}</b> из <b>{info['limit']}</b> бесплатных"
@@ -174,7 +170,6 @@ async def cmd_profile(message: Message):
     )
 
     lines.append("")
-    # История оплат
     lines.append("💳 <b>История оплат</b> (последние 5):")
     if not payments:
         lines.append("Пока нет ни одного платежа.")
@@ -197,6 +192,9 @@ async def cmd_profile(message: Message):
                 f"{status_emoji} {created} — {amount} {asset} — тариф <code>{plan_code}</code> ({status})"
             )
 
+    lines.append("")
+    lines.append("ℹ️ Команды: /profile — кабинет, /faq — ответы на вопросы.")
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -211,18 +209,41 @@ async def cmd_profile(message: Message):
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
-# ------------ ЭКРАНЫ ПОДПИСОК (тексты в стиле «дорого-минималистично») ------------
+# -------- FAQ --------
+
+@router.message(Command("faq"))
+async def cmd_faq(message: Message):
+    text = (
+        "❓ <b>FAQ по подписке</b>\n\n"
+        "<b>Как оплатить?</b>\n"
+        "— Нажми «Оформить подписку» или команду /profile.\n"
+        "— Выбери оплату в TON или USDT.\n"
+        "— Бот откроет окно оплаты через CryptoBot в Telegram.\n"
+        "— После перевода вернись в бота и нажми «Проверить оплату».\n\n"
+        "<b>Куда попадают деньги?</b>\n"
+        "— Все средства зачисляются на мой криптокошелёк в Telegram (CryptoBot/@wallet), "
+        "привязанный к этому боту. Оттуда я могу вывести их на биржу или внешний кошелёк.\n\n"
+        "<b>Есть ли автосписания?</b>\n"
+        "— Нет. Автосписаний нет, подписка не продлевается автоматически. "
+        "Когда срок закончится — доступ просто вернётся в бесплатный режим.\n\n"
+        "<b>Как отменить подписку?</b>\n"
+        "— Ничего отменять не нужно. Просто не оплачивай следующий счёт. "
+        "Если оплатил по ошибке — напиши в поддержку, разберёмся."
+    )
+    await message.answer(text)
+
+
+# -------- экраны подписки --------
 
 @router.callback_query(F.data == "subs:open_plans")
 async def cb_open_plans(callback: CallbackQuery):
-    """Показываем список тарифов."""
-    lines: list[str] = []
+    lines: List[str] = []
 
-    lines.append("💎 <b>Premium-доступ к боту</b>")
+    lines.append("💎 <b>Premium-доступ</b>")
     lines.append("")
     lines.append(
-        "Без ограничений по глубине ответов, без нервов из-за лимитов. "
-        "Просто задаёшь вопрос — я разбираю и отвечаю максимально развернуто."
+        "Режим без жестких лимитов по длине и глубине ответов.\n"
+        "Ты задаёшь вопрос — я разбираю ситуацию до основания и выдаю максимум пользы."
     )
 
     for plan in PLANS.values():
@@ -230,7 +251,7 @@ async def cb_open_plans(callback: CallbackQuery):
         lines.append(f"<b>{plan.title}</b>")
         lines.append(plan.description)
         lines.append(
-            f"Стоимость: <b>{plan.price_ton} TON</b> или <b>{plan.price_usdt} USDT</b>"
+            f"Стоимость: <b>{plan.price_ton} TON</b> или <b>{plan.price_usdt} USDT</b> в месяц."
         )
 
     kb_rows = []
@@ -238,7 +259,7 @@ async def cb_open_plans(callback: CallbackQuery):
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{plan.title} — оплатить в TON",
+                    text=f"{plan.title} — TON",
                     callback_data=f"subs:buy:{code}:TON",
                 )
             ]
@@ -246,24 +267,29 @@ async def cb_open_plans(callback: CallbackQuery):
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{plan.title} — оплатить в USDT",
+                    text=f"{plan.title} — USDT",
                     callback_data=f"subs:buy:{code}:USDT",
                 )
             ]
         )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    if CRYPTO_STATIC_INVOICE_URL:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Оплатить напрямую (TON/USDT)",
+                    url=CRYPTO_STATIC_INVOICE_URL,
+                )
+            ]
+        )
 
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await callback.message.answer("\n".join(lines), reply_markup=kb)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("subs:buy:"))
 async def cb_buy_plan(callback: CallbackQuery):
-    """
-    Пользователь выбрал тариф и валюту оплаты.
-    Создаём invoice через Crypto Pay и даём ссылку на оплату.
-    """
     user_id = callback.from_user.id
     _, _, plan_code, asset = callback.data.split(":", 3)
     plan = get_plan(plan_code)
@@ -323,14 +349,11 @@ async def cb_buy_plan(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("subs:check:"))
 async def cb_check_payment(callback: CallbackQuery):
-    """
-    Пользователь нажал «Проверить оплату».
-    Проверяем статус инвойса через Crypto Pay и, если оплачен, активируем подписку.
-    """
     parts = callback.data.split(":", 3)
     if len(parts) != 4:
         await callback.answer("Некорректные данные", show_alert=True)
         return
+
     _, _, invoice_id, plan_code = parts
     plan = get_plan(plan_code)
     if not plan:
@@ -342,12 +365,10 @@ async def cb_check_payment(callback: CallbackQuery):
         await callback.answer("Счёт не найден", show_alert=True)
         return
 
-    # Проверяем, что этот платёж принадлежит текущему пользователю
     if int(payment["telegram_id"]) != callback.from_user.id:
         await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
         return
 
-    # Если уже оплачено и подписка активирована ранее
     if payment["status"] == "paid":
         await callback.answer()
         await callback.message.answer(
@@ -356,7 +377,6 @@ async def cb_check_payment(callback: CallbackQuery):
         )
         return
 
-    # Проверяем статус у Crypto Pay
     status = await get_invoice_status(invoice_id)
     if status != "paid":
         await callback.answer()
@@ -366,7 +386,6 @@ async def cb_check_payment(callback: CallbackQuery):
         )
         return
 
-    # Помечаем платёж оплаченным и продлеваем подписку
     mark_payment_paid(invoice_id)
     new_until = extend_subscription(callback.from_user.id, plan.days)
 
@@ -376,6 +395,6 @@ async def cb_check_payment(callback: CallbackQuery):
             "Оплата получена ✅\n\n"
             f"Подписка <b>{plan.title}</b> активирована.\n"
             f"Новая дата окончания: <code>{new_until}</code>\n\n"
-            "Добро пожаловать в премиальный режим. Теперь можем копать глубже."
+            "Добро пожаловать в премиальный режим. Теперь можно копать глубже."
         ),
     )
