@@ -187,4 +187,237 @@ def increment_usage(
     count_free_message: bool = True,
 ) -> None:
     """
-    Обновляем статистику использ
+    Обновляем статистику использования:
+    - total_messages +1
+    - total_tokens + tokens_used
+    - free_messages_used +1 (если пользователь не в премиуме и count_free_message=True)
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT free_messages_used, premium_until FROM users WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+
+    free_used = row["free_messages_used"] or 0
+    premium_until = row["premium_until"]
+    now_ts = int(time.time())
+    is_premium = bool(premium_until and premium_until > now_ts)
+
+    if (not is_premium) and count_free_message:
+        free_used += 1
+
+    cur.execute(
+        """
+        UPDATE users
+        SET free_messages_used = ?,
+            total_messages = total_messages + 1,
+            total_tokens = total_tokens + ?,
+            updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (free_used, tokens_used, now_ts, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def upgrade_user_to_premium(telegram_id: int, days: int) -> None:
+    """
+    Выдаём / продлеваем премиум пользователю.
+    """
+    seconds = days * 24 * 60 * 60
+    now_ts = int(time.time())
+
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT premium_until FROM users WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+
+    if row and row["premium_until"]:
+        base = max(row["premium_until"], now_ts)
+    else:
+        base = now_ts
+
+    new_until = base + seconds
+
+    cur.execute(
+        """
+        UPDATE users
+        SET premium_until = ?, free_messages_used = 0, updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (new_until, now_ts, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_payment(
+    invoice_id: int,
+    telegram_id: int,
+    amount: float,
+    currency: str,
+    status: str,
+    created_at: Optional[int],
+    payload: Optional[str],
+) -> None:
+    conn = _get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO payments (
+            invoice_id, telegram_id, amount, currency,
+            status, created_at, paid_at, payload
+        )
+        VALUES (
+            ?, ?, ?, ?,
+            ?, ?, COALESCE(
+                (SELECT paid_at FROM payments WHERE invoice_id = ?),
+                NULL
+            ),
+            ?
+        )
+        """,
+        (
+            invoice_id,
+            telegram_id,
+            amount,
+            currency,
+            status,
+            created_at,
+            invoice_id,
+            payload,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_payment_status(
+    invoice_id: int,
+    status: str,
+    paid_at: Optional[int],
+) -> None:
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE payments
+        SET status = ?, paid_at = COALESCE(?, paid_at)
+        WHERE invoice_id = ?
+        """,
+        (status, paid_at, invoice_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_payments() -> List[Dict[str, Any]]:
+    """
+    Список счетов, которые ещё не оплачены / не отменены.
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM payments
+        WHERE status IN ('active', 'pending', 'wait')
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def mark_payment_and_upgrade(
+    invoice_id: int,
+    paid_at: int,
+    premium_days: int,
+) -> None:
+    """
+    Помечаем платёж как оплаченный и выдаём премиум пользователю.
+    """
+    conn = _get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT telegram_id FROM payments WHERE invoice_id = ?",
+        (invoice_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+
+    telegram_id = row["telegram_id"]
+
+    cur.execute(
+        """
+        UPDATE payments
+        SET status = 'paid', paid_at = ?
+        WHERE invoice_id = ?
+        """,
+        (paid_at, invoice_id),
+    )
+    conn.commit()
+    conn.close()
+
+    # Выдаём премиум
+    upgrade_user_to_premium(telegram_id, premium_days)
+
+
+def get_total_users_count() -> int:
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    (count,) = cur.fetchone()
+    conn.close()
+    return int(count or 0)
+
+
+def get_active_premium_count() -> int:
+    now_ts = int(time.time())
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE premium_until IS NOT NULL AND premium_until > ?
+        """,
+        (now_ts,),
+    )
+    (count,) = cur.fetchone()
+    conn.close()
+    return int(count or 0)
+
+
+def get_usage_stats() -> Dict[str, int]:
+    conn = _get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            COALESCE(SUM(total_messages), 0) AS total_messages,
+            COALESCE(SUM(total_tokens), 0) AS total_tokens
+        FROM users
+        """
+    )
+    row = cur.fetchone()
+    conn.close()
+    return {
+        "total_messages": int(row["total_messages"]),
+        "total_tokens": int(row["total_tokens"]),
+    }
