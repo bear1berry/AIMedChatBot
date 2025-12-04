@@ -13,56 +13,32 @@ from .modes import build_system_prompt, DEFAULT_MODE_KEY
 
 logger = logging.getLogger(__name__)
 
-# === YandexGPT / OpenAI-совместимый API ===
+# === DeepSeek API (OpenAI-совместимый) ===
 #
-# Бот работает через OpenAI-совместимый endpoint YandexGPT:
-#   https://llm.api.cloud.yandex.net/v1/chat/completions
+# Бот работает через официальный API DeepSeek:
+#   https://api.deepseek.com/chat/completions
 #
-# Нужны:
-#   - сервисный API-ключ:  YANDEX_CLOUD_API_KEY
-#   - ID каталога:         YANDEX_CLOUD_FOLDER
+# Нужен:
+#   - ключ API:  DEEPSEEK_API_KEY
 #
 # В .env нужно добавить, например:
-#   YANDEX_CLOUD_API_KEY=yc_sa_********************************
-#   YANDEX_CLOUD_FOLDER=b1gxxxxxxxxxxxxxxxx
+#   DEEPSEEK_API_KEY=sk-********************************
+#
 
-YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "").strip()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
-# Оставляем AIML_API_KEY для обратной совместимости, но приоритет у YANDEX_CLOUD_API_KEY.
-AIML_API_KEY = (
-    os.getenv("YANDEX_CLOUD_API_KEY") or os.getenv("AIML_API_KEY", "")
-).strip()
+# Для обратной совместимости поддерживаем AIML_API_KEY,
+# но приоритет всегда у DEEPSEEK_API_KEY.
+AIML_API_KEY = (DEEPSEEK_API_KEY or os.getenv("AIML_API_KEY", "")).strip()
 
 AIML_API_URL = os.getenv(
     "AIML_API_URL",
-    "https://llm.api.cloud.yandex.net/v1/chat/completions",
+    "https://api.deepseek.com/chat/completions",
 ).strip()
 
-
-def _default_model_uri(short_id: str) -> str:
-    """
-    Собираем URI модели вида gpt://<folder>/<short_id>.
-
-    Если каталог не указан (YANDEX_CLOUD_FOLDER пустой),
-    возвращаем short_id как есть — тогда его можно задать
-    полностью через переменную окружения AIML_MODEL_*.
-    """
-    if YANDEX_CLOUD_FOLDER:
-        if short_id.startswith("gpt://"):
-            return short_id
-        return f"gpt://{YANDEX_CLOUD_FOLDER}/{short_id}"
-    return short_id
-
-
-# Основные модели YandexGPT
-AIML_MODEL_PRIMARY = os.getenv(
-    "AIML_MODEL_PRIMARY",
-    _default_model_uri("yandexgpt/latest"),
-)
-AIML_MODEL_FAST = os.getenv(
-    "AIML_MODEL_FAST",
-    _default_model_uri("yandexgpt-lite/latest"),
-)
+# Основные модели DeepSeek
+AIML_MODEL_PRIMARY = os.getenv("AIML_MODEL_PRIMARY", "deepseek-chat")
+AIML_MODEL_FAST = os.getenv("AIML_MODEL_FAST", "deepseek-chat")
 
 # Дополнительные "профили" — для совместимости со старой логикой.
 # Можно переопределить через переменные окружения, если у вас есть другие модели.
@@ -72,7 +48,7 @@ AIML_MODEL_GPT_OSS_120B = os.getenv(
 )
 AIML_MODEL_DEEPSEEK_REASONER = os.getenv(
     "AIML_MODEL_DEEPSEEK_REASONER",
-    _default_model_uri("yandexgpt/rc"),
+    "deepseek-reasoner",
 )
 AIML_MODEL_DEEPSEEK_CHAT = os.getenv(
     "AIML_MODEL_DEEPSEEK_CHAT",
@@ -294,16 +270,6 @@ def create_workspace(
     return ws
 
 
-def set_mode(user_id: int, mode_key: str) -> ConversationState:
-    """
-    Установить режим для текущего workspace и очистить историю.
-    """
-    state = get_state(user_id)
-    state.mode_key = mode_key
-    state.messages.clear()
-    return state
-
-
 def reset_state(user_id: int) -> None:
     """
     Очистить историю только текущего workspace, режим и модель оставить.
@@ -315,11 +281,11 @@ def reset_state(user_id: int) -> None:
 
 _MODEL_PROFILE_LABELS = {
     "auto": "Авто (подбор)",
-    "gpt4": "YandexGPT (основная)",
-    "mini": "YandexGPT Lite (быстрее)",
-    "oss": "Экспериментальный профиль",
-    "deepseek_reasoner": "Режим рассуждений (YandexGPT)",
-    "deepseek_chat": "Диалоговый режим (YandexGPT)",
+    "gpt4": "DeepSeek (основная)",
+    "mini": "DeepSeek (быстрее)",
+    "oss": "Экспериментальный профиль DeepSeek",
+    "deepseek_reasoner": "DeepSeek Reasoner (рассуждения)",
+    "deepseek_chat": "DeepSeek Chat (диалог)",
 }
 
 
@@ -353,15 +319,15 @@ def _postprocess_reply(text: str) -> str:
 
 def _model_human_name(model_id: str) -> str:
     if model_id == AIML_MODEL_PRIMARY:
-        return "YandexGPT"
+        return "DeepSeek Chat"
     if model_id == AIML_MODEL_FAST:
-        return "YandexGPT Lite"
+        return "DeepSeek Chat (быстр.)"
     if model_id == AIML_MODEL_GPT_OSS_120B:
-        return "YandexGPT Experimental"
+        return "DeepSeek Experimental"
     if model_id == AIML_MODEL_DEEPSEEK_REASONER:
-        return "YandexGPT Reasoning"
+        return "DeepSeek Reasoner"
     if model_id == AIML_MODEL_DEEPSEEK_CHAT:
-        return "YandexGPT Chat"
+        return "DeepSeek Chat"
     return "LLM"
 
 
@@ -384,11 +350,11 @@ def _model_short_desc(model_id: str) -> str:
     Краткое описание модели для подписи перед ответом.
     """
     if model_id == AIML_MODEL_PRIMARY:
-        return "точная и универсальная модель YandexGPT"
+        return "точная и универсальная модель DeepSeek"
     if model_id == AIML_MODEL_FAST:
         return "быстрые ответы и черновики (Lite)"
     if model_id == AIML_MODEL_GPT_OSS_120B:
-        return "экспериментальный профиль на базе YandexGPT"
+        return "экспериментальный профиль DeepSeek"
     if model_id == AIML_MODEL_DEEPSEEK_REASONER:
         return "режим усиленного рассуждения"
     if model_id == AIML_MODEL_DEEPSEEK_CHAT:
@@ -484,16 +450,16 @@ def _select_models_for_query(question: str, state: ConversationState) -> List[st
     return [AIML_MODEL_PRIMARY]
 
 
-# === Низкоуровневый вызов YandexGPT ===
+# === Низкоуровневый вызов DeepSeek API ===
 
 
 async def _call_model(model: str, messages: List[dict]) -> str:
     """
-    Вызов YandexGPT (OpenAI-совместимый endpoint) для одной модели.
-    Работает через HTTP-запрос к https://llm.api.cloud.yandex.net/v1/chat/completions.
+    Вызов DeepSeek (OpenAI-совместимый endpoint) для одной модели.
+    Работает через HTTP-запрос к https://api.deepseek.com/chat/completions.
     """
     if not AIML_API_KEY:
-        raise RuntimeError("YANDEX_CLOUD_API_KEY (или AIML_API_KEY) не задан")
+        raise RuntimeError("DEEPSEEK_API_KEY (или AIML_API_KEY) не задан")
 
     payload = {
         "model": model,
@@ -507,10 +473,6 @@ async def _call_model(model: str, messages: List[dict]) -> str:
         "Authorization": f"Bearer {AIML_API_KEY}",
         "Content-Type": "application/json",
     }
-    # Для Yandex OpenAI-совместимого API нужно указать каталог
-    # через заголовок OpenAI-Project.
-    if YANDEX_CLOUD_FOLDER:
-        headers["OpenAI-Project"] = YANDEX_CLOUD_FOLDER
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(AIML_API_URL, json=payload, headers=headers)
@@ -518,24 +480,34 @@ async def _call_model(model: str, messages: List[dict]) -> str:
     try:
         data = resp.json()
     except Exception:
-        logger.exception("Failed to parse YandexGPT response: %s", resp.text[:500])
-        raise RuntimeError("Failed to parse YandexGPT response")
+        logger.exception("Failed to parse DeepSeek response: %s", resp.text[:500])
+        raise RuntimeError("Failed to parse DeepSeek response")
 
     if resp.status_code >= 400:
         err = data.get("error") if isinstance(data, dict) else data
-        logger.error("YandexGPT error (%s): %r", resp.status_code, err)
-        raise RuntimeError(f"YandexGPT error {resp.status_code}: {err}")
+        logger.error("DeepSeek error (%s): %r", resp.status_code, err)
+        raise RuntimeError(f"DeepSeek error {resp.status_code}: {err}")
 
     try:
         content = data["choices"][0]["message"]["content"]
     except Exception:
-        logger.exception("Unexpected YandexGPT payload: %r", data)
-        raise RuntimeError("Unexpected YandexGPT response format")
+        logger.exception("Unexpected DeepSeek payload: %r", data)
+        raise RuntimeError("Unexpected DeepSeek response format")
 
     return _postprocess_reply(content)
 
 
 # === Публичный API для обработчиков ===
+
+
+def set_mode(user_id: int, mode_key: str) -> ConversationState:
+    """
+    Установить режим для текущего workspace и очистить историю.
+    """
+    state = get_state(user_id)
+    state.mode_key = mode_key
+    state.messages = []
+    return state
 
 
 async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> str:
@@ -585,7 +557,7 @@ async def ask_ai(user_id: int, text: str, user_name: Optional[str] = None) -> st
     ws.messages.append({"role": "user", "content": text})
     ws.messages.append({"role": "assistant", "content": reply})
 
-    # ограничиваем историю (последние N обменов)
+    # Обрезаем историю, чтобы не раздувать контекст
     max_turns = 12
     if len(ws.messages) > max_turns * 2:
         ws.messages = ws.messages[-max_turns * 2 :]
