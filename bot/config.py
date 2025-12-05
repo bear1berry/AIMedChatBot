@@ -114,11 +114,24 @@ PLAN_LIMITS = {
     },
 }
 
+# =============== Платежи (Telegram Payments / ЮKassa через провайдера) ===============
+
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")  # выдаёт BotFather
+if not PAYMENT_PROVIDER_TOKEN:
+    raise RuntimeError("PAYMENT_PROVIDER_TOKEN is not set in environment variables")
+
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "RUB")
+
+# Цены в минимальных единицах валюты (копейки для RUB)
+PLAN_PRICES = {
+    "pro": int(os.getenv("PLAN_PRO_PRICE", "19900")),  # 199.00 RUB
+    "vip": int(os.getenv("PLAN_VIP_PRICE", "49900")),  # 499.00 RUB
+}
+
 # =============== Реферальные лимиты ===============
 
 # Бонус к дневному лимиту за каждого приглашённого пользователя
-REF_BASE_LIMIT = int(os.getenv("REF_BASE_LIMIT", "1000"))          # не используется в дневных лимитах, но оставлен для совместимости
-REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))    # +20 запросов в день за каждого реферала
+REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))  # +20 запросов в день за каждого реферала
 
 # =============== Диалоговый контекст ===============
 
