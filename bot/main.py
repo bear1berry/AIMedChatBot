@@ -1,695 +1,475 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-from datetime import datetime
+from typing import Dict, Any
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.chat_action import ChatActionSender
 
 from bot.config import (
-    BASE_DIR,
     BOT_TOKEN,
     ASSISTANT_MODES,
-    DEFAULT_MODE_KEY,
-    PLAN_LIMITS,
+    DEFAULT_MODE,
+    OWNER_ID,
+    PLAN_BASIC,
+    PLAN_PREMIUM,
+    DEFAULT_DAILY_LIMIT,
+    REF_BONUS_PER_USER,
     SUBSCRIPTION_TARIFFS,
-    CRYPTO_PAY_API_TOKEN,
-    BOT_USERNAME,
 )
-from services.llm import ask_llm_stream
 from services.storage import Storage
+from services.llm import generate_answer
 from services.payments import create_cryptobot_invoice, get_invoice_status
-from services.audio import speech_to_text, text_to_speech
 
-# --------------------------------------------------------------------------------------
-# ЛОГИ
-# --------------------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger(__name__)
 
-# Хранилище (файловое/Redis – внутри services.storage)
+logger = logging.getLogger(__name__)
+
+dp = Dispatcher()
 storage = Storage()
 
-# Основной роутер
-router = Router()
+# --- UI labels (таскбар) ---
 
-# Кто включил озвучку ответов
-VOICE_REPLY_USERS: set[int] = set()
-
-# --------------------------------------------------------------------------------------
-# КНОПКИ ТАСКБАРА
-# --------------------------------------------------------------------------------------
-
-BTN_HOME_MODES = "🧠 Режимы"
-BTN_HOME_PROFILE = "👤 Профиль"
-BTN_HOME_SUBSCRIPTION = "💎 Подписка"
-BTN_HOME_REFERRALS = "👥 Рефералы"
-
-# Подменю режимов
-BTN_MODE_UNIVERSAL = "🧠 Универсальный"
-BTN_MODE_MED = "🩺 Медицина"
-BTN_MODE_MENTOR = "🔥 Наставник"
-BTN_MODE_BUSINESS = "💼 Бизнес"
-BTN_MODE_CREATIVE = "🎨 Креатив"
-BTN_MODE_VOICE_COACH = "🎧 Голосовой коуч"
-
-# Подписка
-BTN_SUB_1M = "💎 1 месяц"
-BTN_SUB_3M = "💎 3 месяца"
-BTN_SUB_12M = "💎 12 месяцев"
-
+BTN_MODES = "🧠 Режимы"
+BTN_PROFILE = "👤 Профиль"
+BTN_SUBSCRIPTION = "💎 Подписка"
+BTN_REFERRALS = "👥 Рефералы"
 BTN_BACK = "⬅️ Назад"
 
-ROOT_BUTTONS = {BTN_HOME_MODES, BTN_HOME_PROFILE, BTN_HOME_SUBSCRIPTION, BTN_HOME_REFERRALS}
+# Кнопки тарифов
+BTN_TARIFF_MONTH = "1 месяц — 7.99 USDT"
+BTN_TARIFF_QUARTER = "3 месяца — 26.99 USDT"
+BTN_TARIFF_YEAR = "12 месяцев — 82.99 USDT"
+BTN_TARIFF_CHECK = "Проверить оплату"
 
-ALL_MENU_BUTTONS = ROOT_BUTTONS | {
-    BTN_MODE_UNIVERSAL,
-    BTN_MODE_MED,
-    BTN_MODE_MENTOR,
-    BTN_MODE_BUSINESS,
-    BTN_MODE_CREATIVE,
-    BTN_MODE_VOICE_COACH,
-    BTN_SUB_1M,
-    BTN_SUB_3M,
-    BTN_SUB_12M,
-    BTN_BACK,
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_MODES)],
+            [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SUBSCRIPTION)],
+            [KeyboardButton(text=BTN_REFERRALS)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Напиши запрос для BlackBox GPT…",
+    )
+
+
+def modes_keyboard() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=mode_cfg["button"])]
+        for mode_cfg in ASSISTANT_MODES.values()
+    ]
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Выбери режим…",
+    )
+
+
+def subscription_keyboard(has_pending: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=BTN_TARIFF_MONTH)],
+        [KeyboardButton(text=BTN_TARIFF_QUARTER)],
+        [KeyboardButton(text=BTN_TARIFF_YEAR)],
+    ]
+    if has_pending:
+        rows.append([KeyboardButton(text=BTN_TARIFF_CHECK)])
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Выбери тариф…",
+    )
+
+
+# --- helpers ---
+
+
+def _get_mode_config(mode: str) -> Dict[str, Any]:
+    return ASSISTANT_MODES.get(mode) or ASSISTANT_MODES[DEFAULT_MODE]
+
+
+def _format_plan(user: Dict[str, Any], is_owner: bool) -> str:
+    if is_owner:
+        return "Админ (без лимитов)"
+
+    plan = user.get("plan") or PLAN_BASIC
+    if plan == PLAN_PREMIUM and storage.is_premium_active(user):
+        until = user.get("premium_until")
+        return f"Premium до {until}"
+    return "Базовый"
+
+
+def _format_limits(user: Dict[str, Any], is_owner: bool) -> str:
+    if is_owner:
+        return "Лимиты: отключены для админа."
+    limit = storage.get_daily_limit(user)
+    used = int(user.get("daily_used") or 0)
+    if limit is None:
+        return f"Лимиты: Premium (без ограничений, использовано сегодня {used})."
+    remain = max(limit - used, 0)
+    return f"Лимиты: {used}/{limit} сегодня, осталось {remain}."
+
+
+async def _send_streaming_answer(message: Message, answer: str) -> None:
+    """
+    Псевдо-стриминг: сначала отправляем «…», потом обновляем сообщение кусками.
+    """
+    # Если ответ очень длинный — просто отправляем без стриминга
+    if len(answer) > 1800:
+        await message.answer(answer)
+        return
+
+    msg = await message.answer("…")
+    chunk_size = 250
+    text = answer
+    for i in range(chunk_size, len(text) + chunk_size, chunk_size):
+        part = text[:i]
+        try:
+            await msg.edit_text(part)
+        except Exception:
+            # Если что-то пошло не так — просто высылаем весь текст отдельным сообщением
+            await message.answer(text)
+            return
+        await asyncio.sleep(0.08)
+
+
+# --- handlers ---
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    user_id = message.from_user.id
+    user, created = storage.get_or_create_user(user_id, message.from_user)
+
+    # Обработка реферала, если есть deep-link
+    if command.args:
+        ref_code = command.args.strip()
+        applied = storage.apply_referral(user_id, ref_code)
+        if applied:
+            await message.answer(
+                "Ты зашёл по реферальной ссылке. "
+                "Твоему другу начислен бонус к лимиту, а ты можешь просто пользоваться ботом 🙂"
+            )
+
+    mode_cfg = _get_mode_config(user.get("mode") or DEFAULT_MODE)
+    emoji = mode_cfg["emoji"]
+    title = mode_cfg["title"]
+
+    text = f"""👋 Привет. Я **BlackBox GPT — Universal AI Assistant.**
+
+Минималистичный интерфейс. Максимум мозга.
+
+Снизу — таскбар:
+- {BTN_MODES} — выбор режима (мозг под твою задачу)
+- {BTN_PROFILE} — профиль и лимиты
+- {BTN_SUBSCRIPTION} — Premium через USDT (CryptoBot)
+- {BTN_REFERRALS} — реферальная система
+
+Сейчас активен режим: *{emoji} {title}*
+
+Просто напиши свой первый запрос 👇
+"""
+
+    await message.answer(text, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await message.answer("Таскбар обновлён.", reply_markup=main_keyboard())
+
+
+@dp.message(F.text == BTN_BACK)
+async def on_back(message: Message) -> None:
+    await message.answer("Возврат к главному экрану.", reply_markup=main_keyboard())
+
+
+@dp.message(F.text == BTN_MODES)
+async def on_modes(message: Message) -> None:
+    lines = []
+    for cfg in ASSISTANT_MODES.values():
+        lines.append(f"{cfg['button']} — {cfg['description']}")
+    text = "Выбери режим работы ассистента:\n\n" + "\n".join(lines)
+    await message.answer(text, reply_markup=modes_keyboard())
+
+
+# Выбор конкретного режима
+MODE_BUTTONS = {cfg["button"]: code for code, cfg in ASSISTANT_MODES.items()}
+
+
+@dp.message(F.text.in_(list(MODE_BUTTONS.keys())))
+async def on_mode_selected(message: Message) -> None:
+    user_id = message.from_user.id
+    code = MODE_BUTTONS[message.text]
+    cfg = _get_mode_config(code)
+    storage.set_mode(user_id, code)
+    text = (
+        f"Режим переключён на {cfg['button']}\n\n"
+        "Теперь просто напиши запрос в этом стиле — я подстроюсь."
+    )
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+@dp.message(F.text == BTN_PROFILE)
+async def on_profile(message: Message) -> None:
+    user_id = message.from_user.id
+    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    is_owner = OWNER_ID is not None and OWNER_ID == user_id
+
+    mode_cfg = _get_mode_config(user.get("mode") or DEFAULT_MODE)
+    plan = _format_plan(user, is_owner)
+    limits = _format_limits(user, is_owner)
+
+    text = (
+        "👤 *Профиль*\n\n"
+        f"ID: `{user_id}`\n"
+        f"Режим: {mode_cfg['button']}\n"
+        f"План: {plan}\n"
+        f"{limits}\n\n"
+        f"Реферальный код: `{user.get('ref_code')}`\n"
+        f"Приглашено друзей: {int(user.get('ref_count') or 0)}\n"
+        f"Бонус к лимиту: +{int(user.get('ref_bonus_messages') or 0)} сообщений/день\n"
+    )
+
+    await message.answer(text, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+
+@dp.message(F.text == BTN_REFERRALS)
+async def on_referrals(message: Message) -> None:
+    user_id = message.from_user.id
+    user, _ = storage.get_or_create_user(user_id, message.from_user)
+
+    ref_code = user.get("ref_code")
+    if not ref_code:
+        storage.get_or_create_user(user_id, message.from_user)
+        user = storage.get_user(user_id)
+        ref_code = user.get("ref_code")
+
+    me = await message.bot.get_me()
+    link = f"https://t.me/{me.username}?start={ref_code}"
+
+    text = (
+        "👥 *Рефералы*\n\n"
+        "1. Отправь эту ссылку друзьям.\n"
+        "2. Когда они запустят бота и начнут им пользоваться, "
+        f"тебе будет начислено +{REF_BONUS_PER_USER} сообщений/день к базовому лимиту.\n\n"
+        f"Твоя ссылка:\n{link}\n\n"
+        f"Уже пришло: {int(user.get('ref_count') or 0)} друзей."
+    )
+    await message.answer(text, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+
+@dp.message(F.text == BTN_SUBSCRIPTION)
+async def on_subscription(message: Message) -> None:
+    user_id = message.from_user.id
+    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    is_owner = OWNER_ID is not None and OWNER_ID == user_id
+
+    if is_owner:
+        await message.answer(
+            "У тебя режим админа — подписка не нужна, лимитов нет 🙂",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if storage.is_premium_active(user):
+        await message.answer(
+            f"У тебя уже активен Premium до {user.get('premium_until')}.\n"
+            "Когда срок закончится, можно будет оформить продление.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    has_pending = bool(user.get("pending_invoice_id"))
+    text = (
+        "💎 *Подписка Premium*\n\n"
+        "Premium снимает лимиты и даёт приоритетные ответы.\n\n"
+        "Тарифы (оплата через CryptoBot, USDT):\n"
+        f"- {BTN_TARIFF_MONTH}\n"
+        f"- {BTN_TARIFF_QUARTER}\n"
+        f"- {BTN_TARIFF_YEAR}\n\n"
+        "После выбора тарифа ты получишь ссылку на оплату в CryptoBot."
+    )
+    if has_pending:
+        text += "\n\nУ тебя есть неоплаченный счёт — можно нажать «Проверить оплату»."
+    await message.answer(text, reply_markup=subscription_keyboard(has_pending), parse_mode="Markdown")
+
+
+TARIFF_BY_BUTTON = {
+    BTN_TARIFF_MONTH: "month",
+    BTN_TARIFF_QUARTER: "quarter",
+    BTN_TARIFF_YEAR: "year",
 }
 
-# --------------------------------------------------------------------------------------
-# КЛАВИАТУРЫ
-# --------------------------------------------------------------------------------------
 
+@dp.message(F.text.in_(list(TARIFF_BY_BUTTON.keys())))
+async def on_tariff_selected(message: Message) -> None:
+    user_id = message.from_user.id
+    tariff_code = TARIFF_BY_BUTTON[message.text]
+    tariff = SUBSCRIPTION_TARIFFS[tariff_code]
 
-def build_root_keyboard() -> ReplyKeyboardMarkup:
-    """Главный таскбар: 4 кнопки."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_HOME_MODES), KeyboardButton(text=BTN_HOME_PROFILE)],
-            [KeyboardButton(text=BTN_HOME_SUBSCRIPTION), KeyboardButton(text=BTN_HOME_REFERRALS)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Напиши текст или отправь голосовое ↓",
-        one_time_keyboard=False,
-        is_persistent=True,
-    )
-
-
-def build_modes_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_MODE_UNIVERSAL), KeyboardButton(text=BTN_MODE_MED)],
-            [KeyboardButton(text=BTN_MODE_MENTOR), KeyboardButton(text=BTN_MODE_BUSINESS)],
-            [KeyboardButton(text=BTN_MODE_CREATIVE), KeyboardButton(text=BTN_MODE_VOICE_COACH)],
-            [KeyboardButton(text=BTN_BACK)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Выбери режим ↓",
-        one_time_keyboard=False,
-        is_persistent=True,
-    )
-
-
-def build_subscription_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_SUB_1M), KeyboardButton(text=BTN_SUB_3M)],
-            [KeyboardButton(text=BTN_SUB_12M), KeyboardButton(text=BTN_BACK)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Выбери тариф ↓",
-        one_time_keyboard=False,
-        is_persistent=True,
-    )
-
-# --------------------------------------------------------------------------------------
-# /start + онбординг
-# --------------------------------------------------------------------------------------
-
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    # реферальный старт /start <code>
-    if command.args:
-        storage.register_referral(user_id, command.args.strip())
-
-    user_data, is_new = storage.get_or_create_user(user_id)
-    limits = storage.get_limits(user_id)
-    mode_key = storage.get_mode(user_id)
-    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
-    mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
-
-    if is_new or not user_data.get("onboarding_seen"):
-        storage.mark_onboarding_seen(user_id)
-        text = (
-            "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
-            "Минималистичный ИИ-ассистент без лишних кнопок.\n\n"
-            "• Пиши запрос текстом или отправляй голосовые.\n"
-            "• Управление — только через 4 кнопки внизу.\n\n"
-            "Попробуй: «Разбери мой день и выдели задачи» или просто наговори голосовое."
-        )
-    else:
-        text = (
-            "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
-            f"Режим: <b>{mode_label}</b>\n"
-            f"Лимит на сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
-            "Я здесь. Пиши или говори — я разберу."
-        )
-
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-# --------------------------------------------------------------------------------------
-# РЕЖИМЫ
-# --------------------------------------------------------------------------------------
-
-
-@router.message(F.text == BTN_HOME_MODES)
-async def on_modes_entry(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    mode_key = storage.get_mode(user_id)
-    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
-    mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
-
-    text = (
-        "⚙️ <b>Режимы мышления</b>\n\n"
-        f"Сейчас: <b>{mode_label}</b>\n\n"
-        "Выбери новый режим внизу. «Голосовой коуч» заточен под прогулочные голосовые сессии."
-    )
-    await message.answer(text, reply_markup=build_modes_keyboard())
-
-
-async def _set_mode_and_back_to_root(message: Message, mode_key: str) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    if mode_key not in ASSISTANT_MODES:
-        await message.answer("Такого режима нет.", reply_markup=build_root_keyboard())
-        return
-
-    storage.update_mode(user_id, mode_key)
-    mode_cfg = ASSISTANT_MODES[mode_key]
-    mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
-
-    await message.answer(
-        f"Режим переключён на <b>{mode_label}</b>.\n\nПиши или отправляй голосовые — я адаптирую стиль работы.",
-        reply_markup=build_root_keyboard(),
-    )
-
-
-@router.message(F.text == BTN_MODE_UNIVERSAL)
-async def btn_mode_universal(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "universal")
-
-
-@router.message(F.text == BTN_MODE_MED)
-async def btn_mode_med(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "med")
-
-
-@router.message(F.text == BTN_MODE_MENTOR)
-async def btn_mode_mentor(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "mentor")
-
-
-@router.message(F.text == BTN_MODE_BUSINESS)
-async def btn_mode_business(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "business")
-
-
-@router.message(F.text == BTN_MODE_CREATIVE)
-async def btn_mode_creative(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "creative")
-
-
-@router.message(F.text == BTN_MODE_VOICE_COACH)
-async def btn_mode_voice_coach(message: Message) -> None:
-    await _set_mode_and_back_to_root(message, "voice_coach")
-
-# --------------------------------------------------------------------------------------
-# ПРОФИЛЬ + ПАМЯТЬ
-# --------------------------------------------------------------------------------------
-
-
-@router.message(F.text == BTN_HOME_PROFILE)
-async def on_profile(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    limits = storage.get_limits(user_id)
-    plan_info = storage.get_plan_info(user_id)
-    mode_key = storage.get_mode(user_id)
-    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
-    mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
-
-    plan_title = plan_info["plan_title"]
-    expires = plan_info["plan_expires_at"]
-
-    if plan_info["plan"] == "free":
-        plan_line = f"<b>{plan_title}</b>"
-    else:
-        plan_line = f"<b>{plan_title}</b>"
-        if expires:
-            plan_line += f" · до <b>{expires}</b>"
-
-    dossier_preview = storage.get_dossier_preview(user_id)
-    voice_reply = "включен" if user_id in VOICE_REPLY_USERS else "выключен"
-
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"Тариф: {plan_line}\n"
-        f"Режим: <b>{mode_label}</b>\n"
-        f"Сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b> запросов\n"
-        f"Всего: <b>{limits['total_requests']}</b>\n"
-        f"Голосовые ответы: <b>{voice_reply}</b> (/voice_reply_on, /voice_reply_off)\n\n"
-        "🧠 <b>Память (краткий срез)</b>\n\n"
-        f"{dossier_preview}"
-    )
-
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-# --------------------------------------------------------------------------------------
-# ПОДПИСКА (CryptoBot / USDT)
-# --------------------------------------------------------------------------------------
-
-
-@router.message(F.text == BTN_HOME_SUBSCRIPTION)
-async def on_subscription_entry(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    plan_info = storage.get_plan_info(user_id)
-    limits = storage.get_limits(user_id)
-
-    plan_title = plan_info["plan_title"]
-    expires = plan_info["plan_expires_at"]
-
-    if plan_info["plan"] == "free":
-        current_line = f"Текущий тариф: <b>{plan_title}</b>\n"
-    else:
-        current_line = f"Текущий тариф: <b>{plan_title}</b>\n"
-        if expires:
-            current_line += f"Активен до: <b>{expires}</b>\n"
-
-    if not CRYPTO_PAY_API_TOKEN:
-        text = (
-            "💎 <b>Подписка</b>\n\n"
-            f"{current_line}"
-            f"Лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
-            "Оплата через CryptoBot ещё не настроена.\n"
-            "Добавь CRYPTO_PAY_API_TOKEN в .env и перезапусти бота."
-        )
-        await message.answer(text, reply_markup=build_root_keyboard())
-        return
-
-    text = (
-        "💎 <b>Premium</b>\n\n"
-        f"{current_line}"
-        f"Твой лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
-        "Выбери тариф внизу. Оплата — только USDT через @CryptoBot.\n"
-        "После подтверждения оплаты подписка включится автоматически."
-    )
-    await message.answer(text, reply_markup=build_subscription_keyboard())
-
-
-async def _create_invoice_and_wait(message: Message, tariff_key: str) -> None:
-    """Создать счёт в CryptoBot и запустить фоновую проверку статуса."""
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-    chat_id = message.chat.id
-
-    tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
-    if not tariff:
-        await message.answer("Этот тариф временно недоступен.", reply_markup=build_root_keyboard())
-        return
-
-    if not CRYPTO_PAY_API_TOKEN:
-        await message.answer("Оплата через CryptoBot не настроена.", reply_markup=build_root_keyboard())
-        return
+    await message.answer("Генерирую ссылку на оплату через CryptoBot…")
 
     try:
-        invoice_id, pay_url = await create_cryptobot_invoice(user_id, tariff_key)
-    except Exception as e:  # noqa: BLE001
-        log.exception("Failed to create CryptoBot invoice: %s", e)
-        await message.answer("Не удалось создать счёт. Попробуй ещё раз чуть позже.", reply_markup=build_root_keyboard())
+        created = await create_cryptobot_invoice(tariff_code, user_id)
+    except Exception:
+        logger.exception("create_cryptobot_invoice error")
+        await message.answer("Не удалось создать счёт. Попробуй чуть позже.")
         return
 
-    storage.register_invoice(
-        user_id=user_id,
-        invoice_id=invoice_id,
-        plan="premium",
-        duration_days=tariff["duration_days"],
-    )
+    if not created:
+        await message.answer("Оплата временно недоступна. Попробуй позже.")
+        return
+
+    invoice_id, url = created
+    storage.set_pending_invoice(user_id, invoice_id, tariff_code)
 
     text = (
-        f"Счёт создан: <b>{tariff['title']}</b> за <b>{tariff['amount']:.2f} USDT</b>.\n\n"
-        f"Оплати по ссылке:\n{pay_url}\n\n"
-        "Я буду периодически проверять статус счёта и включу Premium, как только CryptoBot подтвердит оплату."
+        f"Счёт на *{tariff['title']}* успешно создан.\n\n"
+        f"Ссылка на оплату в CryptoBot:\n{url}\n\n"
+        "После оплаты вернись в чат с ботом и нажми «Проверить оплату»."
     )
-
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-    asyncio.create_task(
-        _wait_for_payment_and_activate(user_id, chat_id, invoice_id, tariff_key)
-    )
+    user = storage.get_user(user_id)
+    has_pending = bool(user and user.get("pending_invoice_id"))
+    await message.answer(text, reply_markup=subscription_keyboard(has_pending), parse_mode="Markdown")
 
 
-async def _wait_for_payment_and_activate(
-    user_id: int,
-    chat_id: int,
-    invoice_id: int,
-    tariff_key: str,
-    check_interval: int = 20,
-    max_checks: int = 24,
-) -> None:
-    """Фоновая проверка статуса счёта и активация подписки."""
-    from aiogram import Bot as AiogramBot
+@dp.message(F.text == BTN_TARIFF_CHECK)
+async def on_tariff_check(message: Message) -> None:
+    user_id = message.from_user.id
+    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    pending_id = user.get("pending_invoice_id")
+    tariff_code = user.get("pending_invoice_tariff")
 
-    bot = AiogramBot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
-    tariff = SUBSCRIPTION_TARIFFS.get(tariff_key) or {}
-    title = tariff.get("title", "Premium")
-    duration_days = tariff.get("duration_days", 30)
-
-    for _ in range(max_checks):
-        try:
-            status = await get_invoice_status(invoice_id)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Error checking CryptoBot invoice: %s", e)
-            await asyncio.sleep(check_interval)
-            continue
-
-        if status == "paid":
-            storage.update_invoice_status(user_id, invoice_id, "paid")
-            storage.set_plan(user_id, "premium", duration_days)
-            plan_info = storage.get_plan_info(user_id)
-            expires = plan_info.get("plan_expires_at")
-
-            text = (
-                "✅ Оплата через CryptoBot подтверждена.\n\n"
-                f"Тариф: <b>{title}</b> активирован.\n"
-            )
-            if expires:
-                text += f"Подписка действует до: <b>{expires}</b>.\n\n"
-            else:
-                text += "\n"
-
-            text += "Можешь загружать меня по полной 😉"
-
-            await bot.send_message(chat_id, text, reply_markup=build_root_keyboard())
-            return
-
-        if status in {"expired", "cancelled"}:
-            storage.update_invoice_status(user_id, invoice_id, status)
-            await bot.send_message(
-                chat_id,
-                f"Статус счёта: <b>{status}</b>.\n"
-                "Если оплату не успел — просто оформи новый тариф из раздела «Подписка».",
-                reply_markup=build_root_keyboard(),
-            )
-            return
-
-        await asyncio.sleep(check_interval)
-
-    await bot.send_message(
-        chat_id,
-        "❓ За отведённое время я не увидел подтверждения оплаты от CryptoBot.\n"
-        "Если ты уверен, что оплатил — напиши админу или повторно оформи подписку.",
-        reply_markup=build_root_keyboard(),
-    )
-
-
-@router.message(F.text == BTN_SUB_1M)
-async def btn_sub_1m(message: Message) -> None:
-    await _create_invoice_and_wait(message, "premium_1m")
-
-
-@router.message(F.text == BTN_SUB_3M)
-async def btn_sub_3m(message: Message) -> None:
-    await _create_invoice_and_wait(message, "premium_3m")
-
-
-@router.message(F.text == BTN_SUB_12M)
-async def btn_sub_12m(message: Message) -> None:
-    await _create_invoice_and_wait(message, "premium_12m")
-
-# --------------------------------------------------------------------------------------
-# РЕФЕРАЛЫ
-# --------------------------------------------------------------------------------------
-
-
-@router.message(F.text == BTN_HOME_REFERRALS)
-async def on_referrals(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    info = storage.get_referral_info(user_id)
-
-    if BOT_USERNAME:
-        ref_link = f"https://t.me/{BOT_USERNAME}?start={info['code']}"
-    else:
-        ref_link = info["code"]
-
-    text = (
-        "👥 <b>Рефералы</b>\n\n"
-        "Поделись ссылкой с теми, кому реально нужен сильный ИИ-ассистент.\n\n"
-        f"Твоя ссылка:\n{ref_link}\n\n"
-        f"Приглашено: <b>{info['invited_count']}</b>\n"
-        f"Базовый лимит: <b>{info['base_limit']}</b>\n"
-        f"Бонус от рефералов: <b>{info['ref_bonus']}</b>\n"
-        f"Итого лимит в день: <b>{info['limit_today']}</b>"
-    )
-
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-# --------------------------------------------------------------------------------------
-# НАЗАД НА ГЛАВНЫЙ
-# --------------------------------------------------------------------------------------
-
-
-@router.message(F.text == BTN_BACK)
-async def on_back(message: Message) -> None:
-    text = (
-        "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
-        "Главный экран. Пиши запрос или отправь голосовое — я разберу."
-    )
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-# --------------------------------------------------------------------------------------
-# ОБРАБОТКА ЗАПРОСА (TEXT / VOICE)
-# --------------------------------------------------------------------------------------
-
-
-async def _process_prompt(message: Message, prompt: str, source: str = "text") -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    if not prompt.strip():
-        await message.answer("Не нашёл текста в запросе.", reply_markup=build_root_keyboard())
-        return
-
-    if not storage.can_make_request(user_id):
-        limits = storage.get_limits(user_id)
-        text = (
-            "На сегодня лимит запросов исчерпан.\n\n"
-            f"Сделано: <b>{limits['used_today']} / {limits['limit_today']}</b>.\n\n"
-            "Можно подождать до завтра или оформить Premium в разделе «Подписка»."
-        )
-        await message.answer(text, reply_markup=build_root_keyboard())
-        return
-
-    mode_key = storage.get_mode(user_id)
-    history = storage.get_history(user_id)
-
-    storage.append_history(user_id, "user", prompt)
-    storage.update_dossier_on_message(user_id, mode_key, prompt)
-    storage.increment_usage(user_id)
-
-    bot = message.bot
-    sent = await message.answer("🧠 Думаю над ответом…")
-
-    reply_text = ""
-    last_edit = datetime.now()
-
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        async for chunk in ask_llm_stream(mode_key, prompt, history):
-            reply_text += chunk
-            now = datetime.now()
-            if (now - last_edit).total_seconds() > 0.7 and reply_text:
-                view = reply_text[-4096:]
-                try:
-                    await sent.edit_text(view)
-                except Exception:
-                    pass
-                last_edit = now
-
-    if reply_text:
-        view = reply_text[-4096:]
-        try:
-            await sent.edit_text(view)
-        except Exception:
-            await sent.edit_text("Ответ сформирован, но не удалось отрисовать текст.")
-    else:
-        await sent.edit_text("Не получилось получить ответ от модели. Попробуй ещё раз.")
-
-    storage.append_history(user_id, "assistant", reply_text)
-
-    # Озвучка ответа (если включена)
-    if user_id in VOICE_REPLY_USERS and reply_text.strip():
-        try:
-            file_name = f"tts_{user_id}_{message.message_id}.ogg"
-            voice_path = await text_to_speech(reply_text, file_name=file_name)
-            await message.answer_voice(voice_path.open("rb"))
-        except Exception as e:  # noqa: BLE001
-            log.exception("TTS error: %s", e)
-
-
-@router.message(
-    F.text
-    & ~F.text.startswith("/")
-    & ~F.text.in_(ALL_MENU_BUTTONS)
-)
-async def handle_chat(message: Message) -> None:
-    prompt = (message.text or "").strip()
-    await _process_prompt(message, prompt, source="text")
-
-
-@router.message(F.voice)
-async def handle_voice(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    user_id = user.id
-
-    try:
-        file = await message.bot.get_file(message.voice.file_id)
-        tmp_dir = BASE_DIR / "tmp" / "voice"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        ogg_path = tmp_dir / f"voice_{user_id}_{message.message_id}.ogg"
-        await message.bot.download_file(file.file_path, destination=str(ogg_path))
-
-        text = await speech_to_text(ogg_path)
-    except Exception as e:  # noqa: BLE001
-        log.exception("Voice/STT error: %s", e)
+    if not pending_id or not tariff_code:
         await message.answer(
-            "Не получилось распознать голосовое. "
-            "Возможно, оно слишком длинное или сервис временно недоступен.",
-            reply_markup=build_root_keyboard(),
+            "Нет активного счёта. Выбери тариф, чтобы создать новый.",
+            reply_markup=subscription_keyboard(False),
         )
         return
 
-    if not text:
-        await message.answer("Я не смог распознать текст в голосовом сообщении.", reply_markup=build_root_keyboard())
+    await message.answer("Проверяю оплату…")
+
+    try:
+        status = await get_invoice_status(int(pending_id))
+    except Exception:
+        logger.exception("get_invoice_status error")
+        await message.answer("Не удалось проверить статус оплаты. Попробуй позже.")
         return
 
-    await _process_prompt(message, text, source="voice")
+    if status == "paid":
+        storage.activate_premium(user_id, tariff_code)
+        user = storage.get_user(user_id)
+        await message.answer(
+            f"Оплата подтверждена ✅\n\n"
+            f"Premium активирован до {user.get('premium_until')}.",
+            reply_markup=main_keyboard(),
+        )
+    elif status == "active":
+        await message.answer(
+            "Счёт ещё не оплачен. После оплаты нажми «Проверить оплату» ещё раз.",
+            reply_markup=subscription_keyboard(True),
+        )
+    elif status == "expired":
+        storage.clear_pending_invoice(user_id)
+        await message.answer(
+            "Счёт истёк. Создай новый, выбрав тариф ещё раз.",
+            reply_markup=subscription_keyboard(False),
+        )
+    else:
+        await message.answer(
+            f"Не удалось определить статус оплаты (status={status!r}). "
+            "Попробуй позже или создай новый счёт.",
+            reply_markup=subscription_keyboard(True),
+        )
 
-# --------------------------------------------------------------------------------------
-# СЛУЖЕБНЫЕ КОМАНДЫ
-# --------------------------------------------------------------------------------------
+
+# --- обработка обычных запросов ---
 
 
-@router.message(Command("id"))
-async def cmd_id(message: Message) -> None:
-    user = message.from_user
-    if not user:
+@dp.message(F.text)
+async def on_user_message(message: Message) -> None:
+    text = message.text
+    # Игнорим служебные кнопки (на случай, если что-то не отловилось отдельными хендлерами)
+    if text in {
+        BTN_MODES,
+        BTN_PROFILE,
+        BTN_SUBSCRIPTION,
+        BTN_REFERRALS,
+        BTN_BACK,
+        BTN_TARIFF_MONTH,
+        BTN_TARIFF_QUARTER,
+        BTN_TARIFF_YEAR,
+        BTN_TARIFF_CHECK,
+    }:
         return
-    await message.answer(
-        f"Твой Telegram ID: <code>{user.id}</code>\n\n"
-        "Добавь его в ADMIN_USER_IDS в .env, чтобы включить админ-режим.",
-        reply_markup=build_root_keyboard(),
-    )
 
+    user_id = message.from_user.id
+    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    is_owner = OWNER_ID is not None and OWNER_ID == user_id
 
-@router.message(Command("reset"))
-async def cmd_reset(message: Message) -> None:
-    user = message.from_user
-    if not user:
+    # Лимиты (не действуют для админа)
+    if not is_owner:
+        limit = storage.get_daily_limit(user)
+        used = int(user.get("daily_used") or 0)
+        if limit is not None and used >= limit:
+            await message.answer(
+                "На сегодня лимит сообщений исчерпан.\n\n"
+                "Варианты:\n"
+                "• Подождать до завтра — лимит обновится автоматически.\n"
+                "• Оформить Premium в разделе «Подписка» для снятия ограничений."
+            )
+            return
+
+    mode = user.get("mode") or DEFAULT_MODE
+    mode_cfg = _get_mode_config(mode)
+
+    # История диалога в рамках режима
+    history = storage.get_history(user, mode)
+
+    # Показываем индикатор печати
+    try:
+        await message.bot.send_chat_action(message.chat.id, "typing")
+    except Exception:
+        pass
+
+    # Запрос к LLM
+    try:
+        answer = await generate_answer(
+            system_prompt=mode_cfg["system_prompt"],
+            history=history,
+            user_message=text,
+        )
+    except Exception:
+        logger.exception("LLM error")
+        await message.answer("Что-то пошло не так при обращении к модели. Попробуй ещё раз чуть позже.")
         return
-    user_id = user.id
 
-    storage.clear_history(user_id)
-    await message.answer(
-        "Диалог очищен. Начинаем ветку с нуля.",
-        reply_markup=build_root_keyboard(),
-    )
+    # Обновляем лимиты и историю
+    if not is_owner:
+        user = storage.register_usage(user, count=1)
+    storage.add_history_message(user, mode, "user", text)
+    storage.add_history_message(user, mode, "assistant", answer)
 
-
-@router.message(Command("voice_reply_on"))
-async def cmd_voice_on(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    VOICE_REPLY_USERS.add(user.id)
-    await message.answer("Теперь ответы будут дублироваться голосом 🔊", reply_markup=build_root_keyboard())
+    await _send_streaming_answer(message, answer)
 
 
-@router.message(Command("voice_reply_off"))
-async def cmd_voice_off(message: Message) -> None:
-    user = message.from_user
-    if not user:
-        return
-    VOICE_REPLY_USERS.discard(user.id)
-    await message.answer("Голосовые ответы выключены.", reply_markup=build_root_keyboard())
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    text = (
-        "<b>Навигация</b>\n\n"
-        f"{BTN_HOME_MODES} — выбор режима (в т.ч. 🎧 Голосовой коуч)\n"
-        f"{BTN_HOME_PROFILE} — тариф, лимиты и память\n"
-        f"{BTN_HOME_SUBSCRIPTION} — оформление Premium\n"
-        f"{BTN_HOME_REFERRALS} — реферальная ссылка и бонусы\n\n"
-        "Команды:\n"
-        "/voice_reply_on — включить озвучку ответов\n"
-        "/voice_reply_off — выключить озвучку\n"
-        "/reset — очистить диалог\n"
-        "/id — показать твой Telegram ID"
-    )
-    await message.answer(text, reply_markup=build_root_keyboard())
-
-# --------------------------------------------------------------------------------------
-# Точка входа
-# --------------------------------------------------------------------------------------
+# --- entrypoint ---
 
 
 async def main() -> None:
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    log.info("Starting BlackBox bot polling...")
+    bot = Bot(token=BOT_TOKEN)
+    me = await bot.get_me()
+    logger.info("Starting bot as @%s (id=%s)", me.username, me.id)
     await dp.start_polling(bot)
 
 
