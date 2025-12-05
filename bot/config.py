@@ -14,7 +14,7 @@ if ENV_PATH.exists():
 else:
     load_dotenv()
 
-# ===== Пути к файлам данных =====
+# ===== Пути к данным =====
 DATA_DIR = BASE_DIR / "data"
 USERS_FILE_PATH = str(DATA_DIR / "users.json")
 
@@ -104,7 +104,7 @@ ASSISTANT_MODES: Dict[str, Dict[str, str]] = {
             "Ты универсальный ИИ-ассистент BlackBox GPT. "
             "Отвечаешь на любые вопросы — от жизни до кода. "
             "Пиши структурировано, по делу, без воды. "
-            'Если можешь выдать список или шаги — делай это в формате "1., 2., 3.".'
+            'Если можешь выдать список или шаги — делай это в формате \"1., 2., 3.\".'
         ),
     },
     "med": {
@@ -171,4 +171,3 @@ DEFAULT_MODE_KEY = "universal"
 AUDIO_PROVIDER = os.getenv("AUDIO_PROVIDER", "yandex")
 YANDEX_SPEECHKIT_API_KEY = os.getenv("YANDEX_SPEECHKIT_API_KEY", "")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
-
