@@ -451,3 +451,214 @@ def get_usage_stats() -> Dict[str, int]:
         "total_messages": int(row["total_messages"]),
         "total_tokens": int(row["total_tokens"]),
     }
+
+# === Projects (мульти-режимы бота по пользователю) ===
+import time
+import sqlite3
+
+# Флаг, чтобы не создавать таблицы каждый раз
+_PROJECTS_INITIALIZED = False
+
+
+def _projects_conn() -> sqlite3.Connection:
+    """
+    Отдельный коннект для работы с проектами.
+    Используем тот же файл БД (DB_PATH), что и для подписок.
+    """
+    from .subscription_db import DB_PATH  # если DB_PATH объявлен выше в этом файле
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_projects_schema() -> None:
+    """
+    Ленивая инициализация схемы для проектов.
+    Таблицы создаются при первом обращении.
+    """
+    global _PROJECTS_INITIALIZED
+    if _PROJECTS_INITIALIZED:
+        return
+
+    conn = _projects_conn()
+    cur = conn.cursor()
+
+    # Основная таблица проектов
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id     INTEGER NOT NULL,
+            title           TEXT NOT NULL,
+            description     TEXT DEFAULT '',
+            system_prompt   TEXT DEFAULT '',
+            is_archived     INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
+        );
+        """
+    )
+
+    # Активный проект у пользователя
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_projects_state (
+            telegram_id         INTEGER PRIMARY KEY,
+            current_project_id  INTEGER,
+            updated_at          INTEGER NOT NULL
+        );
+        """
+    )
+
+    conn.commit()
+    conn.close()
+    _PROJECTS_INITIALIZED = True
+
+
+def create_project(
+    telegram_id: int,
+    title: str,
+    description: str = "",
+    system_prompt: str = "",
+) -> dict:
+    """
+    Создать проект для пользователя.
+    Возвращает dict с данными проекта.
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    ts = int(time.time())
+
+    cur = conn.execute(
+        """
+        INSERT INTO projects (telegram_id, title, description, system_prompt, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (telegram_id, title.strip(), description.strip(), system_prompt.strip(), ts, ts),
+    )
+    project_id = cur.lastrowid
+
+    row = conn.execute(
+        "SELECT * FROM projects WHERE id = ?",
+        (project_id,),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+
+    return dict(row) if row else {}
+
+
+def list_projects(telegram_id: int, include_archived: bool = False) -> list[dict]:
+    """
+    Получить список проектов пользователя.
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    if include_archived:
+        rows = conn.execute(
+            "SELECT * FROM projects WHERE telegram_id = ? ORDER BY is_archived, updated_at DESC",
+            (telegram_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM projects WHERE telegram_id = ? AND is_archived = 0 ORDER BY updated_at DESC",
+            (telegram_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_project(telegram_id: int, project_id: int) -> dict | None:
+    """
+    Получить конкретный проект по id (проверяем, что принадлежит пользователю).
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    row = conn.execute(
+        """
+        SELECT * FROM projects
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (project_id, telegram_id),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_current_project(telegram_id: int, project_id: int | None) -> None:
+    """
+    Установить активный проект для пользователя.
+    project_id = None -> сбросить (работа без проекта).
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    ts = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO user_projects_state (telegram_id, current_project_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            current_project_id = excluded.current_project_id,
+            updated_at         = excluded.updated_at
+        """,
+        (telegram_id, project_id, ts),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_current_project(telegram_id: int) -> dict | None:
+    """
+    Вернёт активный проект пользователя (или None, если не выбран).
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    state = conn.execute(
+        "SELECT current_project_id FROM user_projects_state WHERE telegram_id = ?",
+        (telegram_id,),
+    ).fetchone()
+
+    if not state or state["current_project_id"] is None:
+        conn.close()
+        return None
+
+    row = conn.execute(
+        "SELECT * FROM projects WHERE id = ?",
+        (state["current_project_id"],),
+    ).fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def archive_project(telegram_id: int, project_id: int) -> None:
+    """
+    Пометить проект как архивный (не показываем в основном списке).
+    """
+    _ensure_projects_schema()
+    conn = _projects_conn()
+    ts = int(time.time())
+    conn.execute(
+        """
+        UPDATE projects
+        SET is_archived = 1,
+            updated_at   = ?
+        WHERE id = ? AND telegram_id = ?
+        """,
+        (ts, project_id, telegram_id),
+    )
+
+    # Если архивируем активный — снимаем его в состоянии
+    conn.execute(
+        """
+        UPDATE user_projects_state
+        SET current_project_id = NULL,
+            updated_at         = ?
+        WHERE telegram_id = ? AND current_project_id = ?
+        """,
+        (ts, telegram_id, project_id),
+    )
+
+    conn.commit()
+    conn.close()
