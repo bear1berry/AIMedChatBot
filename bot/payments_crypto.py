@@ -8,29 +8,30 @@ Docs: https://help.crypt.bot/crypto-pay-api
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 # === Config ===
 
-# Пробуем несколько вариантов переменных, чтобы не ломать существующий .env
 CRYPTO_PAY_API_TOKEN = (
     os.getenv("CRYPTO_PAY_API_TOKEN")
     or os.getenv("CRYPTO_BOT_API_KEY")
     or os.getenv("CRYPTO_BOT_TOKEN")
+    or os.getenv("CRYPTO_PAY_TOKEN")
 )
 
 CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot")
 
 # Какой ассет использовать (по умолчанию USDT).
-# Если хочешь TON — просто поставь CRYPTO_ASSET=TON в .env
+# Если хочешь TON — просто поставь CRYPTO_PAY_ASSET=TON в .env
 CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET") or os.getenv("CRYPTO_ASSET") or "USDT"
 
 # Тарифы подписки.
 # Ключи — код плана, который используется в main.py в callback_data.
 # Значения: (amount, period_days)
-_PLAN_VARIANTS = {
+_PLAN_VARIANTS: Dict[str, Tuple[str, int]] = {
     # 1 месяц
     "month": ("5", 30),
     "1m": ("5", 30),
@@ -56,33 +57,9 @@ class CryptoPayError(RuntimeError):
 def _ensure_config() -> None:
     if not CRYPTO_PAY_API_TOKEN:
         raise CryptoPayError(
-            "CRYPTO_PAY_API_TOKEN / CRYPTO_BOT_API_KEY не задан в .env (нужен для крипто-оплат)."
+            "CRYPTO_PAY_API_TOKEN / CRYPTO_BOT_API_KEY / CRYPTO_BOT_TOKEN / CRYPTO_PAY_TOKEN "
+            "не задан в .env (нужен для крипто-оплат)."
         )
-
-
-def _resolve_plan(plan_code: Optional[str]) -> Tuple[str, int, str]:
-    """
-    Возвращает: (amount, period_days, normalized_code)
-    """
-    if not plan_code:
-        plan_code = DEFAULT_PLAN_CODE
-
-    plan_code_lower = plan_code.lower()
-    if plan_code_lower not in _PLAN_VARIANTS:
-        # Если прилетел неизвестный код — откатываемся к дефолтному плану
-        plan_code_lower = DEFAULT_PLAN_CODE
-
-    amount, period_days = _PLAN_VARIANTS[plan_code_lower]
-
-    # Нормализуем имя плана, чтобы везде было единообразно
-    if period_days == 30:
-        normalized = "month"
-    elif period_days == 90:
-        normalized = "3m"
-    else:
-        normalized = "12m"
-
-    return amount, period_days, normalized
 
 
 async def _call_crypto_pay(
@@ -91,6 +68,9 @@ async def _call_crypto_pay(
     params: Optional[Dict[str, Any]] = None,
     json: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Низкоуровневый helper для Crypto Pay API.
+    """
     _ensure_config()
 
     url = f"{CRYPTO_PAY_API_URL}/api/{method}"
@@ -108,8 +88,34 @@ async def _call_crypto_pay(
 
     data = resp.json()
     if not data.get("ok"):
+        logging.error("Crypto Pay API error in %s: %s", method, data)
         raise CryptoPayError(f"Crypto Pay API error in {method}: {data}")
     return data["result"]
+
+
+def _resolve_plan(plan_code: Optional[str]) -> Tuple[str, int, str]:
+    """
+    Возвращает: (amount, period_days, normalized_code)
+    """
+    if not plan_code:
+        plan_code = DEFAULT_PLAN_CODE
+
+    plan_code_lower = plan_code.lower()
+    if plan_code_lower not in _PLAN_VARIANTS:
+        # Если прилетел неизвестный код — откатываемся к дефолту
+        plan_code_lower = DEFAULT_PLAN_CODE
+
+    amount, period_days = _PLAN_VARIANTS[plan_code_lower]
+
+    # Нормализуем имя плана, чтобы везде было единообразно
+    if period_days == 30:
+        normalized = "month"
+    elif period_days == 90:
+        normalized = "3m"
+    else:
+        normalized = "12m"
+
+    return amount, period_days, normalized
 
 
 async def create_invoice(telegram_id: int, plan_code: Optional[str] = None) -> Dict[str, Any]:
@@ -129,20 +135,17 @@ async def create_invoice(telegram_id: int, plan_code: Optional[str] = None) -> D
 
     description = f"Премиум-доступ: {normalized_code} (BlackBox GPT)."
 
-    payload = {
+    payload: Dict[str, Any] = {
         "asset": CRYPTO_PAY_ASSET,
         "amount": amount,
         "description": description,
         # В payload зашьём id пользователя и план — пригодится, если будешь использовать вебхуки
         "payload": f"user={telegram_id};plan={normalized_code}",
-        # Можно включить скрытое сообщение после оплаты:
-        # "hidden_message": "Спасибо за оплату! Возвращайтесь в бота BlackBox GPT 🤍",
     }
 
     result = await _call_crypto_pay("createInvoice", json=payload)
 
     # result — это словарь с полями инвойса (см. доку Crypto Pay).
-    # Нормализуем ключи, чтобы main.py было удобно использовать.
     invoice_id = result.get("invoice_id") or result.get("id")
     pay_url = result["pay_url"]
 
@@ -156,22 +159,41 @@ async def create_invoice(telegram_id: int, plan_code: Optional[str] = None) -> D
     }
 
 
-async def fetch_invoice_status(invoice_id: int | str) -> Dict[str, Any]:
+async def fetch_invoice_status(invoice_id: int | str) -> Optional[Dict[str, Any]]:
     """
-    Получить статус инвойса из Crypto Pay.
+    Получить статус инвойса из Crypto Pay по ID.
 
-    Возвращает первый инвойс из результата API или {"status": "not_found"}.
+    Возвращает dict:
+
+    {
+        "invoice_id": int,
+        "status": str,
+        "amount": str,
+        "asset": str,
+        "hash": str | None,
+        "created_at": str,
+        "paid_at": str | None,
+        "description": str | None,
+        "payload": str | None,
+    }
+
+    или None, если не найден или ошибка.
     """
-    # Crypto Pay ожидает список id через запятую
-    params = {"invoice_ids": str(invoice_id)}
+    try:
+        # Crypto Pay ожидает invoice_ids строкой через запятую
+        result = await _call_crypto_pay(
+            "getInvoices",
+            params={"invoice_ids": str(invoice_id)},
+        )
+    except Exception as e:
+        logging.exception("Error fetching invoice %s from Crypto Pay: %s", invoice_id, e)
+        return None
 
-    result = await _call_crypto_pay("getInvoices", params=params)
-    # result — список инвойсов
     if not result:
-        return {"status": "not_found", "invoice_id": invoice_id}
+        logging.warning("Invoice %s not found in Crypto Pay", invoice_id)
+        return None
 
     inv = result[0]
-    # Гарантируем наличие стабильных полей
     return {
         "invoice_id": inv.get("invoice_id") or inv.get("id"),
         "status": inv.get("status"),
@@ -183,64 +205,3 @@ async def fetch_invoice_status(invoice_id: int | str) -> Dict[str, Any]:
         "description": inv.get("description"),
         "payload": inv.get("payload"),
     }
-# ====== Проверка статуса инвойса через Crypto Pay ======
-# Эта функция нужна main.py: from .payments_crypto import fetch_invoice_status
-# Она возвращает словарь с данными инвойса или None, если не найден.
-
-import os
-import httpx
-import logging
-
-CRYPTO_PAY_API_TOKEN = (
-    os.getenv("CRYPTO_PAY_API_TOKEN")
-    or os.getenv("CRYPTO_PAY_TOKEN")
-)
-CRYPTO_PAY_API_URL = "https://pay.crypt.bot/api"
-
-
-async def fetch_invoice_status(invoice_id: int):
-    """
-    Получить статус инвойса по его ID из Crypto Pay.
-    Возвращает dict с инвойсом (как приходит из API) или None.
-    """
-    if not CRYPTO_PAY_API_TOKEN:
-        logging.error("CRYPTO_PAY_API_TOKEN / CRYPTO_PAY_TOKEN не задан в .env")
-        return None
-
-    try:
-        async with httpx.AsyncClient(base_url=CRYPTO_PAY_API_URL, timeout=10.0) as client:
-            resp = await client.post(
-                "/getInvoices",
-                headers={"Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN},
-                json={"invoice_ids": [invoice_id]},
-            )
-            data = resp.json()
-
-        if not data.get("ok"):
-            logging.error("Crypto Pay getInvoices error: %s", data)
-            return None
-
-        invoices = data.get("result") or []
-        if not invoices:
-            logging.warning("Invoice %s not found in Crypto Pay", invoice_id)
-            return None
-
-        invoice = invoices[0]
-        logging.info(
-            "Fetched invoice %s status from Crypto Pay: %s",
-            invoice_id,
-            invoice.get("status"),
-        )
-        return invoice
-
-    except Exception as e:
-        logging.exception("Exception while fetching invoice status from Crypto Pay: %s", e)
-        return None
-async def fetch_invoice_status(invoice_id):
-    """
-    Обратная совместимость для старого кода:
-    возвращает статус одного инвойса по его ID.
-    Использует существующую функцию fetch_invoices_statuses.
-    """
-    statuses = await fetch_invoices_statuses([str(invoice_id)])
-    return statuses.get(str(invoice_id))
