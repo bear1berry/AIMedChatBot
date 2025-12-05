@@ -2,57 +2,40 @@ import json
 import os
 import threading
 from datetime import datetime, date
-from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
-# Аккуратно подтягиваем конфиг как модуль
-try:
-    import bot.config as config  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    config = None  # type: ignore[assignment]
-
-
-# ===== КОНСТАНТЫ ИЗ CONFIG С ЗАПАСНЫМИ ЗНАЧЕНИЯМИ =====
-
-DEFAULT_MODE_KEY: str = getattr(config, "DEFAULT_MODE_KEY", "universal")
-REF_BONUS_PER_USER: int = int(getattr(config, "REF_BONUS_PER_USER", 5))
-MAX_HISTORY_MESSAGES: int = int(getattr(config, "MAX_HISTORY_MESSAGES", 30))
-PLAN_LIMITS: Dict[str, Dict[str, Any]] = getattr(
-    config,
-    "PLAN_LIMITS",
-    {
-        "free": {
-            "title": "Free",
-            "daily_base": 50,
-            "description": "Базовый бесплатный тариф по умолчанию.",
-        }
-    },
+from bot.config import (
+    DEFAULT_MODE_KEY,
+    REF_BONUS_PER_USER,
+    MAX_HISTORY_MESSAGES,
+    PLAN_LIMITS,
 )
-
-# Путь к файлу users.json (не зависим от config.USERS_FILE_PATH)
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_USERS_FILE_PATH = str(DATA_DIR / "users.json")
 
 
 def _today_str() -> str:
-    """Сегодняшняя дата YYYY-MM-DD."""
+    """Сегодняшняя дата в формате YYYY-MM-DD."""
     return date.today().isoformat()
 
 
 class Storage:
-    """Файловое JSON-хранилище пользователей, лимитов и рефералок."""
+    """
+    Простое файловое хранилище в JSON.
+    Хранит:
+      - досье пользователя (mode_key, количество сообщений, последняя активность)
+      - тариф (plan)
+      - usage по дням (для суточных лимитов)
+      - реферальную систему (code, invited_by, invited_users, total_requests)
+      - диалоговую историю (history) для контекста LLM
+    """
 
-    def __init__(self, path: str | None = None) -> None:
-        # Можно вызывать Storage() без аргументов
-        self.path = path or DEFAULT_USERS_FILE_PATH
+    def __init__(self, path: str = "data/users.json") -> None:
+        self.path = path
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.data: Dict[str, Any] = {"users": {}}
         self._load()
 
-    # ===== ВНУТРЕННЕЕ =====
+    # ===== Внутренние методы =====
 
     def _load(self) -> None:
         if os.path.exists(self.path):
@@ -60,7 +43,7 @@ class Storage:
                 with open(self.path, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
             except Exception:
-                # Если файл битый — стартуем с пустой структурой
+                # Если файл битый — не падаем, а перезапускаем пустым
                 self.data = {"users": {}}
         else:
             self._save()
@@ -73,65 +56,75 @@ class Storage:
     def _user_key(self, user_id: int) -> str:
         return str(user_id)
 
-    def _ensure_user_structure(self, user: Dict[str, Any]) -> None:
-        """Гарантируем, что у пользователя есть все нужные поля (для старых записей)."""
-        user.setdefault("mode_key", DEFAULT_MODE_KEY)
-        user.setdefault("plan", "free")
-        user.setdefault(
-            "dossier",
-            {
-                "messages_count": 0,
-                "last_prompt_preview": "",
-                "last_activity": None,
-            },
-        )
-        user.setdefault(
-            "referral",
-            {
-                "code": None,
-                "invited_by": None,
-                "invited_users": [],
-                "total_requests": 0,
-            },
-        )
-        user.setdefault("usage", {})    # {"YYYY-MM-DD": used_today}
-        user.setdefault("history", [])  # список сообщений для LLM
-
-    # ===== ПУБЛИЧНЫЙ API =====
-
-    def get_or_create_user(self, user_id: int) -> Tuple[Dict[str, Any], bool]:
-        """Возвращает (user_dict, created_flag). Совместимо с кодом, который это ожидает."""
+    def _get_or_create_user_internal(self, user_id: int) -> Dict[str, Any]:
+        """
+        Внутренний метод: гарантирует наличие пользователя в self.data
+        и всех нужных полей.
+        """
         uid = self._user_key(user_id)
         if "users" not in self.data:
             self.data["users"] = {}
 
-        users = self.data["users"]
-        if uid in users:
-            user = users[uid]
-            created = False
+        if uid not in self.data["users"]:
+            # Новый пользователь
+            self.data["users"][uid] = {
+                "mode_key": DEFAULT_MODE_KEY,
+                "plan": "free",
+                "dossier": {
+                    "messages_count": 0,
+                    "last_prompt_preview": "",
+                    "last_activity": None,
+                },
+                "referral": {
+                    "code": None,
+                    "invited_by": None,
+                    "invited_users": [],
+                    "total_requests": 0,
+                },
+                "usage": {},   # { "YYYY-MM-DD": used_today }
+                "history": [],  # диалоговая история
+            }
         else:
-            user = {}
-            users[uid] = user
-            created = True
+            # Для старых записей — безопасно дополняем поля
+            user = self.data["users"][uid]
+            user.setdefault("mode_key", DEFAULT_MODE_KEY)
+            user.setdefault("plan", "free")
+            user.setdefault(
+                "dossier",
+                {
+                    "messages_count": 0,
+                    "last_prompt_preview": "",
+                    "last_activity": None,
+                },
+            )
+            user.setdefault(
+                "referral",
+                {
+                    "code": None,
+                    "invited_by": None,
+                    "invited_users": [],
+                    "total_requests": 0,
+                },
+            )
+            user.setdefault("usage", {})
+            user.setdefault("history", [])
 
-        self._ensure_user_structure(user)
+        return self.data["users"][uid]
+
+    # ===== Публичные методы: пользователь / досье =====
+
+    def get_or_create_user(self, user_id: int) -> Dict[str, Any]:
+        """
+        Возвращает словарь пользователя. Если его не было — создаёт.
+        (Интерфейс как в старой версии — main.py ожидает именно dict.)
+        """
+        user = self._get_or_create_user_internal(user_id)
         self._save()
-        return user, created
-
-    def get_user(self, user_id: int) -> Dict[str, Any] | None:
-        uid = self._user_key(user_id)
-        user = self.data.get("users", {}).get(uid)
-        if user is None:
-            return None
-        self._ensure_user_structure(user)
         return user
 
-    def update_user_mode(self, user_id: int, mode_key: str) -> None:
-        user, _ = self.get_or_create_user(user_id)
-        user["mode_key"] = mode_key
-        self._save()
-
-    # ===== ДОСЬЕ =====
+    def get_dossier(self, user_id: int) -> Dict[str, Any]:
+        user = self._get_or_create_user_internal(user_id)
+        return user.get("dossier", {})
 
     def update_dossier_on_message(
         self,
@@ -139,8 +132,10 @@ class Storage:
         mode_key: str,
         user_prompt: str,
     ) -> None:
-        """Обновляем «досье» при новом сообщении пользователя."""
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Обновляем «досье» при новом сообщении пользователя.
+        """
+        user = self._get_or_create_user_internal(user_id)
         dossier = user.setdefault("dossier", {})
         dossier["messages_count"] = int(dossier.get("messages_count", 0)) + 1
         dossier["last_prompt_preview"] = user_prompt[:120]
@@ -148,10 +143,10 @@ class Storage:
         user["mode_key"] = mode_key
         self._save()
 
-    # ===== ИСТОРИЯ ДИАЛОГА =====
+    # ===== Публичные методы: история диалога =====
 
     def get_history(self, user_id: int) -> List[Dict[str, str]]:
-        user, _ = self.get_or_create_user(user_id)
+        user = self._get_or_create_user_internal(user_id)
         history = user.setdefault("history", [])
         if not isinstance(history, list):
             history = []
@@ -160,8 +155,10 @@ class Storage:
         return history
 
     def append_history(self, user_id: int, role: str, content: str) -> None:
-        """Добавляет сообщение в историю и режет до MAX_HISTORY_MESSAGES."""
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Добавляет сообщение в историю и ограничивает её длину MAX_HISTORY_MESSAGES.
+        """
+        user = self._get_or_create_user_internal(user_id)
         history = user.setdefault("history", [])
         if not isinstance(history, list):
             history = []
@@ -173,28 +170,30 @@ class Storage:
         self._save()
 
     def reset_history(self, user_id: int) -> None:
-        user, _ = self.get_or_create_user(user_id)
+        user = self._get_or_create_user_internal(user_id)
         user["history"] = []
         self._save()
 
-    # ===== ПЛАН / ТАРИФ =====
+    # ===== Публичные методы: тариф =====
 
     def get_plan(self, user_id: int) -> str:
-        user, _ = self.get_or_create_user(user_id)
+        user = self._get_or_create_user_internal(user_id)
         return user.get("plan", "free")
 
     def set_plan(self, user_id: int, plan: str) -> None:
         if plan not in PLAN_LIMITS:
             return
-        user, _ = self.get_or_create_user(user_id)
+        user = self._get_or_create_user_internal(user_id)
         user["plan"] = plan
         self._save()
 
-    # ===== ЛИМИТЫ ==== #
+    # ===== Публичные методы: лимиты и запросы =====
 
     def register_request(self, user_id: int) -> None:
-        """Увеличивает счётчики запросов: суточный + суммарный."""
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Увеличивает счётчики запросов: суточный и суммарный.
+        """
+        user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
         usage = user.setdefault("usage", {})
 
@@ -206,8 +205,20 @@ class Storage:
         self._save()
 
     def get_limits(self, user_id: int) -> Dict[str, Any]:
-        """Возвращает детальную инфу по лимитам и рефералке."""
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Возвращает подробную информацию по лимитам и рефералке:
+        {
+          "plan": "free" / "pro" / "vip",
+          "plan_title": str,
+          "used_today": int,
+          "limit_today": int,
+          "base_limit": int,
+          "ref_bonus": int,
+          "invited_count": int,
+          "total_requests": int,
+        }
+        """
+        user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
         usage = user.setdefault("usage", {})
 
@@ -240,10 +251,12 @@ class Storage:
         limits = self.get_limits(user_id)
         return limits["used_today"] < limits["limit_today"]
 
-    # ===== РЕФЕРАЛКА =====
+    # ===== Публичные методы: рефералка =====
 
     def _generate_ref_code(self, user_id: int) -> str:
-        """Генерим стабильный реф-код на основе user_id."""
+        """
+        Генерируем устойчивый реф-код на основе user_id (чтобы не городить БД).
+        """
         alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         n = user_id if user_id > 0 else abs(user_id) + 1
         result = ""
@@ -251,10 +264,14 @@ class Storage:
         while n > 0:
             n, r = divmod(n, base)
             result = alphabet[r] + result
-        return f"BB{result}"  # префикс под бренд BlackBox
+        return f"BB{result}"
 
     def ensure_ref_code(self, user_id: int) -> str:
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Убеждаемся, что у пользователя есть реф-код. Если нет — генерируем.
+        Возвращает сам код.
+        """
+        user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
         code = referral.get("code")
         if not code:
@@ -263,9 +280,11 @@ class Storage:
             self._save()
         return code
 
-    def _find_user_by_ref_code(self, code: str) -> int | None:
-        users = self.data.get("users", {})
-        for uid_str, udata in users.items():
+    def _find_user_by_ref_code(self, code: str):
+        """
+        Ищем владельца данного реф-кода, возвращаем user_id или None.
+        """
+        for uid_str, udata in self.data.get("users", {}).items():
             ref = udata.get("referral", {})
             if ref.get("code") == code:
                 try:
@@ -275,17 +294,18 @@ class Storage:
         return None
 
     def attach_referral(self, invited_id: int, code: str) -> str:
-        """Привязка пригласившего по коду.
-
-        Возвращает:
+        """
+        Привязка пригласившего по коду.
+        Возвращает статус:
           - "ok"
           - "not_found"
           - "already_has_referrer"
           - "self_referral"
         """
-        invited, _ = self.get_or_create_user(invited_id)
+        invited = self._get_or_create_user_internal(invited_id)
         referral = invited.setdefault("referral", {})
 
+        # Уже есть приглашавший — не трогаем
         if referral.get("invited_by") is not None:
             return "already_has_referrer"
 
@@ -297,7 +317,7 @@ class Storage:
 
         referral["invited_by"] = owner_id
 
-        owner, _ = self.get_or_create_user(owner_id)
+        owner = self._get_or_create_user_internal(owner_id)
         owner_ref = owner.setdefault("referral", {})
         invited_users = owner_ref.setdefault("invited_users", [])
         if invited_id not in invited_users:
@@ -307,8 +327,10 @@ class Storage:
         return "ok"
 
     def get_referral_stats(self, user_id: int) -> Dict[str, Any]:
-        """Расширенная инфа для экрана «Рефералы»/«Профиль»."""
-        user, _ = self.get_or_create_user(user_id)
+        """
+        Расширенная инфа для экрана «Рефералы» / профиля.
+        """
+        user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
         limits = self.get_limits(user_id)
 
