@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # ================= БАЗОВЫЕ ПУТИ =================
@@ -8,7 +9,11 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
 
-# Явно грузим .env из корня проекта, независимо от того, откуда нас запустили
+# Логи прямо в journalctl, чтобы видеть, что происходит
+print(f"[CONFIG] BASE_DIR={BASE_DIR}")
+print(f"[CONFIG] ENV_PATH={ENV_PATH} exists={ENV_PATH.exists()}")
+
+# Явно грузим .env из корня проекта, независимо от WorkingDirectory
 load_dotenv(dotenv_path=ENV_PATH)
 
 # =============== Общие настройки ===============
@@ -16,16 +21,19 @@ load_dotenv(dotenv_path=ENV_PATH)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
+print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")
+print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")
+
 if not BOT_TOKEN:
     raise RuntimeError(
         f"BOT_TOKEN is not set in environment variables. "
-        f"Проверь, что файл {ENV_PATH} существует и в нём есть строка BOT_TOKEN=..."
+        f"ENV_PATH={ENV_PATH}, exists={ENV_PATH.exists()}"
     )
 
 if not DEEPSEEK_API_KEY:
     raise RuntimeError(
         f"DEEPSEEK_API_KEY is not set in environment variables. "
-        f"Проверь, что файл {ENV_PATH} содержит DEEPSEEK_API_KEY=..."
+        f"ENV_PATH={ENV_PATH}, exists={ENV_PATH.exists()}"
     )
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
@@ -131,24 +139,19 @@ PLAN_LIMITS = {
     },
 }
 
-# =============== Платежи (Telegram Payments / ЮKassa через провайдера) ===============
+# =============== Платежи ===============
 
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")  # может быть пустым
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "RUB")
 
-# Цены в минимальных единицах валюты (копейки для RUB)
 PLAN_PRICES = {
-    "pro": int(os.getenv("PLAN_PRO_PRICE", "19900")),  # 199.00 RUB
-    "vip": int(os.getenv("PLAN_VIP_PRICE", "49900")),  # 499.00 RUB
+    "pro": int(os.getenv("PLAN_PRO_PRICE", "19900")),
+    "vip": int(os.getenv("PLAN_VIP_PRICE", "49900")),
 }
 
-# Флаг: включены ли платежи вообще
 PAYMENTS_ENABLED = bool(PAYMENT_PROVIDER_TOKEN)
 
-# =============== Реферальные лимиты ===============
+# =============== Рефералка и контекст ===============
 
 REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))
-
-# =============== Диалоговый контекст ===============
-
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
