@@ -1,226 +1,203 @@
+from __future__ import annotations
+
 import os
-import json
-import time
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Mapping, Dict
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# === ENV ===
-
-CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN", "").strip()
+# Токен и URL Crypto Pay API
+CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
 CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api").rstrip("/")
 
-# Актив, в котором выставляем счёт.
-# По умолчанию TON, потому что мы уже знаем, что он у тебя работает.
-# Если позже включишь USDT в Crypto Bot – можешь добавить в .env:
-#   CRYPTO_PAY_ASSET=USDT
-CRYPTO_PAY_ASSET = os.getenv("CRYPTO_PAY_ASSET", "TON").strip() or "TON"
+# Актив, в котором выставляется счёт: TON / USDT / и т.д.
+# По умолчанию TON, чтобы точно работало с твоим мерчантом
+CRYPTO_PAY_ASSET = (os.getenv("CRYPTO_PAY_ASSET") or "TON").upper().strip() or "TON"
 
-
-class CryptoPayError(Exception):
-    """Ошибка работы с Crypto Bot API."""
-
-
-# === Настройки тарифов ===
-#
-# Один и тот же тариф может иметь несколько кодов, чтобы не ломать
-# существующую логику в других файлах (на всякий случай).
-
-PLAN_AMOUNTS: Dict[str, str] = {
-    # 1 месяц
-    "month": "5",
-    "m1": "5",
-    "1m": "5",
-    "premium_month": "5",
-
-    # 3 месяца
-    "3months": "12",
-    "m3": "12",
-    "3m": "12",
-    "premium_3m": "12",
-
-    # 12 месяцев
-    "year": "60",
-    "12m": "60",
-    "m12": "60",
-    "premium_12m": "60",
+# Количество месяцев по кодам тарифов
+PLAN_MONTHS: Dict[str, int] = {
+    "1m": 1,
+    "3m": 3,
+    "12m": 12,
 }
 
-PLAN_TITLES: Dict[str, str] = {
-    "month": "1 месяц",
-    "m1": "1 месяц",
-    "1m": "1 месяц",
-    "premium_month": "1 месяц",
-    "3months": "3 месяца",
-    "m3": "3 месяца",
-    "3m": "3 месяца",
-    "premium_3m": "3 месяца",
-    "year": "12 месяцев",
-    "12m": "12 месяцев",
-    "m12": "12 месяцев",
-    "premium_12m": "12 месяцев",
+# Цены по тарифам (в единицах CRYPTO_PAY_ASSET)
+# 5 / 12 / 60 — как ты просил
+PLAN_PRICES: Dict[str, float] = {
+    "1m": 5.0,
+    "3m": 12.0,
+    "12m": 60.0,
 }
 
-DEFAULT_AMOUNT = "5"
-DEFAULT_TITLE = "1 месяц"
+
+class CryptoPayError(RuntimeError):
+    """Любая ошибка при работе с Crypto Pay API."""
 
 
-# === Вспомогательный запрос к Crypto Bot ===
-
-async def _crypto_post(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+async def _crypto_post(method: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
     """
-    Вызов метода Crypto Bot API.
+    Низкоуровневый вызов Crypto Pay API.
 
-    :param method: имя метода, например 'createInvoice' или 'getInvoices'
-    :param params: словарь параметров
-    :return: словарь result из ответа API
-    :raises CryptoPayError: при сетевой ошибке или ошибке API
+    :param method: имя метода, например 'createInvoice'
+    :param payload: JSON-параметры запроса
+    :return: поле 'result' из ответа CryptoBot
     """
     if not CRYPTO_PAY_API_TOKEN:
-        raise CryptoPayError("CRYPTO_PAY_API_TOKEN не задан в .env")
+        raise CryptoPayError("Environment variable CRYPTO_PAY_API_TOKEN is not set")
 
     url = f"{CRYPTO_PAY_API_URL}/{method}"
 
-    headers = {
-        "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-    logger.info("CryptoBot request %s params=%s", method, params)
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(url, headers=headers, json=params)
-    except Exception as exc:
-        logger.exception("Network error while calling Crypto Bot API")
-        raise CryptoPayError(f"Сетевая ошибка при обращении к Crypto Bot: {exc}") from exc
-
-    if response.status_code != 200:
-        logger.error("Crypto Bot HTTP %s: %s", response.status_code, response.text)
-        raise CryptoPayError(
-            f"Crypto Bot вернул HTTP {response.status_code}: {response.text}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={"Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN},
         )
 
     try:
-        data = response.json()
+        data = resp.json()
     except Exception as exc:
-        logger.error("Cannot parse Crypto Bot response as JSON: %s", response.text)
-        raise CryptoPayError(f"Некорректный ответ от Crypto Bot: {exc}") from exc
+        logger.exception("CRYPTOBOT: invalid JSON response: %s", resp.text)
+        raise CryptoPayError("Invalid response from CryptoBot") from exc
 
     if not data.get("ok"):
-        # Логируем подробности, чтобы их можно было посмотреть через journalctl
-        logger.error("Crypto Bot API error: %r", data)
-        raise CryptoPayError(f"Crypto Bot вернул ошибку: {data!r}")
+        # Здесь будет видно, что именно вернул CryptoBot
+        logger.error("CRYPTOBOT ERROR %s: %s", method, data)
+        raise CryptoPayError(str(data.get("error") or data))
 
     result = data.get("result")
-    if not isinstance(result, dict):
-        logger.error("Unexpected Crypto Bot 'result': %r", result)
-        raise CryptoPayError("Некорректный формат ответа Crypto Bot (result)")
+    if result is None:
+        raise CryptoPayError("CryptoBot response has no 'result' field")
 
     return result
 
 
-# === Публичные функции, которые используются в других модулях ===
-
-async def create_invoice(
-    plan_code: str,
-    telegram_id: int,
-    username: str | None = None,
-) -> Tuple[str, str]:
+async def create_invoice(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
     """
-    Создать счёт в Crypto Bot.
+    Гибкая обёртка над createInvoice.
 
-    :param plan_code: код плана (month / 3months / year, либо твой старый код)
-    :param telegram_id: id пользователя в Telegram
-    :param username: username пользователя (для описания)
-    :return: (bot_invoice_url, invoice_id) — ссылка на счёт и его id
-    :raises CryptoPayError: если что-то пошло не так
+    Поддерживает разные варианты вызова (чтобы не ломать твой текущий код):
+
+        await create_invoice("1m")
+        await create_invoice(user_id, "1m")
+        await create_invoice(user_id=user_id, plan_code="1m", description="...")
+        await create_invoice(plan="1m", amount=5)
+
+    Возвращает словарь result из CryptoBot, в котором есть:
+      - invoice_id
+      - pay_url
+      - bot_invoice_url
+      и т.п.
     """
+    # ---------- определяем plan_code ----------
+    plan_code = kwargs.get("plan_code") or kwargs.get("plan")
+    if plan_code is None:
+        # Если план передали позиционно: (user_id, "1m") или просто ("1m",)
+        if len(args) >= 2 and isinstance(args[1], str):
+            plan_code = args[1]
+        elif len(args) >= 1 and isinstance(args[0], str):
+            plan_code = args[0]
 
-    # Цена и подпись тарифа по коду. Если код неизвестен — считаем, что это 1 месяц.
-    amount = PLAN_AMOUNTS.get(plan_code, DEFAULT_AMOUNT)
-    title_suffix = PLAN_TITLES.get(plan_code, DEFAULT_TITLE)
+    if not isinstance(plan_code, str):
+        raise CryptoPayError(
+            f"Unsupported call to create_invoice, can't detect plan_code; "
+            f"args={args}, kwargs={kwargs}"
+        )
 
-    description = f"Подписка AI Medicine Premium — {title_suffix}"
+    plan_code = plan_code.strip()
+    if plan_code not in PLAN_PRICES:
+        raise CryptoPayError(f"Unknown subscription plan: {plan_code}")
 
-    # payload, чтобы потом можно было сопоставить платёж с пользователем/тарифом
-    payload = json.dumps(
-        {
-            "u": telegram_id,
-            "p": plan_code,
-            "ts": int(time.time()),
-        },
-        ensure_ascii=False,
+    # ---------- определяем сумму ----------
+    amount = kwargs.get("amount") or kwargs.get("price") or PLAN_PRICES[plan_code]
+    try:
+        amount_value = float(amount)
+    except (TypeError, ValueError):
+        raise CryptoPayError(f"Invalid amount: {amount!r}")
+
+    if amount_value <= 0:
+        raise CryptoPayError("Amount must be positive")
+
+    # ---------- описание ----------
+    description = kwargs.get("description") or f"Подписка AI Medicine Premium — план {plan_code}"
+    hidden_message = kwargs.get("hidden_message") or (
+        "После оплаты вернись в бот — подписка активируется автоматически."
     )
 
-    params = {
-        "asset": CRYPTO_PAY_ASSET,      # по умолчанию TON
-        "amount": amount,               # строкой, как рекомендует большинство API
-        "description": description,
-        "payload": payload,
-        "allow_comments": False,
-        "allow_anonymous": False,
-        # счёт живёт 1 час; можно изменить при желании
-        "expires_in": 3600,
+    payload: dict[str, Any] = {
+        "asset": CRYPTO_PAY_ASSET,
+        "amount": str(amount_value),
+        "description": description[:1024],
+        "hidden_message": hidden_message[:4096],
+        "expires_in": 3600,  # 1 час на оплату
     }
 
-    result = await _crypto_post("createInvoice", params)
+    # Опциональное поле payload — удобно привязать invoice к пользователю
+    invoice_payload = kwargs.get("invoice_payload")
+    if invoice_payload is None and args:
+        # Если первым аргументом передали user_id (int) — используем его
+        if isinstance(args[0], int):
+            invoice_payload = f"user:{args[0]}:{plan_code}"
 
-    invoice_id = str(result.get("invoice_id"))
-    bot_invoice_url = result.get("bot_invoice_url") or result.get("pay_url")
-
-    if not invoice_id or not bot_invoice_url:
-        logger.error("Unexpected createInvoice result: %r", result)
-        raise CryptoPayError("Crypto Bot вернул некорректные данные при создании счёта")
+    if invoice_payload is not None:
+        payload["payload"] = str(invoice_payload)[:128]
 
     logger.info(
-        "Created invoice id=%s plan=%s amount=%s asset=%s for user=%s",
-        invoice_id,
-        plan_code,
-        amount,
+        "CRYPTOBOT: creating invoice method=createInvoice asset=%s amount=%s plan=%s payload=%r",
         CRYPTO_PAY_ASSET,
-        telegram_id,
+        amount_value,
+        plan_code,
+        payload.get("payload"),
     )
 
-    # ВАЖНО: возвращаем tuple (url, id), как ожидает существующий код.
-    return bot_invoice_url, invoice_id
+    result = await _crypto_post("createInvoice", payload)
+    return result
 
 
-async def fetch_invoices_statuses(invoice_ids: List[str]) -> Dict[str, str]:
+async def fetch_invoices_statuses(*args: Any, **kwargs: Any) -> dict[str, Mapping[str, Any]]:
     """
-    Получить статусы нескольких счетов.
+    Получить статусы инвойсов из CryptoBot.
 
-    :param invoice_ids: список id счетов Crypto Bot (строки)
-    :return: словарь {invoice_id: status}
-    :raises CryptoPayError: при ошибке запроса
+    Допустимые варианты вызова:
+
+        await fetch_invoices_statuses(["123", "456"])
+        await fetch_invoices_statuses(invoice_ids=["123", "456"])
+
+    Возвращает словарь:
+        { "123": invoice_dict, "456": invoice_dict, ... }
     """
-    clean_ids = [str(i).strip() for i in invoice_ids if str(i).strip()]
-    if not clean_ids:
+    invoice_ids = kwargs.get("invoice_ids")
+    if invoice_ids is None and args:
+        invoice_ids = args[0]
+
+    if not invoice_ids:
         return {}
 
-    params = {"invoice_ids": ",".join(clean_ids)}
+    ids_list = [str(i) for i in invoice_ids]
 
-    result = await _crypto_post("getInvoices", params)
+    payload = {"invoice_ids": ids_list}
 
-    # В ответе от Crypto Bot result — это словарь с ключом "items"
-    items = result.get("items")
-    if not isinstance(items, list):
-        logger.error("Unexpected getInvoices result: %r", result)
-        raise CryptoPayError("Crypto Bot вернул некорректные данные при запросе статусов")
+    logger.info("CRYPTOBOT: fetching invoices statuses for %s", ids_list)
 
-    statuses: Dict[str, str] = {}
-    for item in items:
-        try:
-            inv_id = str(item["invoice_id"])
-            status = str(item["status"])
-        except Exception:
-            logger.warning("Bad invoice item in response: %r", item)
-            continue
+    result = await _crypto_post("getInvoices", payload)
 
-        statuses[inv_id] = status
+    # CryptoBot возвращает список инвойсов
+    by_id: dict[str, Mapping[str, Any]] = {}
+    if isinstance(result, list):
+        for inv in result:
+            inv_id = str(inv.get("invoice_id") or inv.get("id"))
+            if inv_id:
+                by_id[inv_id] = inv
 
-    logger.info("Fetched invoice statuses: %s", statuses)
-    return statuses
+    return by_id
+
+
+__all__ = [
+    "CryptoPayError",
+    "PLAN_MONTHS",
+    "PLAN_PRICES",
+    "create_invoice",
+    "fetch_invoices_statuses",
+]
