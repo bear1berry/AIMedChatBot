@@ -14,7 +14,13 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from bot.config import BOT_TOKEN, ASSISTANT_MODES, DEFAULT_MODE_KEY
+from bot.config import (
+    BOT_TOKEN,
+    ASSISTANT_MODES,
+    DEFAULT_MODE_KEY,
+    PLAN_LIMITS,
+    REF_BONUS_PER_USER,
+)
 from services.llm import ask_llm_stream
 from services.storage import Storage
 
@@ -90,6 +96,26 @@ router = Router()
 
 
 # =========================
+#  Вспомогательные функции
+# =========================
+
+
+def _ref_level(invited_count: int) -> str:
+    if invited_count >= 20:
+        return "Амбассадор"
+    if invited_count >= 5:
+        return "Партнёр"
+    if invited_count >= 1:
+        return "Новичок"
+    return "—"
+
+
+def _plan_description(plan: str) -> str:
+    cfg = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    return cfg.get("description", "")
+
+
+# =========================
 #  Handlers
 # =========================
 
@@ -113,7 +139,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         if status == "ok":
             ref_msg = (
                 "\n\n🎁 Твой аккаунт привязан к реферальному коду. "
-                "Ты получил бонусные лимиты."
+                "Ты получил бонусные дневные лимиты."
             )
         elif status == "not_found":
             ref_msg = "\n\n⚠️ Реферальный код не найден, но бот всё равно доступен."
@@ -123,13 +149,16 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
             ref_msg = "\n\n⚠️ Нельзя использовать собственный реферальный код."
 
     mode_cfg = ASSISTANT_MODES[state.mode_key]
+    limits = storage.get_limits(user_id)
 
     text = (
         "🖤 <b>BlackBoxGPT</b>\n\n"
         "Твой персональный ИИ-ассистент.\n"
         "Выбери режим внизу и просто напиши запрос.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
-        f"<i>{mode_cfg['description']}</i>"
+        f"<i>{mode_cfg['description']}</i>\n\n"
+        f"Тариф: <b>{limits['plan_title']}</b>\n"
+        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов."
         f"{ref_msg}"
     )
 
@@ -161,16 +190,22 @@ async def cmd_profile(message: Message) -> None:
     stats = storage.get_referral_stats(user_id)
 
     mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+    level = _ref_level(stats["invited_count"])
 
     text = (
         "👤 <b>Твой профиль</b>\n\n"
-        f"Режим по умолчанию: <b>{mode_cfg['title']}</b>\n"
-        f"Сообщений: <b>{dossier.get('messages_count', 0)}</b>\n"
-        f"Последний запрос: <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+        f"<b>Режим по умолчанию:</b> {mode_cfg['title']}\n"
+        f"<b>Сообщений всего:</b> {dossier.get('messages_count', 0)}\n"
+        f"<b>Последний запрос:</b> <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+        "💳 <b>Тариф</b>\n"
+        f"Текущий тариф: <b>{stats['plan_title']}</b>\n"
+        f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b> запросов\n"
+        f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
+        f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n"
+        f"Всего запросов за всё время: <b>{stats['total_requests']}</b>\n\n"
         "🎁 <b>Реферальная система</b>\n"
         f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
-        f"Приглашено: <b>{stats['invited_count']}</b>\n"
-        f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n"
+        f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n"
     )
 
     await message.answer(
@@ -196,6 +231,29 @@ async def cmd_reset(message: Message) -> None:
     )
 
 
+@router.message(Command("plans"))
+async def cmd_plans(message: Message) -> None:
+    """
+    Краткий обзор тарифов (пока без реальной оплаты/апгрейда).
+    """
+    lines = ["💳 <b>Тарифы BlackBoxGPT</b>\n"]
+    for key, cfg in PLAN_LIMITS.items():
+        lines.append(
+            f"• <b>{cfg['title']}</b> ({key}) — до <b>{cfg['daily_base']}</b> запросов в день."
+        )
+        lines.append(f"  {cfg.get('description', '')}\n")
+
+    lines.append(
+        f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
+        "запросов в день к своему тарифу."
+    )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=build_main_keyboard(get_user_state(message.from_user.id).mode_key),
+    )
+
+
 @router.callback_query(F.data.startswith("mode:"))
 async def cb_change_mode(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
@@ -210,12 +268,14 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
     storage.update_user_mode(user_id, mode_key)
 
     mode_cfg = ASSISTANT_MODES[mode_key]
+    limits = storage.get_limits(user_id)
 
     new_text = (
         "Режим обновлён ✅\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
-        "Теперь просто напиши свой запрос."
+        f"Тариф: <b>{limits['plan_title']}</b>\n"
+        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>."
     )
 
     try:
@@ -252,21 +312,28 @@ async def cb_service(callback: CallbackQuery) -> None:
         dossier = user.get("dossier", {})
         stats = storage.get_referral_stats(user_id)
         mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+        level = _ref_level(stats["invited_count"])
 
         text = (
             "👤 <b>Твой профиль</b>\n\n"
-            f"Режим по умолчанию: <b>{mode_cfg['title']}</b>\n"
-            f"Сообщений: <b>{dossier.get('messages_count', 0)}</b>\n"
-            f"Последний запрос: <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+            f"<b>Режим по умолчанию:</b> {mode_cfg['title']}\n"
+            f"<b>Сообщений всего:</b> {dossier.get('messages_count', 0)}\n"
+            f"<b>Последний запрос:</b> <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+            "💳 <b>Тариф</b>\n"
+            f"Текущий тариф: <b>{stats['plan_title']}</b>\n"
+            f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b> запросов\n"
+            f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
+            f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n"
+            f"Всего запросов за всё время: <b>{stats['total_requests']}</b>\n\n"
             "🎁 <b>Реферальная система</b>\n"
             f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
-            f"Приглашено: <b>{stats['invited_count']}</b>\n"
-            f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n"
+            f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n"
         )
     elif action == "referral":
         # Генерация и показ реферальной ссылки
         code = storage.ensure_ref_code(user_id)
         stats = storage.get_referral_stats(user_id)
+        level = _ref_level(stats["invited_count"])
 
         me = await callback.message.bot.get_me()
         username = me.username or "YourBot"
@@ -274,11 +341,14 @@ async def cb_service(callback: CallbackQuery) -> None:
 
         text = (
             "🎁 <b>Твоя реферальная программа</b>\n\n"
-            f"Код: <code>{code}</code>\n"
-            f"Ссылка: <code>{link}</code>\n\n"
-            f"Приглашено: <b>{stats['invited_count']}</b>\n"
-            f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n\n"
-            "Каждый приглашённый через твою ссылку даёт бонусные лимиты запросов."
+            f"Тариф: <b>{stats['plan_title']}</b>\n"
+            f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b>\n"
+            f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
+            f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n\n"
+            f"Твой код: <code>{code}</code>\n"
+            f"Твоя ссылка: <code>{link}</code>\n\n"
+            f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n\n"
+            "Каждый приглашённый через твою ссылку даёт дополнительные запросы в день."
         )
     else:
         text = "Сервис в разработке."
@@ -297,7 +367,7 @@ async def handle_text(message: Message) -> None:
     Поддерживает:
       - диалоговый контекст (history)
       - стриминг ответа (по чанкам)
-      - визуальный UX (typing-индикатор, структурированный ответ за счёт system_prompt)
+      - тарифы и суточные лимиты
     """
     user_id = message.from_user.id
     text = message.text or ""
@@ -314,13 +384,15 @@ async def handle_text(message: Message) -> None:
 
     # Проверяем лимиты
     if not storage.can_make_request(user_id):
-        used, limit = storage.get_limits(user_id)
+        limits = storage.get_limits(user_id)
         await message.answer(
             (
-                "⚠️ Лимит запросов исчерпан.\n\n"
-                f"Твои запросы: <b>{used}/{limit}</b>.\n"
+                "⚠️ Лимит запросов на сегодня исчерпан.\n\n"
+                f"Тариф: <b>{limits['plan_title']}</b>\n"
+                f"Сегодня использовано: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n\n"
                 "Пригласи друзей по реферальной ссылке (кнопка «🎁 Реферал» внизу), "
-                "чтобы получить дополнительные лимиты."
+                "чтобы получить дополнительные дневные лимиты.\n"
+                "Также позже здесь появятся платные тарифы / апгрейды."
             ),
             reply_markup=build_main_keyboard(state.mode_key),
         )
