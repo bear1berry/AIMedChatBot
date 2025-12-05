@@ -50,6 +50,9 @@ class UserState:
 
 user_states: Dict[int, UserState] = {}
 
+# Сообщение-панель с таскбаром на чат (по chat_id)
+panel_messages: Dict[int, int] = {}
+
 
 def get_user_state(user_id: int) -> UserState:
     """
@@ -69,8 +72,8 @@ def get_user_state(user_id: int) -> UserState:
 
 def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
     """
-    Нижний таскбар: режимы ассистента + сервисные кнопки.
-    Только один такой таскбар должен "жить" в последнем служебном сообщении.
+    Нижний таскбар: режимы ассистента + сервисные кнопки + (опционально) Pro/VIP.
+    Все интерактивные действия — только здесь.
     """
     mode_buttons = [
         InlineKeyboardButton(
@@ -87,12 +90,17 @@ def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💳 Тарифы", callback_data="service:plans"),
     ]
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            mode_buttons,
-            service_buttons,
+    rows = [mode_buttons, service_buttons]
+
+    # Кнопки покупки тарифов тоже часть нижнего таскбара
+    if PAYMENTS_ENABLED:
+        buy_buttons = [
+            InlineKeyboardButton(text="Pro ⭐", callback_data="buy:pro"),
+            InlineKeyboardButton(text="VIP 💎", callback_data="buy:vip"),
         ]
-    )
+        rows.append(buy_buttons)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
     return keyboard
 
 
@@ -131,13 +139,13 @@ def _plan_description(plan: str) -> str:
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     user_id = message.from_user.id
+    chat_id = message.chat.id
     state = get_user_state(user_id)
 
     # Обработка реферального кода из /start
     ref_msg = ""
     ref_code_raw = (command.args or "").strip() if command else ""
     if ref_code_raw:
-        # Ожидаем формат ref_КОД, но если без префикса — тоже съедим
         arg = ref_code_raw.strip()
         if arg.lower().startswith("ref_"):
             arg = arg[4:]
@@ -162,7 +170,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     text = (
         "🖤 <b>BlackBoxGPT</b>\n\n"
         "Твой персональный ИИ-ассистент.\n"
-        "Выбери режим внизу и просто напиши запрос.\n\n"
+        "Навигация — только нижний таскбар, просто пиши запрос.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
         f"Тариф: <b>{limits['plan_title']}</b>\n"
@@ -170,10 +178,28 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         f"{ref_msg}"
     )
 
-    await message.answer(
+    kb = build_main_keyboard(state.mode_key)
+
+    # Пытаемся обновить существующую панель, а не плодить новые
+    panel_msg_id = panel_messages.get(chat_id)
+    if panel_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=panel_msg_id,
+                text=text,
+                reply_markup=kb,
+            )
+            return
+        except Exception:
+            # если не удалось (сообщение удалено и т.п.) — создаём новое
+            pass
+
+    sent = await message.answer(
         text,
-        reply_markup=build_main_keyboard(state.mode_key),
+        reply_markup=kb,
     )
+    panel_messages[chat_id] = sent.message_id
 
 
 @router.message(Command("mode"))
@@ -235,7 +261,8 @@ async def cmd_reset(message: Message) -> None:
 @router.message(Command("plans"))
 async def cmd_plans(message: Message) -> None:
     """
-    Обзор тарифов + кнопки оплаты.
+    Обзор тарифов (только текст).
+    Покупка — через нижний таскбар (кнопки Pro/VIP).
     """
     user_id = message.from_user.id
     limits = storage.get_limits(user_id)
@@ -255,32 +282,9 @@ async def cmd_plans(message: Message) -> None:
         f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
         "запросов в день к своему тарифу.\n"
     )
+    lines.append("Купить Pro или VIP можно через нижний таскбар.")
 
-    if PAYMENTS_ENABLED:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Купить Pro", callback_data="buy:pro"),
-                    InlineKeyboardButton(text="Купить VIP", callback_data="buy:vip"),
-                ],
-            ]
-        )
-    else:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Оплата скоро будет доступна",
-                        callback_data="service:plans_info",
-                    )
-                ]
-            ]
-        )
-
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=keyboard,
-    )
+    await message.answer("\n".join(lines))
 
 
 # =========================
@@ -291,6 +295,7 @@ async def cmd_plans(message: Message) -> None:
 @router.callback_query(F.data.startswith("mode:"))
 async def cb_change_mode(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
     state = get_user_state(user_id)
 
     _, mode_key = callback.data.split(":", 1)
@@ -312,13 +317,17 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
         f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>."
     )
 
+    kb = build_main_keyboard(state.mode_key)
+
     try:
         await callback.message.edit_text(
             new_text,
-            reply_markup=build_main_keyboard(state.mode_key),
+            reply_markup=kb,
         )
+        panel_messages[chat_id] = callback.message.message_id
     except Exception:
-        await callback.message.answer(new_text)
+        sent = await callback.message.answer(new_text, reply_markup=kb)
+        panel_messages[chat_id] = sent.message_id
 
     await callback.answer("Режим переключен")
 
@@ -326,6 +335,7 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("service:"))
 async def cb_service(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
     state = get_user_state(user_id)
     _, action = callback.data.split(":", 1)
 
@@ -382,7 +392,6 @@ async def cb_service(callback: CallbackQuery) -> None:
             "Каждый приглашённый через твою ссылку даёт дополнительные запросы в день."
         )
     elif action == "plans":
-        # Обзор тарифов прямо в этом же сервисном сообщении
         limits = storage.get_limits(user_id)
         lines = [
             "💳 <b>Тарифы BlackBoxGPT</b>\n",
@@ -399,7 +408,7 @@ async def cb_service(callback: CallbackQuery) -> None:
             f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
             "запросов в день к своему тарифу.\n"
         )
-
+        lines.append("Купить Pro или VIP можно кнопками в нижнем таскбаре.")
         text = "\n".join(lines)
     elif action == "plans_info":
         text = (
@@ -410,13 +419,17 @@ async def cb_service(callback: CallbackQuery) -> None:
     else:
         text = "Сервис в разработке."
 
+    kb = build_main_keyboard(state.mode_key)
+
     try:
         await callback.message.edit_text(
             text,
-            reply_markup=build_main_keyboard(state.mode_key),
+            reply_markup=kb,
         )
+        panel_messages[chat_id] = callback.message.message_id
     except Exception:
-        await callback.message.answer(text)
+        sent = await callback.message.answer(text, reply_markup=kb)
+        panel_messages[chat_id] = sent.message_id
 
     await callback.answer()
 
