@@ -6,6 +6,8 @@ import os
 import textwrap
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
@@ -73,11 +75,12 @@ logger = logging.getLogger(__name__)
 # Aiogram setup
 # ---------------------------------------------------------------------------
 
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+    ),
+)
 
 # ---------------------------------------------------------------------------
 # UI constants
@@ -967,4 +970,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
