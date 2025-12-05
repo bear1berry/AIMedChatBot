@@ -69,7 +69,11 @@ ASSISTANT_MODES = {
 DEFAULT_MODE_KEY = "universal"
 
 # =============== Реферальные лимиты ===============
-# Можешь подправить под свою монетизацию
 
 REF_BASE_LIMIT = int(os.getenv("REF_BASE_LIMIT", "1000"))          # базовый лимит запросов
 REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "200"))   # бонус за каждого приглашённого
+
+# =============== Диалоговый контекст ===============
+
+# Сколько последних сообщений (user+assistant) хранить в истории для контекста
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
