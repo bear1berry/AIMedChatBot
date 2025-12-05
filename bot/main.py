@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatAction
 from aiogram.filters import CommandStart, Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import (
@@ -297,6 +297,7 @@ async def handle_text(message: Message) -> None:
     Поддерживает:
       - диалоговый контекст (history)
       - стриминг ответа (по чанкам)
+      - визуальный UX (typing-индикатор, структурированный ответ за счёт system_prompt)
     """
     user_id = message.from_user.id
     text = message.text or ""
@@ -325,6 +326,9 @@ async def handle_text(message: Message) -> None:
         )
         return
 
+    # Показываем typing-индикатор
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
     waiting_message = await message.answer(
         "⌛ Обрабатываю запрос в режиме "
         f"<b>{mode_cfg['title']}</b>...\n\nГенерация идёт в реальном времени.",
@@ -342,12 +346,19 @@ async def handle_text(message: Message) -> None:
 
     answer_text = ""
     chunk_counter = 0
-    EDIT_EVERY_N_CHUNKS = 5  # чтобы не спамить слишком часто edit_message_text
+    EDIT_EVERY_N_CHUNKS = 3  # апдейтим сообщение почаще для более плавного UX
 
     try:
         async for chunk in ask_llm_stream(state.mode_key, user_prompt, history):
             answer_text += chunk
             chunk_counter += 1
+
+            # поддерживаем typing-индикатор
+            if chunk_counter % 5 == 0:
+                try:
+                    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+                except Exception:
+                    pass
 
             if chunk_counter % EDIT_EVERY_N_CHUNKS == 0:
                 try:
