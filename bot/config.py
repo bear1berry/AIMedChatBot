@@ -1,8 +1,15 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# грузим .env из текущей директории (WorkingDirectory из systemd)
-load_dotenv()
+# ================= БАЗОВЫЕ ПУТИ =================
+
+# /home/bear1berry/AIMedChatBot/bot/config.py -> BASE_DIR = /home/bear1berry/AIMedChatBot
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+
+# Явно грузим .env из корня проекта, независимо от того, откуда нас запустили
+load_dotenv(dotenv_path=ENV_PATH)
 
 # =============== Общие настройки ===============
 
@@ -10,10 +17,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables (check .env or systemd env)")
+    raise RuntimeError(
+        f"BOT_TOKEN is not set in environment variables. "
+        f"Проверь, что файл {ENV_PATH} существует и в нём есть строка BOT_TOKEN=..."
+    )
 
 if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is not set in environment variables (check .env)")
+    raise RuntimeError(
+        f"DEEPSEEK_API_KEY is not set in environment variables. "
+        f"Проверь, что файл {ENV_PATH} содержит DEEPSEEK_API_KEY=..."
+    )
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -120,7 +133,7 @@ PLAN_LIMITS = {
 
 # =============== Платежи (Telegram Payments / ЮKassa через провайдера) ===============
 
-PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")  # выдаёт BotFather
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")  # может быть пустым
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "RUB")
 
 # Цены в минимальных единицах валюты (копейки для RUB)
@@ -134,10 +147,8 @@ PAYMENTS_ENABLED = bool(PAYMENT_PROVIDER_TOKEN)
 
 # =============== Реферальные лимиты ===============
 
-# Бонус к дневному лимиту за каждого приглашённого пользователя
-REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))  # +20 запросов в день за каждого реферала
+REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))
 
 # =============== Диалоговый контекст ===============
 
-# Сколько последних сообщений (user+assistant) хранить в истории для контекста LLM
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
