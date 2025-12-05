@@ -52,7 +52,7 @@ ASSISTANT_MODES = {
     },
     "coach": {
         "title": "🔥 Наставник",
-        "description": "Личностный рост, дисциплина, мотивация и разбор целей.",
+        "description": "Режим, дисциплина, мотивация и разбор целей.",
         "system_prompt": (
             "Ты — наставник и коуч. Помогаешь выстраивать режим, цели, привычки. "
             "Говори честно, но поддерживающе. Предлагай конкретные шаги."
@@ -98,17 +98,14 @@ PLAN_LIMITS = {
 # Бонус за одного приглашённого пользователя (суточный лимит)
 REF_BONUS_PER_USER = 5
 
-# Цены тарифов для Payments API (в минорных единицах: 100 = 1 RUB)
-PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
-PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "RUB")
-
-PLAN_PRICES = {
-    # Пример: 199 рублей => 19900
-    "pro": int(os.getenv("PLAN_PRICE_PRO", "19900") or "19900"),
-    "vip": int(os.getenv("PLAN_PRICE_VIP", "49900") or "49900"),
-}
-
-PAYMENTS_ENABLED = bool(PAYMENT_PROVIDER_TOKEN)
+# Ссылки оплаты в USDT через CryptoBot (указываешь в .env)
+# Пример:
+# CRYPTO_USDT_LINK_MONTH=https://t.me/CryptoBot?start=XXXX
+# CRYPTO_USDT_LINK_3M=https://t.me/CryptoBot?start=YYYY
+# CRYPTO_USDT_LINK_YEAR=https://t.me/CryptoBot?start=ZZZZ
+CRYPTO_USDT_LINK_MONTH = os.getenv("CRYPTO_USDT_LINK_MONTH", "")
+CRYPTO_USDT_LINK_3M = os.getenv("CRYPTO_USDT_LINK_3M", "")
+CRYPTO_USDT_LINK_YEAR = os.getenv("CRYPTO_USDT_LINK_YEAR", "")
 
 # Сколько сообщений истории хранить на пользователя
 MAX_HISTORY_MESSAGES = 20
