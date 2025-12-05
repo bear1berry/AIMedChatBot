@@ -1,664 +1,529 @@
+from __future__ import annotations
+
 import os
 import sqlite3
 import time
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-# Подгружаем .env, чтобы взять путь к БД
 load_dotenv()
 
 DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscription.db")
 
 
-def _get_connection() -> sqlite3.Connection:
+# ---------------------------------------------------------------------------
+# Базовые helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    return dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Инициализация БД
+# ---------------------------------------------------------------------------
+
+
 def init_db() -> None:
-    """
-    Инициализация БД + мягкие миграции:
-    - создаём таблицы, если их нет
-    - добавляем недостающие колонки в users / payments
-    """
-    conn = _get_connection()
+    """Создаём таблицы, если их ещё нет."""
+
+    conn = _get_conn()
     cur = conn.cursor()
 
-    # Базовая схема users
+    # Пользователи
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE NOT NULL,
-            username TEXT,
-            is_admin INTEGER DEFAULT 0,
-            free_messages_used INTEGER DEFAULT 0,
-            total_messages INTEGER DEFAULT 0,
-            total_tokens INTEGER DEFAULT 0,
-            premium_until INTEGER,
-            created_at INTEGER,
-            updated_at INTEGER
-        )
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id       INTEGER NOT NULL UNIQUE,
+            username          TEXT,
+            full_name         TEXT,
+            is_admin          INTEGER DEFAULT 0,
+
+            mode              TEXT DEFAULT 'universal',
+            note              TEXT,
+
+            free_usage_date   TEXT,
+            free_usage_count  INTEGER DEFAULT 0,
+
+            premium_until     INTEGER,             -- unixtime до какого момента premium
+
+            referral_code     TEXT UNIQUE,
+
+            created_at        INTEGER,
+            updated_at        INTEGER
+        );
         """
     )
 
-    # Базовая схема payments
+    # Реферальные связи
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_id INTEGER UNIQUE NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            currency TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at INTEGER,
-            paid_at INTEGER,
-            payload TEXT
-        )
+        CREATE TABLE IF NOT EXISTS referrals (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_telegram_id   INTEGER NOT NULL,
+            referred_telegram_id   INTEGER NOT NULL,
+            created_at             INTEGER,
+            UNIQUE(referrer_telegram_id, referred_telegram_id)
+        );
         """
     )
 
-    # Миграции для users
-    cur.execute("PRAGMA table_info(users)")
-    existing_cols = {row[1] for row in cur.fetchall()}
-
-    needed_user_columns = {
-        "username": "TEXT",
-        "is_admin": "INTEGER DEFAULT 0",
-        "free_messages_used": "INTEGER DEFAULT 0",
-        "total_messages": "INTEGER DEFAULT 0",
-        "total_tokens": "INTEGER DEFAULT 0",
-        "premium_until": "INTEGER",
-        "created_at": "INTEGER",
-        "updated_at": "INTEGER",
-    }
-
-    for col_name, col_def in needed_user_columns.items():
-        if col_name not in existing_cols:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
-
-    # Миграции для payments
-    cur.execute("PRAGMA table_info(payments)")
-    existing_payment_cols = {row[1] for row in cur.fetchall()}
-
-    needed_payment_columns = {
-        "amount": "REAL NOT NULL DEFAULT 0",
-        "currency": "TEXT NOT NULL DEFAULT 'TON'",
-        "status": "TEXT NOT NULL DEFAULT 'active'",
-        "created_at": "INTEGER",
-        "paid_at": "INTEGER",
-        "payload": "TEXT",
-    }
-
-    for col_name, col_def in needed_payment_columns.items():
-        if col_name not in existing_payment_cols:
-            cur.execute(f"ALTER TABLE payments ADD COLUMN {col_name} {col_def}")
+    # Инвойсы (крипто-оплата)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invoices (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id    TEXT NOT NULL UNIQUE,
+            telegram_id   INTEGER NOT NULL,
+            plan_code     TEXT NOT NULL,
+            amount_usdt   REAL,
+            period_days   INTEGER,
+            pay_url       TEXT,
+            status        TEXT DEFAULT 'created',
+            created_at    INTEGER,
+            paid_at       INTEGER
+        );
+        """
+    )
 
     conn.commit()
     conn.close()
 
 
-def _row_to_user(row):
-    """
-    Преобразует строку из таблицы users в питоновский словарь.
-    Работает и со старой схемой (без колонки id), и с новой.
-    """
-    if row is None:
-        return None
-
-    # Какие ключи реально есть в строке
-    keys = set(row.keys())
-
-    # Определяем основной идентификатор пользователя
-    tg_id = None
-    if "telegram_id" in keys:
-        tg_id = row["telegram_id"]
-    elif "user_id" in keys:
-        tg_id = row["user_id"]
-    elif "id" in keys:
-        tg_id = row["id"]
-
-    # Базовые поля с безопасными значениями по умолчанию
-    username = row["username"] if "username" in keys else None
-    first_name = row["first_name"] if "first_name" in keys else None
-    last_name = row["last_name"] if "last_name" in keys else None
-
-    is_admin = row["is_admin"] if "is_admin" in keys else 0
-    is_premium = row["is_premium"] if "is_premium" in keys else 0
-    premium_until = row["premium_until"] if "premium_until" in keys else 0
-    total_messages = row["total_messages"] if "total_messages" in keys else 0
-
-    # Возвращаем и "id" (для обратной совместимости), и telegram_id
-    return {
-        "id": tg_id,                    # чтобы старый код, который ждал user["id"], не упал
-        "telegram_id": tg_id,
-        "username": username,
-        "first_name": first_name,
-        "last_name": last_name,
-        "is_admin": bool(is_admin),
-        "is_premium": bool(is_premium),
-        "premium_until": int(premium_until or 0),
-        "total_messages": int(total_messages or 0),
-    }
+# ---------------------------------------------------------------------------
+# Пользователь
+# ---------------------------------------------------------------------------
 
 
+def get_or_create_user(
+    telegram_id: int,
+    username: str | None = None,
+    full_name: str | None = None,
+    is_admin: bool = False,
+) -> Dict[str, Any]:
+    """Возвращает существующего пользователя или создаёт нового."""
 
-def get_or_create_user(telegram_id: int, username: Optional[str], is_admin: bool = False) -> Dict[str, Any]:
-    """
-    Возвращает пользователя из БД или создаёт нового.
-    Флаг is_admin обновляется, если ты добавил себя в ADMIN_USERNAMES.
-    """
-    conn = _get_connection()
+    now = int(time.time())
+    conn = _get_conn()
     cur = conn.cursor()
 
     cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
 
-    now_ts = int(time.time())
-
     if row:
-        # Обновляем username / is_admin при необходимости
+        # Обновим базовые поля (юзернейм мог поменяться)
         cur.execute(
             """
             UPDATE users
-            SET username = COALESCE(?, username),
-                is_admin = CASE WHEN ? THEN 1 ELSE is_admin END,
-                updated_at = ?
-            WHERE telegram_id = ?
+               SET username = COALESCE(?, username),
+                   full_name = COALESCE(?, full_name),
+                   is_admin = CASE WHEN ? THEN 1 ELSE is_admin END,
+                   updated_at = ?
+             WHERE telegram_id = ?
             """,
-            (username, int(is_admin), now_ts, telegram_id),
+            (username, full_name, is_admin, now, telegram_id),
         )
         conn.commit()
-
         cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
         row = cur.fetchone()
-        user = _row_to_user(row)
         conn.close()
-        return user
+        return dict(row)
 
-    # Создаём нового
     cur.execute(
         """
         INSERT INTO users (
-            telegram_id, username, is_admin,
-            free_messages_used, total_messages, total_tokens,
-            premium_until, created_at, updated_at
+            telegram_id, username, full_name, is_admin,
+            mode, free_usage_date, free_usage_count,
+            created_at, updated_at
         )
-        VALUES (?, ?, ?, 0, 0, 0, NULL, ?, ?)
+        VALUES (?, ?, ?, ?, 'universal', NULL, 0, ?, ?)
         """,
-        (telegram_id, username, int(is_admin), now_ts, now_ts),
+        (telegram_id, username, full_name, 1 if is_admin else 0, now, now),
     )
     conn.commit()
 
     cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
-    user = _row_to_user(row)
     conn.close()
-    return user
+    return dict(row)
 
 
 def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
-    conn = _get_connection()
+    conn = _get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
     conn.close()
-    if not row:
-        return None
-    return _row_to_user(row)
+    return _dict(row)
 
 
-def increment_usage(
-    telegram_id: int,
-    tokens_used: int = 0,
-    count_free_message: bool = True,
-) -> None:
-    """
-    Обновляем статистику использования:
-    - total_messages +1
-    - total_tokens + tokens_used
-    - free_messages_used +1 (если пользователь не в премиуме и count_free_message=True)
-    """
-    conn = _get_connection()
+# ---------------------------------------------------------------------------
+# Режимы, досье
+# ---------------------------------------------------------------------------
+
+
+def set_user_mode(telegram_id: int, mode: str) -> None:
+    conn = _get_conn()
     cur = conn.cursor()
-
+    now = int(time.time())
     cur.execute(
-        "SELECT free_messages_used, premium_until FROM users WHERE telegram_id = ?",
-        (telegram_id,),
+        "UPDATE users SET mode = ?, updated_at = ? WHERE telegram_id = ?",
+        (mode, now, telegram_id),
     )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-
-    free_used = row["free_messages_used"] or 0
-    premium_until = row["premium_until"]
-    now_ts = int(time.time())
-    is_premium = bool(premium_until and premium_until > now_ts)
-
-    if (not is_premium) and count_free_message:
-        free_used += 1
-
-    cur.execute(
-        """
-        UPDATE users
-        SET free_messages_used = ?,
-            total_messages = total_messages + 1,
-            total_tokens = total_tokens + ?,
-            updated_at = ?
-        WHERE telegram_id = ?
-        """,
-        (free_used, tokens_used, now_ts, telegram_id),
-    )
+    if cur.rowcount == 0:
+        # На всякий случай создадим пользователя
+        get_or_create_user(telegram_id)
+        cur.execute(
+            "UPDATE users SET mode = ?, updated_at = ? WHERE telegram_id = ?",
+            (mode, now, telegram_id),
+        )
     conn.commit()
     conn.close()
 
 
-def upgrade_user_to_premium(telegram_id: int, days: int) -> None:
-    """
-    Выдаём / продлеваем премиум пользователю.
-    """
-    seconds = days * 24 * 60 * 60
-    now_ts = int(time.time())
+def set_user_note(telegram_id: int, note: str) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        "UPDATE users SET note = ?, updated_at = ? WHERE telegram_id = ?",
+        (note, now, telegram_id),
+    )
+    if cur.rowcount == 0:
+        get_or_create_user(telegram_id)
+        cur.execute(
+            "UPDATE users SET note = ?, updated_at = ? WHERE telegram_id = ?",
+            (note, now, telegram_id),
+        )
+    conn.commit()
+    conn.close()
 
-    conn = _get_connection()
+
+def get_user_note(telegram_id: int) -> Optional[str]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT note FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["note"] if row and row["note"] is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Бесплатный лимит
+# ---------------------------------------------------------------------------
+
+
+def _today_str() -> str:
+    return date.today().isoformat()
+
+
+def get_free_usage_today(telegram_id: int) -> int:
+    conn = _get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT premium_until FROM users WHERE telegram_id = ?",
+        "SELECT free_usage_date, free_usage_count FROM users WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return 0
+
+    if row["free_usage_date"] == _today_str():
+        return int(row["free_usage_count"] or 0)
+    return 0
+
+
+def increment_usage(telegram_id: int) -> int:
+    """Инкремент счётчика бесплатных сообщений за сегодня и возвращает новое значение."""
+
+    today = _today_str()
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT free_usage_date, free_usage_count FROM users WHERE telegram_id = ?",
         (telegram_id,),
     )
     row = cur.fetchone()
 
-    if row and row["premium_until"]:
-        base = max(row["premium_until"], now_ts)
+    if not row:
+        # Создаём пользователя, если его ещё нет
+        get_or_create_user(telegram_id)
+        cur.execute(
+            "SELECT free_usage_date, free_usage_count FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        row = cur.fetchone()
+
+    if row["free_usage_date"] == today:
+        new_count = int(row["free_usage_count"] or 0) + 1
     else:
-        base = now_ts
+        new_count = 1
 
-    new_until = base + seconds
-
+    now = int(time.time())
     cur.execute(
         """
         UPDATE users
-        SET premium_until = ?, free_messages_used = 0, updated_at = ?
-        WHERE telegram_id = ?
+           SET free_usage_date = ?,
+               free_usage_count = ?,
+               updated_at = ?
+         WHERE telegram_id = ?
         """,
+        (today, new_count, now, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+    return new_count
+
+
+# ---------------------------------------------------------------------------
+# Premium
+# ---------------------------------------------------------------------------
+
+
+def has_premium(telegram_id: int) -> bool:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT premium_until FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return False
+
+    premium_until = row["premium_until"]
+    if premium_until is None:
+        return False
+
+    return int(premium_until) > int(time.time())
+
+
+def grant_premium_days(telegram_id: int, days: int) -> None:
+    """Добавляет/продлевает Premium на указанное количество дней."""
+
+    seconds = days * 24 * 3600
+    now_ts = int(time.time())
+
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    # убеждаемся, что пользователь есть
+    get_or_create_user(telegram_id)
+
+    cur.execute("SELECT premium_until FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    current = int(row["premium_until"]) if row and row["premium_until"] else 0
+    base = max(current, now_ts)
+    new_until = base + seconds
+
+    cur.execute(
+        "UPDATE users SET premium_until = ?, updated_at = ? WHERE telegram_id = ?",
         (new_until, now_ts, telegram_id),
     )
     conn.commit()
     conn.close()
 
 
-def save_payment(
-    invoice_id: int,
-    telegram_id: int,
-    amount: float,
-    currency: str,
-    status: str,
-    created_at: Optional[int],
-    payload: Optional[str],
-) -> None:
-    conn = _get_connection()
+# ---------------------------------------------------------------------------
+# Реферальная система
+# ---------------------------------------------------------------------------
+
+
+def ensure_referral_code(telegram_id: int) -> str:
+    """
+    Возвращает реферальный код пользователя, при отсутствии — создаёт.
+    Формат кода делаем простой и уникальный.
+    """
+
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT referral_code FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    if row and row["referral_code"]:
+        code = row["referral_code"]
+        conn.close()
+        return code
+
+    # создаём пользователя на всякий случай
+    get_or_create_user(telegram_id)
+
+    # простой уникальный код: BBX + telegram_id
+    code = f"BBX{telegram_id}"
+
+    # если вдруг занято (теоретически) — добавим счётчик
+    suffix = 1
+    while True:
+        try_code = code if suffix == 1 else f"{code}_{suffix}"
+        cur.execute(
+            "SELECT 1 FROM users WHERE referral_code = ?",
+            (try_code,),
+        )
+        exists = cur.fetchone()
+        if not exists:
+            code = try_code
+            break
+        suffix += 1
+
+    now = int(time.time())
+    cur.execute(
+        "UPDATE users SET referral_code = ?, updated_at = ? WHERE telegram_id = ?",
+        (code, now, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def find_user_by_referral_code(code: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE referral_code = ?", (code,))
+    row = cur.fetchone()
+    conn.close()
+    return _dict(row)
+
+
+def add_referral(referrer_telegram_id: int, referred_telegram_id: int) -> bool:
+    """
+    Добавляет запись о реферале.
+    Возвращает True, если запись новая; False, если такая пара уже была.
+    """
+
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+
+    try:
+        cur.execute(
+            """
+            INSERT INTO referrals (referrer_telegram_id, referred_telegram_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (referrer_telegram_id, referred_telegram_id, now),
+        )
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        # уже есть такая пара (UNIQUE)
+        success = False
+    finally:
+        conn.close()
+
+    return success
+
+
+def get_user_referrals(telegram_id: int) -> List[Dict[str, Any]]:
+    conn = _get_conn()
     cur = conn.cursor()
 
     cur.execute(
         """
-        INSERT OR REPLACE INTO payments (
-            invoice_id, telegram_id, amount, currency,
-            status, created_at, paid_at, payload
+        SELECT u.*
+          FROM referrals r
+          JOIN users u
+            ON u.telegram_id = r.referred_telegram_id
+         WHERE r.referrer_telegram_id = ?
+         ORDER BY r.created_at DESC
+        """,
+        (telegram_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Инвойсы (крипто-оплаты)
+# ---------------------------------------------------------------------------
+
+
+def create_invoice_record(
+    invoice_id: str,
+    telegram_id: int,
+    plan_code: str,
+    amount_usdt: float,
+    period_days: int,
+    pay_url: Optional[str] = None,
+) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO invoices (
+            invoice_id, telegram_id, plan_code, amount_usdt,
+            period_days, pay_url, status, created_at
         )
-        VALUES (
-            ?, ?, ?, ?,
-            ?, ?, COALESCE(
-                (SELECT paid_at FROM payments WHERE invoice_id = ?),
-                NULL
-            ),
-            ?
-        )
+        VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                    (SELECT status FROM invoices WHERE invoice_id = ?),
+                    'created'
+               ), COALESCE(
+                    (SELECT created_at FROM invoices WHERE invoice_id = ?),
+                    ?
+               ))
         """,
         (
             invoice_id,
             telegram_id,
-            amount,
-            currency,
-            status,
-            created_at,
+            plan_code,
+            amount_usdt,
+            period_days,
+            pay_url,
             invoice_id,
-            payload,
+            invoice_id,
+            now,
         ),
     )
     conn.commit()
     conn.close()
 
 
-def update_payment_status(
-    invoice_id: int,
-    status: str,
-    paid_at: Optional[int],
-) -> None:
-    conn = _get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE payments
-        SET status = ?, paid_at = COALESCE(?, paid_at)
-        WHERE invoice_id = ?
-        """,
-        (status, paid_at, invoice_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_pending_payments() -> List[Dict[str, Any]]:
-    """
-    Список счетов, которые ещё не оплачены / не отменены.
-    """
-    conn = _get_connection()
+def get_last_invoice_for_user(telegram_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT *
-        FROM payments
-        WHERE status IN ('active', 'pending', 'wait')
-        ORDER BY created_at DESC
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-
-def mark_payment_and_upgrade(
-    invoice_id: int,
-    paid_at: int,
-    premium_days: int,
-) -> None:
-    """
-    Помечаем платёж как оплаченный и выдаём премиум пользователю.
-    """
-    conn = _get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT telegram_id FROM payments WHERE invoice_id = ?",
-        (invoice_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-
-    telegram_id = row["telegram_id"]
-
-    cur.execute(
-        """
-        UPDATE payments
-        SET status = 'paid', paid_at = ?
-        WHERE invoice_id = ?
+          FROM invoices
+         WHERE telegram_id = ?
+         ORDER BY id DESC
+         LIMIT 1
         """,
-        (paid_at, invoice_id),
-    )
-    conn.commit()
-    conn.close()
-
-    # Выдаём премиум
-    upgrade_user_to_premium(telegram_id, premium_days)
-
-
-def get_total_users_count() -> int:
-    conn = _get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    (count,) = cur.fetchone()
-    conn.close()
-    return int(count or 0)
-
-
-def get_active_premium_count() -> int:
-    now_ts = int(time.time())
-    conn = _get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM users
-        WHERE premium_until IS NOT NULL AND premium_until > ?
-        """,
-        (now_ts,),
-    )
-    (count,) = cur.fetchone()
-    conn.close()
-    return int(count or 0)
-
-
-def get_usage_stats() -> Dict[str, int]:
-    conn = _get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(total_messages), 0) AS total_messages,
-            COALESCE(SUM(total_tokens), 0) AS total_tokens
-        FROM users
-        """
-    )
-    row = cur.fetchone()
-    conn.close()
-    return {
-        "total_messages": int(row["total_messages"]),
-        "total_tokens": int(row["total_tokens"]),
-    }
-
-# === Projects (мульти-режимы бота по пользователю) ===
-import time
-import sqlite3
-
-# Флаг, чтобы не создавать таблицы каждый раз
-_PROJECTS_INITIALIZED = False
-
-
-def _projects_conn() -> sqlite3.Connection:
-    """
-    Отдельный коннект для работы с проектами.
-    Используем тот же файл БД (DB_PATH), что и для подписок.
-    """
-    from .subscription_db import DB_PATH  # если DB_PATH объявлен выше в этом файле
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _ensure_projects_schema() -> None:
-    """
-    Ленивая инициализация схемы для проектов.
-    Таблицы создаются при первом обращении.
-    """
-    global _PROJECTS_INITIALIZED
-    if _PROJECTS_INITIALIZED:
-        return
-
-    conn = _projects_conn()
-    cur = conn.cursor()
-
-    # Основная таблица проектов
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS projects (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id     INTEGER NOT NULL,
-            title           TEXT NOT NULL,
-            description     TEXT DEFAULT '',
-            system_prompt   TEXT DEFAULT '',
-            is_archived     INTEGER NOT NULL DEFAULT 0,
-            created_at      INTEGER NOT NULL,
-            updated_at      INTEGER NOT NULL
-        );
-        """
-    )
-
-    # Активный проект у пользователя
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_projects_state (
-            telegram_id         INTEGER PRIMARY KEY,
-            current_project_id  INTEGER,
-            updated_at          INTEGER NOT NULL
-        );
-        """
-    )
-
-    conn.commit()
-    conn.close()
-    _PROJECTS_INITIALIZED = True
-
-
-def create_project(
-    telegram_id: int,
-    title: str,
-    description: str = "",
-    system_prompt: str = "",
-) -> dict:
-    """
-    Создать проект для пользователя.
-    Возвращает dict с данными проекта.
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    ts = int(time.time())
-
-    cur = conn.execute(
-        """
-        INSERT INTO projects (telegram_id, title, description, system_prompt, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (telegram_id, title.strip(), description.strip(), system_prompt.strip(), ts, ts),
-    )
-    project_id = cur.lastrowid
-
-    row = conn.execute(
-        "SELECT * FROM projects WHERE id = ?",
-        (project_id,),
-    ).fetchone()
-    conn.commit()
-    conn.close()
-
-    return dict(row) if row else {}
-
-
-def list_projects(telegram_id: int, include_archived: bool = False) -> list[dict]:
-    """
-    Получить список проектов пользователя.
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    if include_archived:
-        rows = conn.execute(
-            "SELECT * FROM projects WHERE telegram_id = ? ORDER BY is_archived, updated_at DESC",
-            (telegram_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM projects WHERE telegram_id = ? AND is_archived = 0 ORDER BY updated_at DESC",
-            (telegram_id,),
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def get_project(telegram_id: int, project_id: int) -> dict | None:
-    """
-    Получить конкретный проект по id (проверяем, что принадлежит пользователю).
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    row = conn.execute(
-        """
-        SELECT * FROM projects
-        WHERE id = ? AND telegram_id = ?
-        """,
-        (project_id, telegram_id),
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def set_current_project(telegram_id: int, project_id: int | None) -> None:
-    """
-    Установить активный проект для пользователя.
-    project_id = None -> сбросить (работа без проекта).
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    ts = int(time.time())
-    conn.execute(
-        """
-        INSERT INTO user_projects_state (telegram_id, current_project_id, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-            current_project_id = excluded.current_project_id,
-            updated_at         = excluded.updated_at
-        """,
-        (telegram_id, project_id, ts),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_current_project(telegram_id: int) -> dict | None:
-    """
-    Вернёт активный проект пользователя (или None, если не выбран).
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    state = conn.execute(
-        "SELECT current_project_id FROM user_projects_state WHERE telegram_id = ?",
         (telegram_id,),
-    ).fetchone()
-
-    if not state or state["current_project_id"] is None:
-        conn.close()
-        return None
-
-    row = conn.execute(
-        "SELECT * FROM projects WHERE id = ?",
-        (state["current_project_id"],),
-    ).fetchone()
+    )
+    row = cur.fetchone()
     conn.close()
+    return _dict(row)
 
-    return dict(row) if row else None
 
-
-def archive_project(telegram_id: int, project_id: int) -> None:
-    """
-    Пометить проект как архивный (не показываем в основном списке).
-    """
-    _ensure_projects_schema()
-    conn = _projects_conn()
-    ts = int(time.time())
-    conn.execute(
+def mark_invoice_paid(invoice_id: str) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
         """
-        UPDATE projects
-        SET is_archived = 1,
-            updated_at   = ?
-        WHERE id = ? AND telegram_id = ?
+        UPDATE invoices
+           SET status = 'paid',
+               paid_at = COALESCE(paid_at, ?)
+         WHERE invoice_id = ?
         """,
-        (ts, project_id, telegram_id),
+        (now, invoice_id),
     )
-
-    # Если архивируем активный — снимаем его в состоянии
-    conn.execute(
-        """
-        UPDATE user_projects_state
-        SET current_project_id = NULL,
-            updated_at         = ?
-        WHERE telegram_id = ? AND current_project_id = ?
-        """,
-        (ts, telegram_id, project_id),
-    )
-
     conn.commit()
     conn.close()
