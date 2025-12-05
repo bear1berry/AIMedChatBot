@@ -1,204 +1,157 @@
-"""
-Глобальная конфигурация бота BlackBox GPT.
-
-Здесь лежит всё, что нужно остальному коду:
-- токены и API-ключи
-- лимиты тарифов
-- пути к файлам
-- текст онбординга
-"""
-
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-# === БАЗОВЫЕ ПУТИ ===
+
+# --- Base paths ---
 
 BASE_DIR: Path = Path(__file__).resolve().parent.parent
 ENV_PATH: Path = BASE_DIR / ".env"
-DATA_DIR: Path = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-USERS_FILE_PATH: Path = DATA_DIR / "users.json"
-
-
-# === ЗАГРУЗКА .env ===
 
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
+    print(f"[CONFIG] BASE_DIR={BASE_DIR}")
+    print(f"[CONFIG] ENV_PATH={ENV_PATH} exists=True")
+else:
+    print(f"[CONFIG] BASE_DIR={BASE_DIR}")
+    print(f"[CONFIG] ENV_PATH={ENV_PATH} exists=False")
 
+# --- Tokens & API keys ---
 
-# === ТОКЕНЫ И КЛЮЧИ ===
-
-BOT_TOKEN: Optional[str] = os.getenv("BOT_TOKEN")
-DEEPSEEK_API_KEY: Optional[str] = os.getenv("DEEPSEEK_API_KEY")
+BOT_TOKEN: str | None = os.getenv("BOT_TOKEN")
+DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables")
-
+    raise RuntimeError("BOT_TOKEN is not set in .env")
 if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is not set in environment variables")
+    raise RuntimeError("DEEPSEEK_API_KEY is not set in .env")
 
-# DeepSeek / LLM
-DEEPSEEK_API_URL: str = os.getenv(
-    "DEEPSEEK_API_URL",
-    "https://api.deepseek.com/v1/chat/completions",
-)
+print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")
+print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")
+
+# Optional: DeepSeek base URL & model (OpenAI-совместимый API)
+DEEPSEEK_API_BASE_URL: str = os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+# --- CryptoBot (Crypto Pay API) ---
 
-# === АДМИНЫ ===
+CRYPTO_PAY_API_TOKEN: str = os.getenv("CRYPTO_PAY_API_TOKEN", "").strip()
+CRYPTO_PAY_API_URL: str = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
 
-# через запятую в .env: 123,456,789
-_admin_ids_raw = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS: List[int] = []
-for part in _admin_ids_raw.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ADMIN_IDS.append(int(part))
+# --- Owner / admin ---
 
+OWNER_ID_ENV = os.getenv("OWNER_ID", "").strip()
+OWNER_ID = int(OWNER_ID_ENV) if OWNER_ID_ENV.isdigit() else None
 
-# === ТАРИФЫ / ЛИМИТЫ ===
+# --- Планы и лимиты ---
 
-# два режима: BASIC и PREMIUM
-# BASIC ограничен по количеству сообщений в день, PREMIUM — безлимит
-PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
-    "basic": {
-        "name": "Базовый",
-        "daily_messages": 50,      # лимит в сутки
-        "priority": 1,
+PLAN_BASIC = "basic"
+PLAN_PREMIUM = "premium"
+
+# Сколько сообщений в день у базового плана
+DEFAULT_DAILY_LIMIT: int = 30
+
+# Сколько дополнительных сообщений в день даёт один реферал
+REF_BONUS_PER_USER: int = 10
+
+# Тарифы подписки (цены в USDT через CryptoBot)
+SUBSCRIPTION_TARIFFS = {
+    "month": {
+        "code": "month",
+        "title": "1 месяц Premium",
+        "days": 30,
+        "price_usdt": 7.99,
+        "asset": "USDT",
     },
-    "premium": {
-        "name": "Premium",
-        "daily_messages": None,    # None = без лимита
-        "priority": 10,
+    "quarter": {
+        "code": "quarter",
+        "title": "3 месяца Premium",
+        "days": 90,
+        "price_usdt": 26.99,
+        "asset": "USDT",
+    },
+    "year": {
+        "code": "year",
+        "title": "12 месяцев Premium",
+        "days": 365,
+        "price_usdt": 82.99,
+        "asset": "USDT",
     },
 }
 
-# сколько дополнительных сообщений даёт 1 приглашённый реферал
-REF_BONUS_PER_USER: int = 20
+# --- Файлы хранилища ---
 
-# сколько последних сообщений диалога храним в истории для LLM
-MAX_HISTORY_MESSAGES: int = 20
+DATA_DIR: Path = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+USERS_FILE_PATH: Path = DATA_DIR / "users.json"
 
+# --- Режимы ассистента ---
 
-# === РЕЖИМЫ ПОМОЩНИКА ===
+DEFAULT_MODE = "universal"
 
-ASSISTANT_MODES: Dict[str, Dict[str, str]] = {
+ASSISTANT_MODES = {
     "universal": {
-        "title": "Универсальный 🤖",
+        "code": "universal",
+        "emoji": "🧠",
+        "title": "Универсальный",
+        "button": "🧠 Универсальный",
+        "description": "Главный режим. Я решаю любые задачи: от идей и текстов до кода и стратегии.",
         "system_prompt": (
-            "Ты — BlackBox GPT, универсальный ИИ-ассистент. "
-            "Отвечай чётко, структурированно и по делу. "
-            "Если нужно — задавай уточняющие вопросы, но не перегружай пользователя."
+            "Ты — универсальный ИИ-ассистент BlackBox GPT. "
+            "Отвечай максимально полезно, структурно и по делу. "
+            "Пиши живым, но аккуратным языком, без воды. "
+            "Если запрос неясен — сначала уточни, но не злоупотребляй вопросами."
         ),
     },
     "medicine": {
-        "title": "Медицина 🩺",
+        "code": "medicine",
+        "emoji": "🩺",
+        "title": "Медицина",
+        "button": "🩺 Медицина",
+        "description": "Профессиональный разбор медицины простым языком. Памятки, алгоритмы, разбор статей.",
         "system_prompt": (
-            "Ты — помощник врача-эпидемиолога. "
-            "Давай аккуратные, взвешенные ответы, опираясь на доказательную медицину. "
-            "Всегда напоминай, что твои ответы не заменяют очную консультацию врача."
+            "Ты — ИИ-ассистент врача-эпидемиолога. "
+            "Отвечай строго на основе доказательной медицины и актуальных клинических рекомендаций. "
+            "Обязательно подчёркивай, что не ставишь диагноз и не заменяешь очный приём."
         ),
     },
     "mentor": {
-        "title": "Наставник 🔥",
+        "code": "mentor",
+        "emoji": "🔥",
+        "title": "Наставник",
+        "button": "🔥 Наставник",
+        "description": "Личный наставник: режим, дисциплина, цели, разбор состояний и поддержка.",
         "system_prompt": (
             "Ты — личный наставник пользователя. "
-            "Помогаешь с дисциплиной, режимом, целями, даёшь мотивирующие, но честные ответы."
+            "Помогаешь в дисциплине, саморазвитии, постановке и разборе целей. "
+            "Будь поддерживающим, но прямым: меньше воды, больше конкретики, структурных планов и шагов."
         ),
     },
     "business": {
-        "title": "Бизнес 💼",
+        "code": "business",
+        "emoji": "💼",
+        "title": "Бизнес",
+        "button": "💼 Бизнес",
+        "description": "Запуски, стратегии, идеи, проверки гипотез, тексты для продаж.",
         "system_prompt": (
-            "Ты — консультант по бизнесу, стратегиям и продуктам. "
-            "Помогаешь структурировать идеи, считать экономику и находить точки роста."
+            "Ты — стратегический бизнес-ассистент. "
+            "Помогаешь с идеями, проверкой гипотез, маркетингом, структурой продуктов и текстами. "
+            "Отвечай чётко, логично, с фокусом на практику и цифры."
         ),
     },
     "creative": {
-        "title": "Креатив 🎨",
+        "code": "creative",
+        "emoji": "🎨",
+        "title": "Креатив",
+        "button": "🎨 Креатив",
+        "description": "Айдентика, идеи, визуалы, тексты, сценарии — всё, где нужен креатив.",
         "system_prompt": (
-            "Ты — креативный партнёр. Придумываешь идеи, форматы, тексты, визуальные концепты."
+            "Ты — креативный директор и копирайтер. "
+            "Генерируй идеи для визуала, текстов, историй, сценариев. "
+            "Сохраняй структурность и внятность, даже когда предлагаешь смелые концепции."
         ),
     },
 }
-
-DEFAULT_MODE_KEY: str = "universal"
-
-
-# === ОНБОРДИНГ / ТЕКСТЫ ===
-
-BOT_NAME: str = "BlackBox GPT"
-BOT_TAGLINE: str = "Universal AI Assistant"
-
-ONBOARDING_TEXT: str = (
-    f"🖤 <b>{BOT_NAME}</b> — {BOT_TAGLINE}.\n\n"
-    "Минимум интерфейса. Максимум мозга.\n\n"
-    "Просто напиши свой запрос — я разберусь.\n"
-    "Нижний таскбар — для выбора режима, профиля, подписки и рефералов."
-)
-
-
-# === КРИПТО-ОПЛАТА (CryptoBot) ===
-
-# токен Crypto Pay API (@CryptoBot), кладёшь в .env
-CRYPTO_PAY_API_TOKEN: Optional[str] = os.getenv("CRYPTO_PAY_API_TOKEN")
-
-# базовый URL API криптобота (ЭТОГО КОНСТАНТЫ РАНЬШЕ НЕ ХВАТАЛО)
-CRYPTO_PAY_API_URL: str = os.getenv(
-    "CRYPTO_PAY_API_URL",
-    "https://pay.crypt.bot/api",
-)
-
-# тарифы для кнопки "Подписка"
-# code — внутренний код тарифа, на него завязана логика
-SUBSCRIPTION_TARIFFS: Dict[str, Dict[str, Any]] = {
-    "monthly": {
-        "code": "monthly",
-        "title": "1 месяц — $7.99",
-        "amount": "7.99",
-        "asset": "USDT",
-        "period_days": 30,
-    },
-    "quarterly": {
-        "code": "quarterly",
-        "title": "3 месяца — $26.99",
-        "amount": "26.99",
-        "asset": "USDT",
-        "period_days": 90,
-    },
-    "yearly": {
-        "code": "yearly",
-        "title": "12 месяцев — $82.99",
-        "amount": "82.99",
-        "asset": "USDT",
-        "period_days": 365,
-    },
-}
-
-
-# === ЯНДЕКС SPEECHKIT (для голоса, пока опционально) ===
-
-YANDEX_SPEECHKIT_API_KEY: Optional[str] = os.getenv("YANDEX_SPEECHKIT_API_KEY")
-YANDEX_SPEECHKIT_FOLDER_ID: Optional[str] = os.getenv("YANDEX_SPEECHKIT_FOLDER_ID")
-
-
-# === ОТЛАДОЧНЫЙ ВЫВОД ===
-
-def print_debug_config() -> None:
-    """Чуть-чуть логов при старте, чтобы понимать, что .env подцепился."""
-    print(f"[CONFIG] BASE_DIR={BASE_DIR}")
-    print(f"[CONFIG] ENV_PATH={ENV_PATH} exists={ENV_PATH.exists()}")
-    print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")
-    print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")
-    print(
-        f"[CONFIG] CRYPTO_PAY_API_TOKEN loaded? "
-        f"{'YES' if CRYPTO_PAY_API_TOKEN else 'NO'}"
-    )
-
-
-print_debug_config()
