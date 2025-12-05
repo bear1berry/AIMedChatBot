@@ -15,7 +15,7 @@ from aiogram.types import (
 )
 
 from bot.config import BOT_TOKEN, ASSISTANT_MODES, DEFAULT_MODE_KEY
-from services.llm import ask_llm
+from services.llm import ask_llm_stream
 from services.storage import Storage
 
 # =========================
@@ -44,7 +44,6 @@ def get_user_state(user_id: int) -> UserState:
     Достаём состояние из памяти и синхронизируем с файловым хранилищем.
     """
     if user_id not in user_states:
-        # подтянем сохранённый режим из файла
         stored = storage.get_or_create_user(user_id)
         mode_key = stored.get("mode_key", DEFAULT_MODE_KEY)
         user_states[user_id] = UserState(mode_key=mode_key)
@@ -180,6 +179,23 @@ async def cmd_profile(message: Message) -> None:
     )
 
 
+@router.message(Command("reset"))
+async def cmd_reset(message: Message) -> None:
+    """
+    Сбрасывает диалоговый контекст (history) для пользователя.
+    """
+    user_id = message.from_user.id
+    storage.reset_history(user_id)
+    state = get_user_state(user_id)
+    state.last_answer = None
+    state.last_prompt = None
+
+    await message.answer(
+        "🔄 Диалоговый контекст сброшен. Можем начать с чистого листа.",
+        reply_markup=build_main_keyboard(state.mode_key),
+    )
+
+
 @router.callback_query(F.data.startswith("mode:"))
 async def cb_change_mode(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
@@ -278,6 +294,9 @@ async def cb_service(callback: CallbackQuery) -> None:
 async def handle_text(message: Message) -> None:
     """
     Главный обработчик любых текстовых запросов пользователя.
+    Поддерживает:
+      - диалоговый контекст (history)
+      - стриминг ответа (по чанкам)
     """
     user_id = message.from_user.id
     text = message.text or ""
@@ -308,7 +327,7 @@ async def handle_text(message: Message) -> None:
 
     waiting_message = await message.answer(
         "⌛ Обрабатываю запрос в режиме "
-        f"<b>{mode_cfg['title']}</b>...\n\nОбычно это занимает несколько секунд.",
+        f"<b>{mode_cfg['title']}</b>...\n\nГенерация идёт в реальном времени.",
         reply_markup=build_main_keyboard(state.mode_key),
     )
 
@@ -318,18 +337,54 @@ async def handle_text(message: Message) -> None:
     # Регистрируем использование лимита
     storage.register_request(user_id)
 
+    # Берём диалоговую историю для контекста
+    history = storage.get_history(user_id)
+
+    answer_text = ""
+    chunk_counter = 0
+    EDIT_EVERY_N_CHUNKS = 5  # чтобы не спамить слишком часто edit_message_text
+
     try:
-        answer = await ask_llm(state.mode_key, user_prompt)
-        state.last_answer = answer
+        async for chunk in ask_llm_stream(state.mode_key, user_prompt, history):
+            answer_text += chunk
+            chunk_counter += 1
+
+            if chunk_counter % EDIT_EVERY_N_CHUNKS == 0:
+                try:
+                    await waiting_message.edit_text(
+                        answer_text,
+                        reply_markup=build_main_keyboard(state.mode_key),
+                    )
+                except Exception:
+                    # Игнорим ошибки типа "message is not modified" или rate limit
+                    pass
+
+        # Стрим закончился — финальный текст
+        if not answer_text.strip():
+            answer_text = (
+                "Что-то пошло не так при генерации ответа. Попробуй сформулировать запрос по-другому."
+            )
+
+        state.last_answer = answer_text
+
+        # Обновляем history (user + assistant)
+        storage.append_history(user_id, "user", user_prompt)
+        storage.append_history(user_id, "assistant", answer_text)
 
         await waiting_message.edit_text(
-            answer,
+            answer_text,
             reply_markup=build_main_keyboard(state.mode_key),
         )
+
     except Exception as e:  # noqa: BLE001
-        logging.exception("Unexpected error while handling text: %s", e)
+        logging.exception("Unexpected error while handling text with streaming: %s", e)
+        fallback = (
+            answer_text.strip()
+            if answer_text.strip()
+            else "❌ Произошла неожиданная ошибка. Попробуй ещё раз позже."
+        )
         await waiting_message.edit_text(
-            "❌ Произошла неожиданная ошибка. Попробуй ещё раз позже.",
+            fallback,
             reply_markup=build_main_keyboard(state.mode_key),
         )
 
