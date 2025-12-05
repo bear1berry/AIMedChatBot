@@ -15,7 +15,6 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # =============== Режимы ассистента ===============
-# сюда добавлены указания по структуре и форматированию ответа
 
 ASSISTANT_MODES = {
     "universal": {
@@ -95,10 +94,31 @@ ASSISTANT_MODES = {
 
 DEFAULT_MODE_KEY = "universal"
 
+# =============== Тарифы ===============
+
+PLAN_LIMITS = {
+    "free": {
+        "title": "Free",
+        "daily_base": int(os.getenv("PLAN_FREE_DAILY_BASE", "50")),
+        "description": "Базовый бесплатный тариф для старта и личного использования.",
+    },
+    "pro": {
+        "title": "Pro",
+        "daily_base": int(os.getenv("PLAN_PRO_DAILY_BASE", "500")),
+        "description": "Для активных пользователей и продвинутых задач.",
+    },
+    "vip": {
+        "title": "VIP",
+        "daily_base": int(os.getenv("PLAN_VIP_DAILY_BASE", "2000")),
+        "description": "Максимальные лимиты и приоритетный доступ.",
+    },
+}
+
 # =============== Реферальные лимиты ===============
 
-REF_BASE_LIMIT = int(os.getenv("REF_BASE_LIMIT", "1000"))          # базовый лимит запросов
-REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "200"))   # бонус за каждого приглашённого
+# Бонус к дневному лимиту за каждого приглашённого пользователя
+REF_BASE_LIMIT = int(os.getenv("REF_BASE_LIMIT", "1000"))          # не используется в дневных лимитах, но оставлен для совместимости
+REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))    # +20 запросов в день за каждого реферала
 
 # =============== Диалоговый контекст ===============
 
