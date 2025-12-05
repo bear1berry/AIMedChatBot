@@ -13,7 +13,7 @@ from bot.config import (
 
 
 def _today_str() -> str:
-    return date.today().isoformat()  # можно заменить на utcnow().date().isoformat() при желании
+    return date.today().isoformat()  # при желании можно перейти на UTC
 
 
 class Storage:
