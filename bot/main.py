@@ -25,6 +25,7 @@ from bot.config import (
     PAYMENT_CURRENCY,
     PLAN_PRICES,
     PAYMENTS_ENABLED,
+    ADMIN_USER_IDS,
 )
 from services.llm import ask_llm_stream
 from services.storage import Storage
@@ -49,32 +50,6 @@ class UserState:
 
 user_states: Dict[int, UserState] = {}
 
-# Подписи для кнопок нижнего таскбара
-MODE_BUTTON_LABELS = {
-    "universal": "🧠 Универсальный",
-    "med": "⚕️ Медицина",
-    "coach": "🔥 Наставник",
-    "biz": "💼 Бизнес / Идеи",
-    "creative": "🎨 Креатив",
-}
-
-SERVICE_BUTTON_LABELS = {
-    "templates": "⚡ Сценарии",
-    "profile": "👤 Профиль",
-    "referral": "🎁 Реферал",
-    "plans": "💳 Тарифы",
-}
-
-BUY_BUTTON_PRO = "Pro ⭐"
-BUY_BUTTON_VIP = "VIP 💎"
-
-# Все тексты кнопок, чтобы не отправлять их в LLM
-ALL_BUTTON_TEXTS = (
-    list(MODE_BUTTON_LABELS.values())
-    + list(SERVICE_BUTTON_LABELS.values())
-    + [BUY_BUTTON_PRO, BUY_BUTTON_VIP]
-)
-
 
 def get_user_state(user_id: int) -> UserState:
     """
@@ -87,15 +62,69 @@ def get_user_state(user_id: int) -> UserState:
     return user_states[user_id]
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+# Подписи для кнопок
+
+BTN_MODES = "✨ Режимы"
+BTN_SCENARIOS = "⚡ Сценарии"
+BTN_PROFILE = "👤 Профиль"
+BTN_REFERRAL = "🎁 Реферал"
+BTN_TARIFFS = "💳 Тарифы"
+BTN_BACK = "⬅️ Назад"
+
+MODE_BUTTON_LABELS = {
+    "universal": "🧠 Универсальный",
+    "med": "⚕️ Медицина",
+    "coach": "🔥 Наставник",
+    "biz": "💼 Бизнес / Идеи",
+    "creative": "🎨 Креатив",
+}
+
+SERVICE_BUTTON_LABELS = {
+    "templates": BTN_SCENARIOS,
+    "profile": BTN_PROFILE,
+    "referral": BTN_REFERRAL,
+    "plans": BTN_TARIFFS,
+}
+
+BUY_BUTTON_PRO = "Pro ⭐"
+BUY_BUTTON_VIP = "VIP 💎"
+
+ALL_BUTTON_TEXTS = (
+    [BTN_MODES, BTN_SCENARIOS, BTN_PROFILE, BTN_REFERRAL, BTN_TARIFFS, BTN_BACK]
+    + list(MODE_BUTTON_LABELS.values())
+    + list(SERVICE_BUTTON_LABELS.values())
+    + [BUY_BUTTON_PRO, BUY_BUTTON_VIP]
+)
+
 # =========================
-#  Нижний таскбар (ReplyKeyboard)
+#  Клавиатуры (нижний таскбар)
 # =========================
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
     """
-    Постоянная клавиатура внизу. Никаких inline-кнопок в сообщениях.
+    Главное меню внизу: максимально компактно.
     """
+    rows = [
+        [KeyboardButton(text=BTN_MODES), KeyboardButton(text=BTN_SCENARIOS)],
+        [
+            KeyboardButton(text=BTN_PROFILE),
+            KeyboardButton(text=BTN_REFERRAL),
+            KeyboardButton(text=BTN_TARIФЫ),
+        ],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Напиши запрос...",
+    )
+
+
+def build_modes_keyboard() -> ReplyKeyboardMarkup:
     rows = [
         [
             KeyboardButton(text=MODE_BUTTON_LABELS["universal"]),
@@ -106,17 +135,17 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
             KeyboardButton(text=MODE_BUTTON_LABELS["biz"]),
         ],
         [KeyboardButton(text=MODE_BUTTON_LABELS["creative"])],
-        [
-            KeyboardButton(text=SERVICE_BUTTON_LABELS["templates"]),
-            KeyboardButton(text=SERVICE_BUTTON_LABELS["profile"]),
-        ],
-        [
-            KeyboardButton(text=SERVICE_BUTTON_LABELS["referral"]),
-            KeyboardButton(text=SERVICE_BUTTON_LABELS["plans"]),
-        ],
+        [KeyboardButton(text=BTN_BACK)],
     ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Выбери режим или вернись назад",
+    )
 
-    # Кнопки покупки тарифов тоже в таскбаре
+
+def build_tariffs_keyboard() -> ReplyKeyboardMarkup:
+    rows = []
     if PAYMENTS_ENABLED:
         rows.append(
             [
@@ -124,12 +153,11 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=BUY_BUTTON_VIP),
             ]
         )
-
+    rows.append([KeyboardButton(text=BTN_BACK)])
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Напиши запрос...",
+        input_field_placeholder="Выбери тариф или вернись назад",
     )
 
 
@@ -172,27 +200,34 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         status = storage.attach_referral(user_id, arg)
         if status == "ok":
             ref_msg = (
-                "\n\n🎁 Твой аккаунт привязан к реферальному коду. "
-                "Ты получил бонусные дневные лимиты."
+                "\n\n🎁 Реферальный код привязан. "
+                "Бонусные лимиты активированы."
             )
         elif status == "not_found":
-            ref_msg = "\n\n⚠️ Реферальный код не найден, но бот всё равно доступен."
+            ref_msg = "\n\n⚠️ Реферальный код не найден."
         elif status == "already_has_referrer":
-            ref_msg = "\n\nℹ️ Реферальный код уже был привязан ранее."
+            ref_msg = "\n\nℹ️ Реферальный код уже был привязан."
         elif status == "self_referral":
-            ref_msg = "\n\n⚠️ Нельзя использовать собственный реферальный код."
+            ref_msg = "\n\n⚠️ Нельзя использовать собственный код."
 
     mode_cfg = ASSISTANT_MODES[state.mode_key]
     limits = storage.get_limits(user_id)
 
+    if is_admin(user_id):
+        tariff_block = "Тариф: <b>Admin</b>\nЛимит на сегодня: <b>без ограничений</b>."
+    else:
+        tariff_block = (
+            f"Тариф: <b>{limits['plan_title']}</b>\n"
+            f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов."
+        )
+
     text = (
         "🖤 <b>BlackBoxGPT</b>\n\n"
-        "Твой персональный ИИ-ассистент.\n"
-        "Управление — только нижний таскбар. Просто пиши запрос.\n\n"
+        "Минимум кнопок, максимум пользы.\n"
+        "Выбери раздел внизу или просто напиши вопрос.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
-        f"Тариф: <b>{limits['plan_title']}</b>\n"
-        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов."
+        f"{tariff_block}"
         f"{ref_msg}"
     )
 
@@ -213,23 +248,28 @@ async def cmd_profile(message: Message) -> None:
     mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
     level = _ref_level(stats["invited_count"])
 
+    if is_admin(user_id):
+        tariff_line = "Текущий тариф: <b>Admin</b> (лимитов нет)"
+    else:
+        tariff_line = f"Текущий тариф: <b>{stats['plan_title']}</b>"
+
     text = (
-        "👤 <b>Твой профиль</b>\n\n"
+        "👤 <b>Профиль</b>\n\n"
         f"<b>Режим по умолчанию:</b> {mode_cfg['title']}\n"
         f"<b>Сообщений всего:</b> {dossier.get('messages_count', 0)}\n"
         f"<b>Последний запрос:</b> <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
         "💳 <b>Тариф</b>\n"
-        f"Текущий тариф: <b>{stats['plan_title']}</b>\n"
-        f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b> запросов\n"
+        f"{tariff_line}\n"
+        f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b>\n"
         f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
         f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n"
         f"Всего запросов за всё время: <b>{stats['total_requests']}</b>\n\n"
-        "🎁 <b>Реферальная система</b>\n"
-        f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
+        "🎁 <b>Рефералы</b>\n"
+        f"Код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
         f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n"
     )
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_main_keyboard())
 
 
 @router.message(Command("reset"))
@@ -243,41 +283,62 @@ async def cmd_reset(message: Message) -> None:
     state.last_answer = None
     state.last_prompt = None
 
-    await message.answer("🔄 Диалоговый контекст сброшен. Можем начать с чистого листа.")
+    await message.answer(
+        "Диалог очищен. Можно начинать новую ветку.",
+        reply_markup=build_main_keyboard(),
+    )
 
 
 @router.message(Command("plans"))
 async def cmd_plans(message: Message) -> None:
     """
-    Обзор тарифов текстом. Покупка — кнопками Pro/VIP в таскбаре.
+    Обзор тарифов текстом. Покупка — из раздела «Тарифы».
     """
     user_id = message.from_user.id
     limits = storage.get_limits(user_id)
 
-    lines = [
-        "💳 <b>Тарифы BlackBoxGPT</b>\n",
-        f"Твой текущий тариф: <b>{limits['plan_title']}</b>",
-        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n",
-    ]
+    lines = ["💳 <b>Тарифы</b>\n"]
+    if is_admin(user_id):
+        lines.append("Ты в режиме Admin — ограничений по запросам нет.\n")
+    else:
+        lines.append(f"Твой тариф: <b>{limits['plan_title']}</b>")
+        lines.append(
+            f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n"
+        )
+
     for key, cfg in PLAN_LIMITS.items():
         lines.append(
             f"• <b>{cfg['title']}</b> ({key}) — до <b>{cfg['daily_base']}</b> запросов в день."
         )
-        lines.append(f"  {cfg.get('description', '')}\n")
+        desc = cfg.get("description", "").strip()
+        if desc:
+            lines.append(f"  {desc}\n")
 
     lines.append(
-        f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
-        "запросов в день к своему тарифу.\n"
+        f"Каждый приглашённый друг даёт +<b>{REF_BONUS_PER_USER}</b> запросов в день."
     )
     if PAYMENTS_ENABLED:
-        lines.append("Оформить Pro/VIP можно кнопками Pro ⭐ / VIP 💎 в нижнем таскбаре.")
+        lines.append("\nОформить Pro/VIP можно через раздел «💳 Тарифы» внизу.")
 
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), reply_markup=build_main_keyboard())
 
 
 # =========================
-#  Кнопки режимов (нижний таскбар)
+#  Кнопка «Режимы» и выбор режима
 # =========================
+
+
+@router.message(F.text == BTN_MODES)
+async def modes_menu(message: Message) -> None:
+    state = get_user_state(message.from_user.id)
+    mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+
+    text = (
+        "Режим определяет стиль и фокус ответов.\n\n"
+        f"Сейчас выбран: <b>{mode_cfg['title']}</b>.\n"
+        "Выбери новый режим внизу."
+    )
+    await message.answer(text, reply_markup=build_modes_keyboard())
 
 
 @router.message(F.text.in_(list(MODE_BUTTON_LABELS.values())))
@@ -292,7 +353,7 @@ async def mode_button(message: Message) -> None:
             mode_key = k
             break
     if mode_key is None or mode_key not in ASSISTANT_MODES:
-        await message.answer("Неизвестный режим.")
+        await message.answer("Неизвестный режим.", reply_markup=build_main_keyboard())
         return
 
     state.mode_key = mode_key
@@ -301,19 +362,34 @@ async def mode_button(message: Message) -> None:
     mode_cfg = ASSISTANT_MODES[mode_key]
     limits = storage.get_limits(user_id)
 
+    if is_admin(user_id):
+        limit_line = "Лимит на сегодня: <b>без ограничений</b>."
+    else:
+        limit_line = f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>."
+
     text = (
-        "Режим обновлён ✅\n\n"
+        "Режим обновлён.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
-        f"Тариф: <b>{limits['plan_title']}</b>\n"
-        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>."
+        f"{limit_line}"
     )
 
-    await message.answer(text)
+    # После выбора режима возвращаем главное меню
+    await message.answer(text, reply_markup=build_main_keyboard())
 
 
 # =========================
-#  Кнопки сервисов (нижний таскбар)
+#  Кнопка «Назад»
+# =========================
+
+
+@router.message(F.text == BTN_BACK)
+async def back_to_main(message: Message) -> None:
+    await message.answer("Главное меню.", reply_markup=build_main_keyboard())
+
+
+# =========================
+#  Сервисные разделы (Сценарии / Профиль / Реферал / Тарифы)
 # =========================
 
 
@@ -330,40 +406,53 @@ async def service_button(message: Message) -> None:
             break
 
     if action is None:
-        await message.answer("Сервис в разработке.")
+        await message.answer("Раздел в разработке.", reply_markup=build_main_keyboard())
         return
 
     if action == "templates":
         text = (
-            "⚡ <b>Быстрые сценарии</b>\n\n"
-            "Например, можешь написать:\n"
-            "• «Сделай структуру Telegram-канала по медицине»\n"
-            "• «Придумай 10 идей постов для моего бота»\n"
-            "• «Разбери мой день и предложи улучшения режима»\n\n"
-            "Или просто напиши свою задачу — режим уже выбран."
+            "⚡ <b>Сценарии</b>\n\n"
+            "Примеры запросов:\n"
+            "• Структура Telegram-канала\n"
+            "• Идеи постов для бота\n"
+            "• Разбор распорядка дня и улучшения\n\n"
+            "Просто опиши свою задачу — ассистент подстроится."
         )
+        kb = build_main_keyboard()
+
     elif action == "profile":
+        # Используем логику профиля
         user = storage.get_or_create_user(user_id)
         dossier = user.get("dossier", {})
         stats = storage.get_referral_stats(user_id)
-        mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+        mode_cfg = ASSISTANT_MODES.get(
+            state.mode_key,
+            ASSISTANT_MODES[DEFAULT_MODE_KEY],
+        )
         level = _ref_level(stats["invited_count"])
 
+        if is_admin(user_id):
+            tariff_line = "Текущий тариф: <b>Admin</b> (лимитов нет)"
+        else:
+            tariff_line = f"Текущий тариф: <b>{stats['plan_title']}</b>"
+
         text = (
-            "👤 <b>Твой профиль</b>\n\n"
+            "👤 <b>Профиль</b>\n\n"
             f"<b>Режим по умолчанию:</b> {mode_cfg['title']}\n"
             f"<b>Сообщений всего:</b> {dossier.get('messages_count', 0)}\n"
             f"<b>Последний запрос:</b> <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
             "💳 <b>Тариф</b>\n"
-            f"Текущий тариф: <b>{stats['plan_title']}</b>\n"
-            f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b> запросов\n"
+            f"{tariff_line}\n"
+            f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b>\n"
             f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
             f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n"
             f"Всего запросов за всё время: <b>{stats['total_requests']}</b>\n\n"
-            "🎁 <b>Реферальная система</b>\n"
-            f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
+            "🎁 <b>Рефералы</b>\n"
+            f"Код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
             f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n"
         )
+        kb = build_main_keyboard()
+
     elif action == "referral":
         code = storage.ensure_ref_code(user_id)
         stats = storage.get_referral_stats(user_id)
@@ -374,44 +463,54 @@ async def service_button(message: Message) -> None:
         link = f"https://t.me/{username}?start=ref_{code}"
 
         text = (
-            "🎁 <b>Твоя реферальная программа</b>\n\n"
-            f"Тариф: <b>{stats['plan_title']}</b>\n"
-            f"Лимит на сегодня: <b>{stats['used_today']}/{stats['limit_today']}</b>\n"
+            "🎁 <b>Реферальная программа</b>\n\n"
+            f"Текущий тариф: <b>{stats['plan_title']}</b>\n"
             f"Базовый лимит: <b>{stats['base_limit']}</b>\n"
-            f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n\n"
-            f"Твой код: <code>{code}</code>\n"
-            f"Твоя ссылка: <code>{link}</code>\n\n"
+            f"Бонус от рефералов: <b>{stats['ref_bonus']} (по {REF_BONUS_PER_USER} за каждого)</b>\n"
             f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n\n"
-            "Каждый приглашённый через твою ссылку даёт дополнительные запросы в день."
+            f"Твой код: <code>{code}</code>\n"
+            f"Ссылка: <code>{link}</code>\n"
         )
+        kb = build_main_keyboard()
+
     elif action == "plans":
         limits = storage.get_limits(user_id)
-        lines = [
-            "💳 <b>Тарифы BlackBoxGPT</b>\n",
-            f"Твой текущий тариф: <b>{limits['plan_title']}</b>",
-            f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n",
-        ]
+        lines = ["💳 <b>Тарифы</b>\n"]
+        if is_admin(user_id):
+            lines.append("Ты в режиме Admin — ограничений по запросам нет.\n")
+        else:
+            lines.append(f"Твой тариф: <b>{limits['plan_title']}</b>")
+            lines.append(
+                f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n"
+            )
+
         for key, cfg in PLAN_LIMITS.items():
             lines.append(
                 f"• <b>{cfg['title']}</b> ({key}) — до <b>{cfg['daily_base']}</b> запросов в день."
             )
-            lines.append(f"  {cfg.get('description', '')}\n")
+            desc = cfg.get("description", "").strip()
+            if desc:
+                lines.append(f"  {desc}\n")
 
         lines.append(
-            f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
-            "запросов в день к своему тарифу.\n"
+            f"Каждый приглашённый даёт +<b>{REF_BONUS_PER_USER}</b> запросов в день."
         )
         if PAYMENTS_ENABLED:
-            lines.append("Оформить Pro/VIP можно кнопками Pro ⭐ / VIP 💎 в нижнем таскбаре.")
-        text = "\n".join(lines)
-    else:
-        text = "Сервис в разработке."
+            lines.append(
+                "\nДля оформления тарифа выбери Pro или VIP внизу."
+            )
 
-    await message.answer(text)
+        text = "\n".join(lines)
+        kb = build_tariffs_keyboard()
+    else:
+        text = "Раздел в разработке."
+        kb = build_main_keyboard()
+
+    await message.answer(text, reply_markup=kb)
 
 
 # =========================
-#  Покупка тарифов (кнопки Pro/VIP в таскбаре)
+#  Покупка тарифов (кнопки Pro/VIP)
 # =========================
 
 
@@ -420,6 +519,7 @@ async def buy_button(message: Message, bot: Bot) -> None:
     if not PAYMENTS_ENABLED:
         await message.answer(
             "Платежи пока не настроены. Свяжись с админом или попробуй позже.",
+            reply_markup=build_main_keyboard(),
         )
         return
 
@@ -463,7 +563,7 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: 
         await bot.answer_pre_checkout_query(
             pre_checkout_query.id,
             ok=False,
-            error_message="Произошла ошибка при обработке платежа. Попробуйте позже.",
+            error_message="Ошибка при обработке платежа. Попробуйте позже.",
         )
 
 
@@ -479,7 +579,8 @@ async def successful_payment_handler(message: Message) -> None:
 
     if plan not in PLAN_LIMITS:
         await message.answer(
-            "Платёж прошёл, но тариф определить не удалось. Обратись в поддержку.",
+            "Платёж прошёл, но тариф определить не удалось. Напиши администратору.",
+            reply_markup=build_main_keyboard(),
         )
         return
 
@@ -488,15 +589,13 @@ async def successful_payment_handler(message: Message) -> None:
     plan_cfg = PLAN_LIMITS[plan]
 
     text = (
-        "✅ <b>Оплата прошла успешно!</b>\n\n"
-        f"Твой новый тариф: <b>{limits['plan_title']}</b>\n"
+        "Оплата прошла успешно.\n\n"
+        f"Новый тариф: <b>{limits['plan_title']}</b>\n"
         f"Дневной базовый лимит: <b>{plan_cfg['daily_base']}</b> запросов.\n"
-        f"С учётом бонусов от рефералов лимит на сегодня: "
-        f"<b>{limits['used_today']}/{limits['limit_today']}</b>.\n\n"
-        "Спасибо за поддержку проекта 🖤"
+        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>.\n"
     )
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_main_keyboard())
 
 
 # =========================
@@ -518,35 +617,33 @@ async def handle_text(message: Message) -> None:
     state = get_user_state(user_id)
     mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
 
-    # Обновляем досье
     storage.update_dossier_on_message(user_id, state.mode_key, text)
 
-    # Лимиты
-    if not storage.can_make_request(user_id):
+    if (not is_admin(user_id)) and (not storage.can_make_request(user_id)):
         limits = storage.get_limits(user_id)
         await message.answer(
             (
-                "⚠️ Лимит запросов на сегодня исчерпан.\n\n"
+                "Лимит запросов на сегодня исчерпан.\n\n"
                 f"Тариф: <b>{limits['plan_title']}</b>\n"
-                f"Сегодня использовано: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n\n"
-                "Пригласи друзей по реферальной ссылке (кнопка «🎁 Реферал» внизу), "
-                "чтобы получить дополнительные дневные лимиты.\n\n"
-                "Или открой /plans и апгрейдни тариф до Pro/VIP."
+                f"Сегодня использовано: <b>{limits['used_today']}/{limits['limit_today']}</b>.\n\n"
+                "Пригласи друзей через реферальную ссылку (кнопка «🎁 Реферал»), "
+                "чтобы получить дополнительные запросы.\n\n"
+                "Или открой /plans и обнови тариф."
             ),
+            reply_markup=build_main_keyboard(),
         )
         return
 
-    # typing…
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     waiting_message = await message.answer(
-        "⌛ Обрабатываю запрос в режиме "
-        f"<b>{mode_cfg['title']}</b>...\n\nГенерация идёт в реальном времени.",
+        "Думаю над ответом...",
     )
 
     user_prompt = text.strip()
     state.last_prompt = user_prompt
 
+    # Админа не ограничиваем, но статистику всё равно ведём
     storage.register_request(user_id)
 
     history = storage.get_history(user_id)
@@ -574,7 +671,7 @@ async def handle_text(message: Message) -> None:
 
         if not answer_text.strip():
             answer_text = (
-                "Что-то пошло не так при генерации ответа. Попробуй сформулировать запрос по-другому."
+                "Не удалось сформировать ответ. Попробуй переформулировать запрос."
             )
 
         state.last_answer = answer_text
@@ -589,7 +686,7 @@ async def handle_text(message: Message) -> None:
         fallback = (
             answer_text.strip()
             if answer_text.strip()
-            else "❌ Произошла неожиданная ошибка. Попробуй ещё раз позже."
+            else "Произошла внутренняя ошибка. Попробуй ещё раз позже."
         )
         await waiting_message.edit_text(fallback)
 
