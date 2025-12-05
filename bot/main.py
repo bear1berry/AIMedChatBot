@@ -16,9 +16,6 @@ from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -55,7 +52,9 @@ ADMIN_USERNAMES = {
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment (.env)")
 
+# есть ли вообще ИИ
 LLM_AVAILABLE = bool(DEEPSEEK_API_KEY or GROQ_API_KEY)
+# включена ли оплата
 CRYPTO_ENABLED = bool(CRYPTO_PAY_API_TOKEN)
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -177,7 +176,7 @@ ASSISTANT_MODES: Dict[str, AssistantMode] = {
 
 DEFAULT_MODE_CODE = "universal"
 
-# in-memory хранилище выбранного режима (на одного пользователя)
+# выбранные режимы пользователей (in-memory)
 USER_MODES: Dict[int, str] = {}
 
 
@@ -193,7 +192,6 @@ def set_user_mode(telegram_id: int, mode_code: str) -> None:
 
 
 def build_system_prompt(mode: AssistantMode) -> str:
-    """Базовый системный промпт + доп. инструкция под режим."""
     base = (
         "Ты — BlackBox GPT, универсальный ИИ-ассистент в Telegram. "
         "Отвечай чётко, по делу, структурировано и дружелюбно. "
@@ -223,10 +221,8 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаём необходимые таблицы."""
     with _get_conn() as conn:
         cur = conn.cursor()
-        # Пользователи
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users_v2 (
@@ -314,8 +310,7 @@ def user_is_premium(user_row: sqlite3.Row) -> bool:
 
 
 def grant_premium(telegram_id: int, months: int) -> None:
-    """Выдаём / продлеваем премиум на указанное количество месяцев."""
-    extend_seconds = int(months * 30.4375 * 24 * 3600)  # ~месяц
+    extend_seconds = int(months * 30.4375 * 24 * 3600)
     now = int(time.time())
     with _get_conn() as conn:
         cur = conn.cursor()
@@ -440,10 +435,6 @@ async def _call_groq(user_text: str, system_prompt: str) -> str:
 
 
 async def generate_ai_reply(user_text: str, mode: Optional[AssistantMode]) -> str:
-    """
-    Универсальный генератор ответа:
-    DeepSeek → Groq → fallback.
-    """
     if mode is None:
         mode = ASSISTANT_MODES[DEFAULT_MODE_CODE]
 
@@ -482,10 +473,6 @@ async def generate_ai_reply(user_text: str, mode: Optional[AssistantMode]) -> st
 
 
 async def crypto_create_invoice(plan: Plan, telegram_id: int) -> dict:
-    """
-    Создаёт инвойс в Crypto Pay API для указанного тарифа.
-    Возвращает объект Invoice из result.
-    """
     if not CRYPTO_ENABLED:
         raise RuntimeError("Crypto Pay API is not configured")
 
@@ -502,7 +489,7 @@ async def crypto_create_invoice(plan: Plan, telegram_id: int) -> dict:
 
     data = {
         "currency_type": "crypto",
-        "asset": "USDT",  # фиксируем оплату в USDT
+        "asset": "USDT",
         "amount": f"{plan.price_usdt:.2f}",
         "description": f"Подписка {plan.title} для BlackBox GPT",
         "payload": json.dumps(payload_obj),
@@ -539,22 +526,15 @@ async def _ensure_user(message: Message) -> sqlite3.Row:
 
 
 async def _check_access(message: Message) -> Tuple[bool, sqlite3.Row]:
-    """
-    Возвращает (allowed, user_row).
-    Если allowed == False — лимит бесплатных сообщений исчерпан.
-    """
     user = await _ensure_user(message)
     username = message.from_user.username
 
-    # Админы — всегда без ограничений
     if is_user_admin(username):
         return True, user
 
-    # Премиум — без ограничений
     if user_is_premium(user):
         return True, user
 
-    # Если нет подключённой модели — лимит не считаем
     if not LLM_AVAILABLE:
         return True, user
 
@@ -573,79 +553,81 @@ async def _check_access(message: Message) -> Tuple[bool, sqlite3.Row]:
 
 
 # ---------------------------------------------------------------------------
-# UI helpers
+# UI — нижний таскбар (ReplyKeyboard)
 # ---------------------------------------------------------------------------
+
+MAIN_BTN_CHAT = "💬 Начать диалог"
+MAIN_BTN_SUBSCRIPTION = "⚡ Подписка"
+MAIN_BTN_MODES = "🎛 Режимы ассистента"
+BACK_TO_MAIN_BTN = "⬅️ Главное меню"
+
+PLAN_BTN_1M = "1 месяц — 5 USDT"
+PLAN_BTN_3M = "3 месяца — 12 USDT"
+PLAN_BTN_12M = "12 месяцев — 60 USDT"
+
+PLAN_BUTTON_TO_CODE = {
+    PLAN_BTN_1M: "1m",
+    PLAN_BTN_3M: "3m",
+    PLAN_BTN_12M: "12m",
+}
+
+MODE_BUTTON_TO_CODE = {m.title: m.code for m in ASSISTANT_MODES.values()}
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text=MAIN_BTN_CHAT)],
             [
-                KeyboardButton(text="💬 Начать диалог"),
-                KeyboardButton(text="⚡ Подписка"),
-            ],
-            [
-                KeyboardButton(text="🎛 Режимы ассистента"),
+                KeyboardButton(text=MAIN_BTN_MODES),
+                KeyboardButton(text=MAIN_BTN_SUBSCRIPTION),
             ],
         ],
         resize_keyboard=True,
     )
 
 
-def subscription_plans_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def modes_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
             [
-                InlineKeyboardButton(
-                    text="1 месяц — 5 USDT",
-                    callback_data="plan:1m",
-                )
+                KeyboardButton(text=ASSISTANT_MODES["universal"].title),
+                KeyboardButton(text=ASSISTANT_MODES["focus"].title),
             ],
             [
-                InlineKeyboardButton(
-                    text="3 месяца — 12 USDT",
-                    callback_data="plan:3m",
-                )
+                KeyboardButton(text=ASSISTANT_MODES["deep"].title),
+                KeyboardButton(text=ASSISTANT_MODES["creative"].title),
             ],
-            [
-                InlineKeyboardButton(
-                    text="12 месяцев — 60 USDT",
-                    callback_data="plan:12m",
-                )
-            ],
-        ]
+            [KeyboardButton(text=ASSISTANT_MODES["coach"].title)],
+            [KeyboardButton(text=BACK_TO_MAIN_BTN)],
+        ],
+        resize_keyboard=True,
     )
 
 
-def modes_keyboard(current_mode: AssistantMode) -> InlineKeyboardMarkup:
-    rows = []
-
-    def btn(mode: AssistantMode) -> InlineKeyboardButton:
-        text = mode.title
-        if mode.code == current_mode.code:
-            text += " ✓"
-        return InlineKeyboardButton(
-            text=text,
-            callback_data=f"mode:{mode.code}",
-        )
-
-    # Разбиваем на строки по 2 кнопки
-    codes_order = ["universal", "focus", "deep", "creative", "coach"]
-    row: list[InlineKeyboardButton] = []
-    for code in codes_order:
-        mode = ASSISTANT_MODES[code]
-        row.append(btn(mode))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def subscription_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=PLAN_BTN_1M)],
+            [KeyboardButton(text=PLAN_BTN_3M)],
+            [KeyboardButton(text=PLAN_BTN_12M)],
+            [KeyboardButton(text=BACK_TO_MAIN_BTN)],
+        ],
+        resize_keyboard=True,
+    )
 
 
-MENU_TEXTS = {"💬 Начать диалог", "⚡ Подписка", "🎛 Режимы ассистента"}
-
+# Тексты, которые обрабатываются отдельными хэндлерами (чтобы не шли в ИИ)
+MENU_TEXTS = {
+    MAIN_BTN_CHAT,
+    MAIN_BTN_SUBSCRIPTION,
+    MAIN_BTN_MODES,
+    BACK_TO_MAIN_BTN,
+    PLAN_BTN_1M,
+    PLAN_BTN_3M,
+    PLAN_BTN_12M,
+}
+MENU_TEXTS.update(MODE_BUTTON_TO_CODE.keys())
 
 # ---------------------------------------------------------------------------
 # Router & handlers
@@ -668,7 +650,8 @@ async def cmd_start(message: Message) -> None:
         f"Текущий статус: <b>{premium_flag}</b>.\n\n"
         f"Сейчас у тебя есть <b>{FREE_MESSAGES_LIMIT}</b> бесплатных сообщений, "
         "после — можно оформить премиум-подписку через USDT.\n\n"
-        "Выбери действие на клавиатуре ниже 👇"
+        "Все основные кнопки находятся в нижней панели.\n"
+        "Выбери действие на таскбаре 👇"
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
 
@@ -683,14 +666,14 @@ async def cmd_help(message: Message) -> None:
         "• Поддерживать в рабочих и личных задачах\n"
         "• Подсказывать по коду и технологиям\n\n"
         f"Текущий режим: <b>{mode.title}</b>.\n"
-        "Изменить режим можно командой /mode или кнопкой «🎛 Режимы ассистента».\n\n"
-        "Команды:\n"
+        "Изменить режим можно кнопкой «🎛 Режимы ассистента» на нижней панели.\n\n"
+        "Команды (они дублируют кнопки):\n"
         "/start — главное меню\n"
         "/subscription — оформить подписку\n"
         "/mode — выбрать режим ассистента\n"
         "/help — эта справка\n"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=main_menu_keyboard())
 
 
 async def _send_subscription_menu(message: Message) -> None:
@@ -698,13 +681,13 @@ async def _send_subscription_menu(message: Message) -> None:
         "⚡ Подписка BlackBox GPT Premium\n\n"
         f"Бесплатный лимит — <b>{FREE_MESSAGES_LIMIT}</b> сообщений. "
         "После — безлимитный доступ по подписке.\n\n"
-        "Тарифы:\n"
+        "Тарифы (кнопки внизу):\n"
         "• 1 месяц — 5 USDT\n"
         "• 3 месяца — 12 USDT\n"
         "• 12 месяцев — 60 USDT\n\n"
-        "Выбери нужный план 👇"
+        "Выбери нужный план на нижней панели 👇"
     )
-    await message.answer(text, reply_markup=subscription_plans_keyboard())
+    await message.answer(text, reply_markup=subscription_keyboard())
 
 
 @router.message(Command("subscription"))
@@ -712,19 +695,16 @@ async def cmd_subscription(message: Message) -> None:
     await _send_subscription_menu(message)
 
 
-@router.message(F.text == "⚡ Подписка")
+@router.message(F.text == MAIN_BTN_SUBSCRIPTION)
 async def subscription_button(message: Message) -> None:
     await _send_subscription_menu(message)
-
-
-# ------------- Режимы ассистента -----------------
 
 
 async def _send_modes_menu(message: Message) -> None:
     mode = get_user_mode(message.from_user.id)
     lines = [
         "🎛 <b>Режимы ассистента BlackBox GPT</b>\n",
-        "Выбери, как я буду с тобой работать:\n",
+        "Все режимы переключаются через нижнюю панель.\n",
     ]
     for m in ASSISTANT_MODES.values():
         marker = " (текущий)" if m.code == mode.code else ""
@@ -736,7 +716,7 @@ async def _send_modes_menu(message: Message) -> None:
     )
 
     text = "\n".join(lines)
-    await message.answer(text, reply_markup=modes_keyboard(mode))
+    await message.answer(text, reply_markup=modes_keyboard())
 
 
 @router.message(Command("mode"))
@@ -744,73 +724,70 @@ async def cmd_mode(message: Message) -> None:
     await _send_modes_menu(message)
 
 
-@router.message(F.text == "🎛 Режимы ассистента")
+@router.message(F.text == MAIN_BTN_MODES)
 async def modes_button(message: Message) -> None:
     await _send_modes_menu(message)
 
 
-@router.callback_query(F.data.startswith("mode:"))
-async def mode_selected(callback: CallbackQuery) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
+@router.message(F.text == BACK_TO_MAIN_BTN)
+async def back_to_main(message: Message) -> None:
+    await message.answer("Возвращаю в главное меню.", reply_markup=main_menu_keyboard())
 
-    _, mode_code = callback.data.split(":", 1)
-    if mode_code not in ASSISTANT_MODES:
-        await callback.answer("Неизвестный режим", show_alert=True)
-        return
 
-    set_user_mode(callback.from_user.id, mode_code)
-    mode = get_user_mode(callback.from_user.id)
+@router.message(F.text == MAIN_BTN_CHAT)
+async def start_dialog(message: Message) -> None:
+    mode = get_user_mode(message.from_user.id)
+    text = (
+        "Окей, я с тобой. ✌️\n\n"
+        f"Сейчас я работаю в режиме: <b>{mode.title}</b>.\n"
+        "Просто напиши свой запрос одним сообщением.\n\n"
+        "В любой момент можно сменить режим на нижней панели."
+    )
+    await message.answer(text, reply_markup=main_menu_keyboard())
+
+
+@router.message(F.text.in_(MODE_BUTTON_TO_CODE.keys()))
+async def mode_selected(message: Message) -> None:
+    mode_code = MODE_BUTTON_TO_CODE[message.text]
+    set_user_mode(message.from_user.id, mode_code)
+    mode = get_user_mode(message.from_user.id)
 
     lines = [
         "✅ Режим обновлён!\n",
         f"Текущий режим: <b>{mode.title}</b>.\n",
         "Кратко о нём:",
         mode.short,
-        "\nНапиши запрос — я отвечу в этом стиле. "
-        "Сменить режим можно в любой момент.",
+        "\nТеперь просто напиши запрос — я отвечу в этом стиле.",
     ]
     text = "\n".join(lines)
-
-    try:
-        await callback.message.edit_text(text, reply_markup=modes_keyboard(mode))
-    except Exception:
-        # если не удалось отредактировать (старое сообщение и т.п.)
-        await callback.message.answer(text, reply_markup=modes_keyboard(mode))
-
-    await callback.answer("Режим обновлён")
+    await message.answer(text, reply_markup=main_menu_keyboard())
 
 
-# ------------- Подписка / Crypto Bot -----------------
-
-
-@router.callback_query(F.data.startswith("plan:"))
-async def subscription_plan_selected(callback: CallbackQuery) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
-
-    plan_code = callback.data.split(":", 1)[1]
+@router.message(F.text.in_(PLAN_BUTTON_TO_CODE.keys()))
+async def plan_selected(message: Message) -> None:
+    plan_code = PLAN_BUTTON_TO_CODE[message.text]
     plan = PLANS.get(plan_code)
     if not plan:
-        await callback.answer("Неизвестный тариф", show_alert=True)
+        await message.answer(
+            "Не удалось определить тариф. Попробуй ещё раз.",
+            reply_markup=subscription_keyboard(),
+        )
         return
 
     if not CRYPTO_ENABLED:
-        await callback.answer(
+        await message.answer(
             "Платёжный модуль ещё не настроен.\nСвяжись с админом.",
-            show_alert=True,
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     try:
-        invoice = await crypto_create_invoice(plan, callback.from_user.id)
+        invoice = await crypto_create_invoice(plan, message.from_user.id)
     except Exception as e:
         logger.exception("Error while creating invoice: %r", e)
-        await callback.answer(
+        await message.answer(
             "Ошибка при создании счёта.\nПопробуй ещё раз чуть позже.",
-            show_alert=True,
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -823,9 +800,9 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
 
     if not pay_url:
         logger.error("Invoice without pay url: %r", invoice)
-        await callback.answer(
+        await message.answer(
             "Не удалось получить ссылку на оплату.\nПопробуй позже.",
-            show_alert=True,
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -833,47 +810,16 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
         "💳 Оформление подписки BlackBox GPT\n\n"
         f"План: <b>{plan.title}</b>\n"
         f"Сумма: <b>{plan.price_usdt} USDT</b>\n\n"
-        "Нажми кнопку ниже, чтобы перейти к оплате через Crypto Bot.\n\n"
+        "Перейди по ссылке и оплати счёт через Crypto Bot:\n"
+        f"{pay_url}\n\n"
         "После успешной оплаты свяжись с админом, чтобы он активировал премиум-доступ "
         "или подключи автоактивацию через Crypto Pay Webhook в коде."
     )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Оплатить через Crypto Bot",
-                    url=pay_url,
-                )
-            ],
-        ]
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-
-# ------------- Диалог / сообщения -----------------
-
-
-@router.message(F.text == "💬 Начать диалог")
-async def start_dialog(message: Message) -> None:
-    mode = get_user_mode(message.from_user.id)
-    text = (
-        "Окей, я с тобой. ✌️\n\n"
-        f"Сейчас я работаю в режиме: <b>{mode.title}</b>.\n"
-        "Напиши, чем тебе помочь прямо сейчас.\n\n"
-        "Режим можно сменить в любой момент кнопкой «🎛 Режимы ассистента»."
-    )
-    await message.answer(text)
+    await message.answer(text, reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("grant_premium"))
 async def cmd_grant_premium(message: Message) -> None:
-    """
-    /grant_premium <id или @username> <месяцев>
-    Доступно только админам (ADMIN_USERNAMES).
-    """
     if not is_user_admin(message.from_user.username):
         return
 
@@ -910,43 +856,40 @@ async def cmd_grant_premium(message: Message) -> None:
 
     grant_premium(telegram_id, months)
     await message.reply(
-        f"Премиум на {months} мес. выдан пользователю `{telegram_id}`."
+        f"Премиум на {months} мес. выдан пользователю `{telegram_id}`.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def handle_private_chat(message: Message) -> None:
-    """
-    Общий хэндлер для диалога с ИИ.
-    """
     if not message.text:
         return
 
-    # Спец-кнопки обрабатываются отдельными хэндлерами
+    # если это один из служебных текстов-кнопок — их уже обработали другие хэндлеры
     if message.text in MENU_TEXTS:
         return
 
-    # Команды — отдельные хэндлеры
     if message.text.startswith("/"):
         return
 
     allowed, _user_row = await _check_access(message)
     if not allowed:
         used = get_free_used(message.from_user.id)
-        text =(
+        text = (
             "🚫 Лимит бесплатных сообщений исчерпан.\n\n"
             f"Ты уже использовал {used} / {FREE_MESSAGES_LIMIT}.\n\n"
-            "Чтобы продолжить общение без ограничений, оформи премиум-подписку:"
+            "Чтобы продолжить общение без ограничений, оформи премиум-подписку "
+            "через кнопку «⚡ Подписка» на нижней панели."
         )
-        await message.answer(text, reply_markup=subscription_plans_keyboard())
+        await message.answer(text, reply_markup=subscription_keyboard())
         return
 
     mode = get_user_mode(message.from_user.id)
     reply = await generate_ai_reply(message.text, mode)
 
-    # Можно слегка подсветить активный режим в начале ответа
     header = f"<b>{mode.title}</b>\n\n"
-    await message.answer(header + reply)
+    await message.answer(header + reply, reply_markup=main_menu_keyboard())
 
 
 # ---------------------------------------------------------------------------
