@@ -183,3 +183,56 @@ async def fetch_invoice_status(invoice_id: int | str) -> Dict[str, Any]:
         "description": inv.get("description"),
         "payload": inv.get("payload"),
     }
+# ====== Проверка статуса инвойса через Crypto Pay ======
+# Эта функция нужна main.py: from .payments_crypto import fetch_invoice_status
+# Она возвращает словарь с данными инвойса или None, если не найден.
+
+import os
+import httpx
+import logging
+
+CRYPTO_PAY_API_TOKEN = (
+    os.getenv("CRYPTO_PAY_API_TOKEN")
+    or os.getenv("CRYPTO_PAY_TOKEN")
+)
+CRYPTO_PAY_API_URL = "https://pay.crypt.bot/api"
+
+
+async def fetch_invoice_status(invoice_id: int):
+    """
+    Получить статус инвойса по его ID из Crypto Pay.
+    Возвращает dict с инвойсом (как приходит из API) или None.
+    """
+    if not CRYPTO_PAY_API_TOKEN:
+        logging.error("CRYPTO_PAY_API_TOKEN / CRYPTO_PAY_TOKEN не задан в .env")
+        return None
+
+    try:
+        async with httpx.AsyncClient(base_url=CRYPTO_PAY_API_URL, timeout=10.0) as client:
+            resp = await client.post(
+                "/getInvoices",
+                headers={"Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN},
+                json={"invoice_ids": [invoice_id]},
+            )
+            data = resp.json()
+
+        if not data.get("ok"):
+            logging.error("Crypto Pay getInvoices error: %s", data)
+            return None
+
+        invoices = data.get("result") or []
+        if not invoices:
+            logging.warning("Invoice %s not found in Crypto Pay", invoice_id)
+            return None
+
+        invoice = invoices[0]
+        logging.info(
+            "Fetched invoice %s status from Crypto Pay: %s",
+            invoice_id,
+            invoice.get("status"),
+        )
+        return invoice
+
+    except Exception as e:
+        logging.exception("Exception while fetching invoice status from Crypto Pay: %s", e)
+        return None
