@@ -236,7 +236,6 @@ async def fetch_invoice_status(invoice_id: int):
     except Exception as e:
         logging.exception("Exception while fetching invoice status from Crypto Pay: %s", e)
         return None
-
 async def fetch_invoice_status(invoice_id):
     """
     Обратная совместимость для старого кода:
