@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# грузим .env из текущей директории (WorkingDirectory из systemd)
+load_dotenv()
 
 # =============== Общие настройки ===============
 
@@ -6,10 +10,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables")
+    raise RuntimeError("BOT_TOKEN is not set in environment variables (check .env or systemd env)")
 
 if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is not set in environment variables")
+    raise RuntimeError("DEEPSEEK_API_KEY is not set in environment variables (check .env)")
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -117,9 +121,6 @@ PLAN_LIMITS = {
 # =============== Платежи (Telegram Payments / ЮKassa через провайдера) ===============
 
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN")  # выдаёт BotFather
-if not PAYMENT_PROVIDER_TOKEN:
-    raise RuntimeError("PAYMENT_PROVIDER_TOKEN is not set in environment variables")
-
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "RUB")
 
 # Цены в минимальных единицах валюты (копейки для RUB)
@@ -128,6 +129,9 @@ PLAN_PRICES = {
     "vip": int(os.getenv("PLAN_VIP_PRICE", "49900")),  # 499.00 RUB
 }
 
+# Флаг: включены ли платежи вообще
+PAYMENTS_ENABLED = bool(PAYMENT_PROVIDER_TOKEN)
+
 # =============== Реферальные лимиты ===============
 
 # Бонус к дневному лимиту за каждого приглашённого пользователя
@@ -135,5 +139,5 @@ REF_BONUS_PER_USER = int(os.getenv("REF_BONUS_PER_USER", "20"))  # +20 запр�
 
 # =============== Диалоговый контекст ===============
 
-# Сколько последних сообщений (user+assistant) хранить в истории для контекста
+# Сколько последних сообщений (user+assistant) хранить в истории для контекста LLM
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
