@@ -11,6 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
+from .projects_router import router as projects_router
 
 from .subscription_db import (
     get_active_premium_count,
@@ -383,3 +384,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
