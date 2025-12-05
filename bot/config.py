@@ -14,6 +14,10 @@ if ENV_PATH.exists():
 else:
     load_dotenv()
 
+# ===== Пути к файлам данных =====
+DATA_DIR = BASE_DIR / "data"
+USERS_FILE_PATH = str(DATA_DIR / "users.json")
+
 # --- ОБЯЗАТЕЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -167,3 +171,4 @@ DEFAULT_MODE_KEY = "universal"
 AUDIO_PROVIDER = os.getenv("AUDIO_PROVIDER", "yandex")
 YANDEX_SPEECHKIT_API_KEY = os.getenv("YANDEX_SPEECHKIT_API_KEY", "")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
+
