@@ -148,7 +148,7 @@ ONBOARDING_TEXT: str = (
 # токен Crypto Pay API (@CryptoBot), кладёшь в .env
 CRYPTO_PAY_API_TOKEN: Optional[str] = os.getenv("CRYPTO_PAY_API_TOKEN")
 
-# базовый URL API криптобота (его у нас как раз не хватало)
+# базовый URL API криптобота (ЭТОГО КОНСТАНТЫ РАНЬШЕ НЕ ХВАТАЛО)
 CRYPTO_PAY_API_URL: str = os.getenv(
     "CRYPTO_PAY_API_URL",
     "https://pay.crypt.bot/api",
@@ -181,4 +181,24 @@ SUBSCRIPTION_TARIFFS: Dict[str, Dict[str, Any]] = {
 }
 
 
-# === ЯНДЕ
+# === ЯНДЕКС SPEECHKIT (для голоса, пока опционально) ===
+
+YANDEX_SPEECHKIT_API_KEY: Optional[str] = os.getenv("YANDEX_SPEECHKIT_API_KEY")
+YANDEX_SPEECHKIT_FOLDER_ID: Optional[str] = os.getenv("YANDEX_SPEECHKIT_FOLDER_ID")
+
+
+# === ОТЛАДОЧНЫЙ ВЫВОД ===
+
+def print_debug_config() -> None:
+    """Чуть-чуть логов при старте, чтобы понимать, что .env подцепился."""
+    print(f"[CONFIG] BASE_DIR={BASE_DIR}")
+    print(f"[CONFIG] ENV_PATH={ENV_PATH} exists={ENV_PATH.exists()}")
+    print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")
+    print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")
+    print(
+        f"[CONFIG] CRYPTO_PAY_API_TOKEN loaded? "
+        f"{'YES' if CRYPTO_PAY_API_TOKEN else 'NO'}"
+    )
+
+
+print_debug_config()
