@@ -1,18 +1,21 @@
 import json
 import threading
-from datetime import datetime, date, timedelta
+from typing import Dict, Any, Optional
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Iterable
 
 from bot.config import (
-    USERS_FILE_PATH,
-    DEFAULT_MODE_KEY,
+    PLAN_LIMITS,
     REF_BONUS_PER_USER,
     MAX_HISTORY_MESSAGES,
-    PLAN_LIMITS,
     ADMIN_USER_IDS,
 )
 
+# Локально считаем путь к файлу пользователей,
+# чтобы не зависеть от USERS_FILE_PATH в config.py
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+USERS_FILE_PATH = str(DATA_DIR / "users.json")
 
 def _today_str() -> str:
     # Можно заменить на UTC по желанию
@@ -397,3 +400,4 @@ class Storage:
             for inv in payments.get("invoices", []):
                 if inv.get("status") in wanted:
                     yield int(uid_str), inv
+
