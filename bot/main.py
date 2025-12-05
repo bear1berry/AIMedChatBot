@@ -114,7 +114,7 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
         [
             KeyboardButton(text=BTN_PROFILE),
             KeyboardButton(text=BTN_REFERRAL),
-            KeyboardButton(text=BTN_TARIФЫ),
+            KeyboardButton(text=BTN_TARIFFS),
         ],
     ]
     return ReplyKeyboardMarkup(
@@ -421,7 +421,6 @@ async def service_button(message: Message) -> None:
         kb = build_main_keyboard()
 
     elif action == "profile":
-        # Используем логику профиля
         user = storage.get_or_create_user(user_id)
         dossier = user.get("dossier", {})
         stats = storage.get_referral_stats(user_id)
