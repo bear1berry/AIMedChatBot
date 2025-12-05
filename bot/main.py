@@ -73,7 +73,8 @@ logger = logging.getLogger(__name__)
 # Aiogram setup
 # ---------------------------------------------------------------------------
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -966,3 +967,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
