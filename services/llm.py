@@ -12,6 +12,8 @@ from bot.config import (
     DEFAULT_MODE_KEY,
 )
 
+log = logging.getLogger(__name__)
+
 
 def _build_messages(
     mode_key: str,
@@ -19,26 +21,19 @@ def _build_messages(
     history: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, str]]:
     """
-    Собираем messages для Chat Completions:
-    [system] + history + [user]
+    Собираем список сообщений в формате OpenAI/DeepSeek.
+    history — список словарей вида {"role": "...", "content": "..."}.
     """
-    mode_cfg: Dict[str, str] = ASSISTANT_MODES.get(
-        mode_key,
-        ASSISTANT_MODES[DEFAULT_MODE_KEY],
-    )
-    system_prompt = mode_cfg["system_prompt"]
+    mode = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
+    system_prompt = mode["system_prompt"]
 
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": system_prompt}
     ]
 
     if history:
-        # history — список словарей вида {"role": "user"/"assistant", "content": "..."}
-        for msg in history:
-            if msg.get("role") in {"user", "assistant"} and msg.get("content"):
-                messages.append(
-                    {"role": msg["role"], "content": msg["content"]},
-                )
+        # Уже должны быть в формате {"role": ..., "content": ...}
+        messages.extend(history)
 
     messages.append({"role": "user", "content": user_prompt})
     return messages
@@ -50,63 +45,69 @@ async def ask_llm_stream(
     history: Optional[List[Dict[str, str]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Стриминговый вызов DeepSeek Chat Completions.
-    Отдаёт куски текста по мере генерации (как async generator).
+    Стриминговый запрос к DeepSeek.
+    Отдаём чанки текста по мере генерации.
     """
+    messages = _build_messages(mode_key, user_prompt, history)
+
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
-
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": _build_messages(mode_key, user_prompt, history),
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "stream": True,
-    }
-
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "stream": True,
+    }
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
 
-                # Стандартный формат: "data: {json}"
-                if not line.startswith("data:"):
-                    continue
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    # Протокол совместим с OpenAI: строки вида "data: {...}"
+                    if line.startswith(":"):
+                        # комментарий SSE
+                        continue
+                    if line.startswith("data:"):
+                        data_str = line[len("data:"):].strip()
+                    else:
+                        data_str = line.strip()
 
-                data_str = line[len("data:"):].strip()
-                if not data_str or data_str == "[DONE]":
-                    break
+                    if not data_str or data_str == "[DONE]":
+                        break
 
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    logging.warning("Cannot decode LLM stream chunk: %s", data_str)
-                    continue
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        log.warning("Failed to parse DeepSeek stream chunk: %r", data_str[:200])
+                        continue
 
-                try:
-                    delta = data["choices"][0]["delta"]
+                    choices = data.get("choices")
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
                     content = delta.get("content")
                     if content:
                         yield content
-                except (KeyError, IndexError) as e:
-                    logging.warning("Unexpected stream chunk format: %s | %s", e, data)
-                    continue
+
+    except httpx.HTTPStatusError as e:
+        log.error("DeepSeek HTTP error: %s, response=%s", e, getattr(e, "response", None))
+    except Exception as e:  # noqa: BLE001
+        log.exception("DeepSeek streaming error: %s", e)
 
 
-async def ask_llm(
+async def ask_llm_full(
     mode_key: str,
     user_prompt: str,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
-    Нестрмиминговая обёртка: собирает все чанки в один ответ.
-    Можно использовать там, где стриминг не нужен.
+    Нестриминговая обёртка: собирает все чанки в один ответ.
     """
     chunks: List[str] = []
     async for chunk in ask_llm_stream(mode_key, user_prompt, history):
