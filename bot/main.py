@@ -1,13 +1,12 @@
 import asyncio
 import logging
-import os
 from typing import Dict, Optional
 
-import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
+from aiogram.filters.command import CommandObject
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -15,80 +14,18 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-# =========================
-#  Configuration
-# =========================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables")
-
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is not set in environment variables")
-
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+from bot.config import BOT_TOKEN, ASSISTANT_MODES, DEFAULT_MODE_KEY
+from services.llm import ask_llm
+from services.storage import Storage
 
 # =========================
-#  Assistant modes
+#  Глобальное хранилище
 # =========================
 
-ASSISTANT_MODES: Dict[str, Dict[str, str]] = {
-    "universal": {
-        "title": "🧠 Универсальный",
-        "description": "Ответы на любые вопросы: от жизни до кода.",
-        "system_prompt": (
-            "Ты — мощный русскоязычный универсальный ИИ-ассистент. "
-            "Отвечай максимально полезно, структурированно и по делу. "
-            "Сохраняй дружелюбный, но уверенный тон. "
-            "При необходимости используй списки и шаги."
-        ),
-    },
-    "med": {
-        "title": "⚕️ Медицина",
-        "description": "Профильный режим для медицины и доказательной базы.",
-        "system_prompt": (
-            "Ты — ИИ-ассистент врача-эпидемиолога с уклоном в доказательную медицину. "
-            "Не ставь диагнозы и не назначай лечение — всегда напоминай, что нужна очная консультация врача. "
-            "Объясняй механизмы болезней, препараты и исследования простым языком, но научно корректно."
-        ),
-    },
-    "coach": {
-        "title": "🔥 Наставник",
-        "description": "Дисциплина, цели, прокачка личности.",
-        "system_prompt": (
-            "Ты — личный наставник по развитию личности, дисциплине и продуктивности. "
-            "Помогай выстраивать систему, а не только давать мотивацию. "
-            "Будь прямолинейным, но поддерживающим. "
-            "Фокус на конкретных шагах и привычках."
-        ),
-    },
-    "biz": {
-        "title": "💼 Бизнес / Идеи",
-        "description": "Стратегия, Telegram, стартапы, монетизация.",
-        "system_prompt": (
-            "Ты — стратег по цифровым продуктам и Telegram-проектам. "
-            "Помогаешь продумывать монетизацию, воронки, UX и автоматизацию с помощью ИИ. "
-            "Отвечай структурно: блоки, шаги, приоритеты."
-        ),
-    },
-    "creative": {
-        "title": "🎨 Креатив",
-        "description": "Нейминг, тексты, промпты, визуальные концепции.",
-        "system_prompt": (
-            "Ты — креативный директор и копирайтер. "
-            "Генерируешь названия, тексты, образы, сильные промпты для генерации картинок. "
-            "Сочетай дерзость, минимализм и премиальный стиль."
-        ),
-    },
-}
-
-DEFAULT_MODE_KEY = "universal"
+storage = Storage()  # data/users.json
 
 # =========================
-#  In-memory user state
+#  In-memory состояние
 # =========================
 
 
@@ -97,20 +34,31 @@ class UserState:
         self.mode_key = mode_key
         self.last_prompt: Optional[str] = None
         self.last_answer: Optional[str] = None
-        self.ref_code: Optional[str] = None  # заглушка под реферальную систему
 
 
 user_states: Dict[int, UserState] = {}
 
+
+def get_user_state(user_id: int) -> UserState:
+    """
+    Достаём состояние из памяти и синхронизируем с файловым хранилищем.
+    """
+    if user_id not in user_states:
+        # подтянем сохранённый режим из файла
+        stored = storage.get_or_create_user(user_id)
+        mode_key = stored.get("mode_key", DEFAULT_MODE_KEY)
+        user_states[user_id] = UserState(mode_key=mode_key)
+    return user_states[user_id]
+
+
 # =========================
-#  Keyboards (нижний таскбар)
+#  Клавиатура (нижний таскбар)
 # =========================
 
 
 def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
     """
     Нижний таскбар: режимы ассистента + сервисные кнопки.
-    Никаких ReplyKeyboard — только inline.
     """
     mode_buttons = [
         InlineKeyboardButton(
@@ -126,72 +74,55 @@ def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🎁 Реферал", callback_data="service:referral"),
     ]
 
-    # Первая строка — режимы
-    # Вторая строка — сервисные
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            mode_buttons,      # строка с режимами
-            service_buttons,   # строка сервисных кнопок
+            mode_buttons,
+            service_buttons,
         ]
     )
     return keyboard
 
 
-def get_user_state(user_id: int) -> UserState:
-    if user_id not in user_states:
-        user_states[user_id] = UserState()
-    return user_states[user_id]
-
-
 # =========================
-#  DeepSeek client
-# =========================
-
-
-async def call_deepseek(system_prompt: str, user_prompt: str) -> str:
-    """
-    Вызов DeepSeek Chat Completion через совместимый с OpenAI формат.
-    """
-    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
-
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "stream": False,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
-        logging.error("Unexpected DeepSeek response format: %s", data)
-        return "Произошла ошибка при обработке ответа модели. Попробуй ещё раз."
-
-
-# =========================
-#  Routers & Handlers
+#  Router
 # =========================
 
 router = Router()
 
 
+# =========================
+#  Handlers
+# =========================
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    state = get_user_state(message.from_user.id)
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    user_id = message.from_user.id
+    state = get_user_state(user_id)
+
+    # Обработка реферального кода из /start
+    ref_msg = ""
+    ref_code_raw = (command.args or "").strip() if command else ""
+    if ref_code_raw:
+        # Ожидаем формат ref_КОД, но если без префикса — тоже съедим
+        arg = ref_code_raw.strip()
+        if arg.lower().startswith("ref_"):
+            arg = arg[4:]
+        arg = arg.upper()
+
+        status = storage.attach_referral(user_id, arg)
+        if status == "ok":
+            ref_msg = (
+                "\n\n🎁 Твой аккаунт привязан к реферальному коду. "
+                "Ты получил бонусные лимиты."
+            )
+        elif status == "not_found":
+            ref_msg = "\n\n⚠️ Реферальный код не найден, но бот всё равно доступен."
+        elif status == "already_has_referrer":
+            ref_msg = "\n\nℹ️ Реферальный код уже был привязан ранее."
+        elif status == "self_referral":
+            ref_msg = "\n\n⚠️ Нельзя использовать собственный реферальный код."
+
     mode_cfg = ASSISTANT_MODES[state.mode_key]
 
     text = (
@@ -200,6 +131,7 @@ async def cmd_start(message: Message) -> None:
         "Выбери режим внизу и просто напиши запрос.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>"
+        f"{ref_msg}"
     )
 
     await message.answer(
@@ -221,6 +153,33 @@ async def cmd_mode(message: Message) -> None:
     )
 
 
+@router.message(Command("profile"))
+async def cmd_profile(message: Message) -> None:
+    user_id = message.from_user.id
+    state = get_user_state(user_id)
+    user = storage.get_or_create_user(user_id)
+    dossier = user.get("dossier", {})
+    stats = storage.get_referral_stats(user_id)
+
+    mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+
+    text = (
+        "👤 <b>Твой профиль</b>\n\n"
+        f"Режим по умолчанию: <b>{mode_cfg['title']}</b>\n"
+        f"Сообщений: <b>{dossier.get('messages_count', 0)}</b>\n"
+        f"Последний запрос: <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+        "🎁 <b>Реферальная система</b>\n"
+        f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
+        f"Приглашено: <b>{stats['invited_count']}</b>\n"
+        f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n"
+    )
+
+    await message.answer(
+        text,
+        reply_markup=build_main_keyboard(state.mode_key),
+    )
+
+
 @router.callback_query(F.data.startswith("mode:"))
 async def cb_change_mode(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
@@ -232,6 +191,8 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
         return
 
     state.mode_key = mode_key
+    storage.update_user_mode(user_id, mode_key)
+
     mode_cfg = ASSISTANT_MODES[mode_key]
 
     new_text = (
@@ -242,13 +203,11 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
     )
 
     try:
-        # Пытаемся отредактировать последнее сообщение бота
         await callback.message.edit_text(
             new_text,
             reply_markup=build_main_keyboard(state.mode_key),
         )
     except Exception:
-        # Если не получилось — просто шлём новое
         await callback.message.answer(
             new_text,
             reply_markup=build_main_keyboard(state.mode_key),
@@ -273,19 +232,37 @@ async def cb_service(callback: CallbackQuery) -> None:
             "Или просто напиши свою задачу — режим уже выбран."
         )
     elif action == "profile":
+        user = storage.get_or_create_user(user_id)
+        dossier = user.get("dossier", {})
+        stats = storage.get_referral_stats(user_id)
+        mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+
         text = (
-            "👤 <b>Профиль</b>\n\n"
-            "Пока профиль хранится в памяти бота в оперативке сервера.\n"
-            "В следующих версиях тут будет:\n"
-            "— Личные настройки режимов\n"
-            "— Избранные сценарии\n"
-            "— Статистика диалогов"
+            "👤 <b>Твой профиль</b>\n\n"
+            f"Режим по умолчанию: <b>{mode_cfg['title']}</b>\n"
+            f"Сообщений: <b>{dossier.get('messages_count', 0)}</b>\n"
+            f"Последний запрос: <i>{dossier.get('last_prompt_preview', '')}</i>\n\n"
+            "🎁 <b>Реферальная система</b>\n"
+            f"Твой код: <code>{stats['code'] or 'ещё не сгенерирован'}</code>\n"
+            f"Приглашено: <b>{stats['invited_count']}</b>\n"
+            f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n"
         )
     elif action == "referral":
+        # Генерация и показ реферальной ссылки
+        code = storage.ensure_ref_code(user_id)
+        stats = storage.get_referral_stats(user_id)
+
+        me = await callback.message.bot.get_me()
+        username = me.username or "YourBot"
+        link = f"https://t.me/{username}?start=ref_{code}"
+
         text = (
-            "🎁 <b>Реферальная система</b>\n\n"
-            "Здесь будет твоя персональная ссылка, за друзей — бонусы.\n"
-            "Сейчас это заглушка, логика будет включена при запуске монетизации."
+            "🎁 <b>Твоя реферальная программа</b>\n\n"
+            f"Код: <code>{code}</code>\n"
+            f"Ссылка: <code>{link}</code>\n\n"
+            f"Приглашено: <b>{stats['invited_count']}</b>\n"
+            f"Запросов: <b>{stats['used']}/{stats['limit']}</b>\n\n"
+            "Каждый приглашённый через твою ссылку даёт бонусные лимиты запросов."
         )
     else:
         text = "Сервис в разработке."
@@ -297,14 +274,37 @@ async def cb_service(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
+@router.message(F.text & ~F.via_bot)
 async def handle_text(message: Message) -> None:
     """
     Главный обработчик любых текстовых запросов пользователя.
     """
     user_id = message.from_user.id
+    text = message.text or ""
+
+    # Не обрабатываем команды здесь
+    if text.startswith("/"):
+        return
+
     state = get_user_state(user_id)
-    mode_cfg = ASSISTANT_MODES[state.mode_key]
+    mode_cfg = ASSISTANT_MODES.get(state.mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+
+    # Обновляем досье
+    storage.update_dossier_on_message(user_id, state.mode_key, text)
+
+    # Проверяем лимиты
+    if not storage.can_make_request(user_id):
+        used, limit = storage.get_limits(user_id)
+        await message.answer(
+            (
+                "⚠️ Лимит запросов исчерпан.\n\n"
+                f"Твои запросы: <b>{used}/{limit}</b>.\n"
+                "Пригласи друзей по реферальной ссылке (кнопка «🎁 Реферал» внизу), "
+                "чтобы получить дополнительные лимиты."
+            ),
+            reply_markup=build_main_keyboard(state.mode_key),
+        )
+        return
 
     waiting_message = await message.answer(
         "⌛ Обрабатываю запрос в режиме "
@@ -312,31 +312,24 @@ async def handle_text(message: Message) -> None:
         reply_markup=build_main_keyboard(state.mode_key),
     )
 
-    user_prompt = message.text.strip()
+    user_prompt = text.strip()
     state.last_prompt = user_prompt
 
+    # Регистрируем использование лимита
+    storage.register_request(user_id)
+
     try:
-        answer = await call_deepseek(
-            system_prompt=mode_cfg["system_prompt"],
-            user_prompt=user_prompt,
-        )
+        answer = await ask_llm(state.mode_key, user_prompt)
         state.last_answer = answer
 
         await waiting_message.edit_text(
             answer,
             reply_markup=build_main_keyboard(state.mode_key),
         )
-    except httpx.HTTPStatusError as e:
-        logging.exception("DeepSeek HTTP error: %s", e)
-        await waiting_message.edit_text(
-            "🚫 DeepSeek вернул ошибку. Попробуй ещё раз позже "
-            "или проверь баланс / API-ключ.",
-            reply_markup=build_main_keyboard(state.mode_key),
-        )
     except Exception as e:  # noqa: BLE001
         logging.exception("Unexpected error while handling text: %s", e)
         await waiting_message.edit_text(
-            "❌ Произошла неожиданная ошибка. Я уже в логах, можешь попробовать ещё раз.",
+            "❌ Произошла неожиданная ошибка. Попробуй ещё раз позже.",
             reply_markup=build_main_keyboard(state.mode_key),
         )
 
