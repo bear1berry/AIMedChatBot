@@ -25,6 +25,7 @@ from bot.config import (
     PAYMENT_PROVIDER_TOKEN,
     PAYMENT_CURRENCY,
     PLAN_PRICES,
+    PAYMENTS_ENABLED,
 )
 from services.llm import ask_llm_stream
 from services.storage import Storage
@@ -261,14 +262,26 @@ async def cmd_plans(message: Message) -> None:
         "запросов в день к своему тарифу.\n"
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Купить Pro", callback_data="buy:pro"),
-                InlineKeyboardButton(text="Купить VIP", callback_data="buy:vip"),
-            ],
-        ]
-    )
+    if PAYMENTS_ENABLED:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Купить Pro", callback_data="buy:pro"),
+                    InlineKeyboardButton(text="Купить VIP", callback_data="buy:vip"),
+                ],
+            ]
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Оплата скоро будет доступна",
+                        callback_data="service:plans_info",
+                    )
+                ]
+            ]
+        )
 
     await message.answer(
         "\n".join(lines),
@@ -382,6 +395,12 @@ async def cb_service(callback: CallbackQuery) -> None:
         await cmd_plans(callback.message)
         await callback.answer()
         return
+    elif action == "plans_info":
+        text = (
+            "💳 <b>Оплата</b>\n\n"
+            "Платёжный провайдер пока не настроен.\n"
+            "Скоро здесь появится возможность оформить Pro/VIP прямо в боте."
+        )
     else:
         text = "Сервис в разработке."
 
@@ -401,6 +420,13 @@ async def cb_service(callback: CallbackQuery) -> None:
 async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
     _, plan = callback.data.split(":", 1)
+
+    if not PAYMENTS_ENABLED:
+        await callback.answer(
+            "Платежи пока не настроены. Свяжись с админом или попробуй позже.",
+            show_alert=True,
+        )
+        return
 
     if plan not in ("pro", "vip"):
         await callback.answer("Этот тариф недоступен для покупки.", show_alert=True)
