@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
@@ -24,7 +24,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
-
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -71,7 +70,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Тарифы
 # ---------------------------------------------------------------------------
@@ -110,6 +108,108 @@ PLANS: dict[str, Plan] = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Режимы ассистента
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AssistantMode:
+    code: str
+    title: str   # c эмодзи
+    short: str   # короткое описание
+    system: str  # доп. системные инструкции
+
+
+ASSISTANT_MODES: Dict[str, AssistantMode] = {
+    "universal": AssistantMode(
+        code="universal",
+        title="🌗 Универсальный",
+        short="Сбалансированные ответы для любых задач.",
+        system=(
+            "Отвечай сбалансированно: сочетай глубину и краткость. "
+            "Если вопрос расплывчатый — задавай уточняющие вопросы, "
+            "чтобы сузить задачу и дать более точный ответ."
+        ),
+    ),
+    "focus": AssistantMode(
+        code="focus",
+        title="🎯 Фокус / Задачи",
+        short="Кратко, по делу, с чек-листами и шагами.",
+        system=(
+            "Отвечай максимально структурировано и кратко. "
+            "Начинай с очень короткого вывода, затем давай пошаговый план. "
+            "Избегай лишней воды, используй списки, чек-листы и конкретные действия."
+        ),
+    ),
+    "deep": AssistantMode(
+        code="deep",
+        title="🧠 Глубокий разбор",
+        short="Глубокая аналитика, стратегии, сценарии.",
+        system=(
+            "Делай глубокий разбор ситуации. "
+            "Разбей ответ на блоки: контекст, анализ, варианты решений, риски, вывод. "
+            "Приводи примеры и возможные сценарии развития."
+        ),
+    ),
+    "creative": AssistantMode(
+        code="creative",
+        title="🔥 Креатив / Идеи",
+        short="Мозговой штурм, нестандартные решения.",
+        system=(
+            "Думай как креативный директор и стратег. "
+            "Генерируй несколько разных идей, вариаций, углов зрения. "
+            "Можно чуть более свободный стиль, но всё равно структуруй результат."
+        ),
+    ),
+    "coach": AssistantMode(
+        code="coach",
+        title="🗣 Ментор / Мотивация",
+        short="Мягкий, но честный наставник.",
+        system=(
+            "Веди себя как сильный, но заботливый наставник. "
+            "Говори прямо, без сахара, но с уважением. "
+            "Помогай увидеть слепые зоны, давай вопросы для самоанализа "
+            "и конкретные шаги, добавляй немного мотивации и опоры."
+        ),
+    ),
+}
+
+DEFAULT_MODE_CODE = "universal"
+
+# in-memory хранилище выбранного режима (на одного пользователя)
+USER_MODES: Dict[int, str] = {}
+
+
+def get_user_mode(telegram_id: int) -> AssistantMode:
+    code = USER_MODES.get(telegram_id, DEFAULT_MODE_CODE)
+    return ASSISTANT_MODES.get(code, ASSISTANT_MODES[DEFAULT_MODE_CODE])
+
+
+def set_user_mode(telegram_id: int, mode_code: str) -> None:
+    if mode_code not in ASSISTANT_MODES:
+        return
+    USER_MODES[telegram_id] = mode_code
+
+
+def build_system_prompt(mode: AssistantMode) -> str:
+    """Базовый системный промпт + доп. инструкция под режим."""
+    base = (
+        "Ты — BlackBox GPT, универсальный ИИ-ассистент в Telegram. "
+        "Отвечай чётко, по делу, структурировано и дружелюбно. "
+        "Избегай лишней воды, давай максимум пользы. "
+        "Если вопрос касается здоровья, медицины, диагнозов или лечения — "
+        "давай только общую справочную информацию и обязательно советуй "
+        "обратиться к врачу. "
+        "Всегда отвечай на русском языке, если явно не просят другой язык."
+    )
+    return (
+        base
+        + "\n\n"
+        + f"Текущий режим ассистента: {mode.title}.\n"
+        + mode.system
+    )
+
 
 # ---------------------------------------------------------------------------
 # База данных (users_v2)
@@ -126,25 +226,23 @@ def init_db() -> None:
     """Создаём необходимые таблицы."""
     with _get_conn() as conn:
         cur = conn.cursor()
-
         # Пользователи
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users_v2 (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id      INTEGER UNIQUE NOT NULL,
-                username         TEXT,
-                first_name       TEXT,
-                last_name        TEXT,
-                is_premium       INTEGER NOT NULL DEFAULT 0,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_premium INTEGER NOT NULL DEFAULT 0,
                 premium_until_ts INTEGER,
-                free_used        INTEGER NOT NULL DEFAULT 0,
-                created_at_ts    INTEGER NOT NULL,
-                updated_at_ts    INTEGER NOT NULL
+                free_used INTEGER NOT NULL DEFAULT 0,
+                created_at_ts INTEGER NOT NULL,
+                updated_at_ts INTEGER NOT NULL
             )
             """
         )
-
         conn.commit()
 
 
@@ -157,11 +255,13 @@ def get_or_create_user(
     now = int(time.time())
     with _get_conn() as conn:
         cur = conn.cursor()
+
         cur.execute(
             "SELECT * FROM users_v2 WHERE telegram_id = ?",
             (telegram_id,),
         )
         row = cur.fetchone()
+
         if row:
             cur.execute(
                 """
@@ -175,20 +275,15 @@ def get_or_create_user(
             cur.execute(
                 """
                 INSERT INTO users_v2 (
-                    telegram_id,
-                    username,
-                    first_name,
-                    last_name,
-                    is_premium,
-                    premium_until_ts,
-                    free_used,
-                    created_at_ts,
-                    updated_at_ts
+                    telegram_id, username, first_name, last_name,
+                    is_premium, premium_until_ts, free_used,
+                    created_at_ts, updated_at_ts
                 )
                 VALUES (?, ?, ?, ?, 0, NULL, 0, ?, ?)
                 """,
                 (telegram_id, username, first_name, last_name, now, now),
             )
+
         conn.commit()
 
         cur.execute(
@@ -222,7 +317,6 @@ def grant_premium(telegram_id: int, months: int) -> None:
     """Выдаём / продлеваем премиум на указанное количество месяцев."""
     extend_seconds = int(months * 30.4375 * 24 * 3600)  # ~месяц
     now = int(time.time())
-
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -231,6 +325,7 @@ def grant_premium(telegram_id: int, months: int) -> None:
         )
         row = cur.fetchone()
         current_until = int(row["premium_until_ts"]) if row and row["premium_until_ts"] else 0
+
         base = current_until if current_until > now else now
         new_until = base + extend_seconds
 
@@ -268,6 +363,7 @@ def increment_free_used(telegram_id: int, delta: int = 1) -> int:
             (delta, telegram_id),
         )
         conn.commit()
+
         cur.execute(
             "SELECT free_used FROM users_v2 WHERE telegram_id = ?",
             (telegram_id,),
@@ -286,18 +382,8 @@ def is_user_admin(username: Optional[str]) -> bool:
 # LLM (DeepSeek / Groq)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "Ты — BlackBox GPT, универсальный ИИ-ассистент в Telegram. "
-    "Отвечай чётко, по делу, структурировано и дружелюбно. "
-    "Избегай лишней воды, давай максимум пользы. "
-    "Если вопрос касается здоровья, медицины, диагнозов или лечения — "
-    "давай только общую справочную информацию и обязательно советуй "
-    "обратиться к врачу. "
-    "Всегда отвечай на русском языке, если явно не просят другой язык."
-)
 
-
-async def _call_deepseek(user_text: str) -> str:
+async def _call_deepseek(user_text: str, system_prompt: str) -> str:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
@@ -308,7 +394,7 @@ async def _call_deepseek(user_text: str) -> str:
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
         "temperature": 0.7,
@@ -316,16 +402,16 @@ async def _call_deepseek(user_text: str) -> str:
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-    resp.raise_for_status()
-    data = resp.json()
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"DeepSeek API вернул пустой ответ: {data}")
     return choices[0]["message"]["content"].strip()
 
 
-async def _call_groq(user_text: str) -> str:
+async def _call_groq(user_text: str, system_prompt: str) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured")
 
@@ -336,7 +422,7 @@ async def _call_groq(user_text: str) -> str:
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
         "temperature": 0.7,
@@ -344,31 +430,36 @@ async def _call_groq(user_text: str) -> str:
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(GROQ_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-    resp.raise_for_status()
-    data = resp.json()
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"Groq API вернул пустой ответ: {data}")
     return choices[0]["message"]["content"].strip()
 
 
-async def generate_ai_reply(user_text: str) -> str:
+async def generate_ai_reply(user_text: str, mode: Optional[AssistantMode]) -> str:
     """
-    Универсальный генератор ответа: DeepSeek → Groq → fallback.
+    Универсальный генератор ответа:
+    DeepSeek → Groq → fallback.
     """
+    if mode is None:
+        mode = ASSISTANT_MODES[DEFAULT_MODE_CODE]
+
+    system_prompt = build_system_prompt(mode)
     last_error: Optional[Exception] = None
 
     if DEEPSEEK_API_KEY:
         try:
-            return await _call_deepseek(user_text)
+            return await _call_deepseek(user_text, system_prompt)
         except Exception as e:
             last_error = e
             logger.exception("DeepSeek API error: %r", e)
 
     if GROQ_API_KEY:
         try:
-            return await _call_groq(user_text)
+            return await _call_groq(user_text, system_prompt)
         except Exception as e:
             last_error = e
             logger.exception("Groq API error: %r", e)
@@ -422,11 +513,12 @@ async def crypto_create_invoice(plan: Plan, telegram_id: int) -> dict:
 
     async with httpx.AsyncClient(base_url=CRYPTO_PAY_API_URL, timeout=15) as client:
         resp = await client.post("/createInvoice", headers=headers, json=data)
+        resp.raise_for_status()
+        body = resp.json()
 
-    resp.raise_for_status()
-    body = resp.json()
     if not body.get("ok"):
         raise RuntimeError(f"Crypto Pay API error: {body}")
+
     invoice = body.get("result") or {}
     return invoice
 
@@ -492,6 +584,9 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="💬 Начать диалог"),
                 KeyboardButton(text="⚡ Подписка"),
             ],
+            [
+                KeyboardButton(text="🎛 Режимы ассистента"),
+            ],
         ],
         resize_keyboard=True,
     )
@@ -522,7 +617,34 @@ def subscription_plans_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-MENU_TEXTS = {"💬 Начать диалог", "⚡ Подписка"}
+def modes_keyboard(current_mode: AssistantMode) -> InlineKeyboardMarkup:
+    rows = []
+
+    def btn(mode: AssistantMode) -> InlineKeyboardButton:
+        text = mode.title
+        if mode.code == current_mode.code:
+            text += " ✓"
+        return InlineKeyboardButton(
+            text=text,
+            callback_data=f"mode:{mode.code}",
+        )
+
+    # Разбиваем на строки по 2 кнопки
+    codes_order = ["universal", "focus", "deep", "creative", "coach"]
+    row: list[InlineKeyboardButton] = []
+    for code in codes_order:
+        mode = ASSISTANT_MODES[code]
+        row.append(btn(mode))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+MENU_TEXTS = {"💬 Начать диалог", "⚡ Подписка", "🎛 Режимы ассистента"}
 
 
 # ---------------------------------------------------------------------------
@@ -534,13 +656,17 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await _ensure_user(message)
+    user_row = await _ensure_user(message)
+    mode = get_user_mode(message.from_user.id)
 
+    premium_flag = "✅ Премиум активен" if user_is_premium(user_row) else "🆓 Базовый доступ"
     text = (
-        "<b>BlackBox GPT — Universal AI Assistant</b>\n\n"
+        "BlackBox GPT — Universal AI Assistant\n\n"
         "Твой личный универсальный ИИ в Telegram.\n"
         "Помогаю с идеями, текстами, кодом, стратегией, решениями и разбором ситуаций.\n\n"
-        f"Сейчас у тебя есть <b>{FREE_MESSAGES_LIMIT} бесплатных сообщений</b>, "
+        f"Текущий режим ассистента: <b>{mode.title}</b>.\n"
+        f"Текущий статус: <b>{premium_flag}</b>.\n\n"
+        f"Сейчас у тебя есть <b>{FREE_MESSAGES_LIMIT}</b> бесплатных сообщений, "
         "после — можно оформить премиум-подписку через USDT.\n\n"
         "Выбери действие на клавиатуре ниже 👇"
     )
@@ -549,15 +675,19 @@ async def cmd_start(message: Message) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    mode = get_user_mode(message.from_user.id)
     text = (
-        "❓ <b>Что умеет BlackBox GPT</b>\n\n"
+        "❓ Что умеет BlackBox GPT\n\n"
         "• Отвечать на вопросы по любой теме\n"
         "• Помогать с текстами, сценариями, структурой мыслей\n"
         "• Поддерживать в рабочих и личных задачах\n"
         "• Подсказывать по коду и технологиям\n\n"
+        f"Текущий режим: <b>{mode.title}</b>.\n"
+        "Изменить режим можно командой /mode или кнопкой «🎛 Режимы ассистента».\n\n"
         "Команды:\n"
         "/start — главное меню\n"
         "/subscription — оформить подписку\n"
+        "/mode — выбрать режим ассистента\n"
         "/help — эта справка\n"
     )
     await message.answer(text)
@@ -565,9 +695,9 @@ async def cmd_help(message: Message) -> None:
 
 async def _send_subscription_menu(message: Message) -> None:
     text = (
-        "⚡ <b>Подписка BlackBox GPT Premium</b>\n\n"
-        "Бесплатный лимит — "
-        f"<b>{FREE_MESSAGES_LIMIT} сообщений</b>. После — безлимитный доступ по подписке.\n\n"
+        "⚡ Подписка BlackBox GPT Premium\n\n"
+        f"Бесплатный лимит — <b>{FREE_MESSAGES_LIMIT}</b> сообщений. "
+        "После — безлимитный доступ по подписке.\n\n"
         "Тарифы:\n"
         "• 1 месяц — 5 USDT\n"
         "• 3 месяца — 12 USDT\n"
@@ -587,8 +717,80 @@ async def subscription_button(message: Message) -> None:
     await _send_subscription_menu(message)
 
 
+# ------------- Режимы ассистента -----------------
+
+
+async def _send_modes_menu(message: Message) -> None:
+    mode = get_user_mode(message.from_user.id)
+    lines = [
+        "🎛 <b>Режимы ассистента BlackBox GPT</b>\n",
+        "Выбери, как я буду с тобой работать:\n",
+    ]
+    for m in ASSISTANT_MODES.values():
+        marker = " (текущий)" if m.code == mode.code else ""
+        lines.append(f"{m.title} — {m.short}{marker}")
+
+    lines.append(
+        "\nМожно в любой момент сменить режим — это влияет только на стиль и глубину ответов, "
+        "а не ограничивает функционал."
+    )
+
+    text = "\n".join(lines)
+    await message.answer(text, reply_markup=modes_keyboard(mode))
+
+
+@router.message(Command("mode"))
+async def cmd_mode(message: Message) -> None:
+    await _send_modes_menu(message)
+
+
+@router.message(F.text == "🎛 Режимы ассистента")
+async def modes_button(message: Message) -> None:
+    await _send_modes_menu(message)
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def mode_selected(callback: CallbackQuery) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+
+    _, mode_code = callback.data.split(":", 1)
+    if mode_code not in ASSISTANT_MODES:
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+
+    set_user_mode(callback.from_user.id, mode_code)
+    mode = get_user_mode(callback.from_user.id)
+
+    lines = [
+        "✅ Режим обновлён!\n",
+        f"Текущий режим: <b>{mode.title}</b>.\n",
+        "Кратко о нём:",
+        mode.short,
+        "\nНапиши запрос — я отвечу в этом стиле. "
+        "Сменить режим можно в любой момент.",
+    ]
+    text = "\n".join(lines)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=modes_keyboard(mode))
+    except Exception:
+        # если не удалось отредактировать (старое сообщение и т.п.)
+        await callback.message.answer(text, reply_markup=modes_keyboard(mode))
+
+    await callback.answer("Режим обновлён")
+
+
+# ------------- Подписка / Crypto Bot -----------------
+
+
 @router.callback_query(F.data.startswith("plan:"))
 async def subscription_plan_selected(callback: CallbackQuery) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+
     plan_code = callback.data.split(":", 1)[1]
     plan = PLANS.get(plan_code)
     if not plan:
@@ -597,7 +799,7 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
 
     if not CRYPTO_ENABLED:
         await callback.answer(
-            "Платёжный модуль ещё не настроен. Свяжись с админом.",
+            "Платёжный модуль ещё не настроен.\nСвяжись с админом.",
             show_alert=True,
         )
         return
@@ -607,7 +809,7 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
     except Exception as e:
         logger.exception("Error while creating invoice: %r", e)
         await callback.answer(
-            "Ошибка при создании счёта. Попробуй ещё раз чуть позже.",
+            "Ошибка при создании счёта.\nПопробуй ещё раз чуть позже.",
             show_alert=True,
         )
         return
@@ -622,16 +824,16 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
     if not pay_url:
         logger.error("Invoice without pay url: %r", invoice)
         await callback.answer(
-            "Не удалось получить ссылку на оплату. Попробуй позже.",
+            "Не удалось получить ссылку на оплату.\nПопробуй позже.",
             show_alert=True,
         )
         return
 
     text = (
-        "💳 <b>Оформление подписки BlackBox GPT</b>\n\n"
+        "💳 Оформление подписки BlackBox GPT\n\n"
         f"План: <b>{plan.title}</b>\n"
         f"Сумма: <b>{plan.price_usdt} USDT</b>\n\n"
-        "Нажми кнопку ниже, чтобы перейти к оплате через <b>Crypto Bot</b>.\n\n"
+        "Нажми кнопку ниже, чтобы перейти к оплате через Crypto Bot.\n\n"
         "После успешной оплаты свяжись с админом, чтобы он активировал премиум-доступ "
         "или подключи автоактивацию через Crypto Pay Webhook в коде."
     )
@@ -651,17 +853,25 @@ async def subscription_plan_selected(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# ------------- Диалог / сообщения -----------------
+
+
 @router.message(F.text == "💬 Начать диалог")
 async def start_dialog(message: Message) -> None:
-    await message.answer(
-        "Окей, я с тобой. Напиши, чем тебе помочь прямо сейчас 👇",
+    mode = get_user_mode(message.from_user.id)
+    text = (
+        "Окей, я с тобой. ✌️\n\n"
+        f"Сейчас я работаю в режиме: <b>{mode.title}</b>.\n"
+        "Напиши, чем тебе помочь прямо сейчас.\n\n"
+        "Режим можно сменить в любой момент кнопкой «🎛 Режимы ассистента»."
     )
+    await message.answer(text)
 
 
 @router.message(Command("grant_premium"))
 async def cmd_grant_premium(message: Message) -> None:
     """
-    /grant_premium <telegram_id|@username> <месяцев>
+    /grant_premium <id или @username> <месяцев>
     Доступно только админам (ADMIN_USERNAMES).
     """
     if not is_user_admin(message.from_user.username):
@@ -700,8 +910,7 @@ async def cmd_grant_premium(message: Message) -> None:
 
     grant_premium(telegram_id, months)
     await message.reply(
-        f"Премиум на <b>{months}</b> мес. выдан пользователю "
-        f"<code>{telegram_id}</code>."
+        f"Премиум на {months} мес. выдан пользователю `{telegram_id}`."
     )
 
 
@@ -721,19 +930,23 @@ async def handle_private_chat(message: Message) -> None:
     if message.text.startswith("/"):
         return
 
-    allowed, user_row = await _check_access(message)
+    allowed, _user_row = await _check_access(message)
     if not allowed:
         used = get_free_used(message.from_user.id)
-        text = (
-            "🕳 <b>Лимит бесплатных сообщений исчерпан</b>\n\n"
-            f"Ты уже использовал <b>{used} / {FREE_MESSAGES_LIMIT}</b>.\n\n"
-            "Чтобы продолжить общение без ограничений, оформи премиум-подписку 👇"
+        text =(
+            "🚫 Лимит бесплатных сообщений исчерпан.\n\n"
+            f"Ты уже использовал {used} / {FREE_MESSAGES_LIMIT}.\n\n"
+            "Чтобы продолжить общение без ограничений, оформи премиум-подписку:"
         )
         await message.answer(text, reply_markup=subscription_plans_keyboard())
         return
 
-    reply = await generate_ai_reply(message.text)
-    await message.answer(reply)
+    mode = get_user_mode(message.from_user.id)
+    reply = await generate_ai_reply(message.text, mode)
+
+    # Можно слегка подсветить активный режим в начале ответа
+    header = f"<b>{mode.title}</b>\n\n"
+    await message.answer(header + reply)
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +959,7 @@ async def set_bot_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="help", description="Что умеет бот"),
         BotCommand(command="subscription", description="Оформить подписку"),
+        BotCommand(command="mode", description="Выбрать режим ассистента"),
     ]
     await bot.set_my_commands(commands)
 
@@ -760,6 +974,7 @@ async def main() -> None:
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
     dp = Dispatcher()
     dp.include_router(router)
 
