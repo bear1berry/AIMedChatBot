@@ -12,6 +12,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    LabeledPrice,
+    PreCheckoutQuery,
 )
 
 from bot.config import (
@@ -20,6 +22,9 @@ from bot.config import (
     DEFAULT_MODE_KEY,
     PLAN_LIMITS,
     REF_BONUS_PER_USER,
+    PAYMENT_PROVIDER_TOKEN,
+    PAYMENT_CURRENCY,
+    PLAN_PRICES,
 )
 from services.llm import ask_llm_stream
 from services.storage import Storage
@@ -77,6 +82,7 @@ def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="⚡ Сценарии", callback_data="service:templates"),
         InlineKeyboardButton(text="👤 Профиль", callback_data="service:profile"),
         InlineKeyboardButton(text="🎁 Реферал", callback_data="service:referral"),
+        InlineKeyboardButton(text="💳 Тарифы", callback_data="service:plans"),
     ]
 
     keyboard = InlineKeyboardMarkup(
@@ -116,7 +122,7 @@ def _plan_description(plan: str) -> str:
 
 
 # =========================
-#  Handlers
+#  Handlers: старт, профиль, режимы
 # =========================
 
 
@@ -234,9 +240,16 @@ async def cmd_reset(message: Message) -> None:
 @router.message(Command("plans"))
 async def cmd_plans(message: Message) -> None:
     """
-    Краткий обзор тарифов (пока без реальной оплаты/апгрейда).
+    Обзор тарифов + кнопки оплаты.
     """
-    lines = ["💳 <b>Тарифы BlackBoxGPT</b>\n"]
+    user_id = message.from_user.id
+    limits = storage.get_limits(user_id)
+
+    lines = [
+        "💳 <b>Тарифы BlackBoxGPT</b>\n",
+        f"Твой текущий тариф: <b>{limits['plan_title']}</b>",
+        f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n",
+    ]
     for key, cfg in PLAN_LIMITS.items():
         lines.append(
             f"• <b>{cfg['title']}</b> ({key}) — до <b>{cfg['daily_base']}</b> запросов в день."
@@ -245,13 +258,27 @@ async def cmd_plans(message: Message) -> None:
 
     lines.append(
         f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
-        "запросов в день к своему тарифу."
+        "запросов в день к своему тарифу.\n"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Купить Pro", callback_data="buy:pro"),
+                InlineKeyboardButton(text="Купить VIP", callback_data="buy:vip"),
+            ],
+        ]
     )
 
     await message.answer(
         "\n".join(lines),
-        reply_markup=build_main_keyboard(get_user_state(message.from_user.id).mode_key),
+        reply_markup=keyboard,
     )
+
+
+# =========================
+#  Handlers: смена режима, сервисные панели
+# =========================
 
 
 @router.callback_query(F.data.startswith("mode:"))
@@ -350,6 +377,11 @@ async def cb_service(callback: CallbackQuery) -> None:
             f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n\n"
             "Каждый приглашённый через твою ссылку даёт дополнительные запросы в день."
         )
+    elif action == "plans":
+        # Просто вызываем ту же логику, что и /plans
+        await cmd_plans(callback.message)
+        await callback.answer()
+        return
     else:
         text = "Сервис в разработке."
 
@@ -358,6 +390,111 @@ async def cb_service(callback: CallbackQuery) -> None:
         reply_markup=build_main_keyboard(state.mode_key),
     )
     await callback.answer()
+
+
+# =========================
+#  Handlers: оплата и апгрейд тарифа
+# =========================
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    _, plan = callback.data.split(":", 1)
+
+    if plan not in ("pro", "vip"):
+        await callback.answer("Этот тариф недоступен для покупки.", show_alert=True)
+        return
+
+    if plan not in PLAN_PRICES:
+        await callback.answer("Цена для этого тарифа не настроена.", show_alert=True)
+        return
+
+    price_amount = PLAN_PRICES[plan]
+    plan_cfg = PLAN_LIMITS.get(plan, PLAN_LIMITS["pro"])
+    title = f"Тариф {plan_cfg['title']}"
+    description = (
+        f"{plan_cfg.get('description', '')}\n\n"
+        f"Дневной базовый лимит: {plan_cfg['daily_base']} запросов.\n"
+        f"Бонусы от рефералов сохраняются."
+    )
+
+    prices = [LabeledPrice(label=title, amount=price_amount)]
+    payload = f"plan:{plan}"
+
+    await bot.send_invoice(
+        chat_id=callback.message.chat.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token=PAYMENT_PROVIDER_TOKEN,
+        currency=PAYMENT_CURRENCY,
+        prices=prices,
+        start_parameter=f"buy_{plan}",
+    )
+
+    await callback.answer()
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: Bot) -> None:
+    """
+    Обязательный обработчик pre_checkout_query — подтверждаем, что всё ок.
+    """
+    try:
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Error in pre_checkout_query: %s", e)
+        await bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message="Произошла ошибка при обработке платежа. Попробуйте позже.",
+        )
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message) -> None:
+    """
+    Обработка успешного платежа: апгрейд тарифа.
+    """
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+    user_id = message.from_user.id
+
+    plan = None
+    if payload.startswith("plan:"):
+        plan = payload.split(":", 1)[1]
+
+    if plan not in PLAN_LIMITS:
+        await message.answer(
+            "Платёж прошёл, но тариф определить не удалось. Обратись в поддержку.",
+            reply_markup=build_main_keyboard(get_user_state(user_id).mode_key),
+        )
+        return
+
+    # Апгрейд плана
+    storage.set_plan(user_id, plan)
+    limits = storage.get_limits(user_id)
+    plan_cfg = PLAN_LIMITS[plan]
+
+    text = (
+        "✅ <b>Оплата прошла успешно!</b>\n\n"
+        f"Твой новый тариф: <b>{limits['plan_title']}</b>\n"
+        f"Дневной базовый лимит: <b>{plan_cfg['daily_base']}</b> запросов.\n"
+        f"С учётом бонусов от рефералов лимит на сегодня: "
+        f"<b>{limits['used_today']}/{limits['limit_today']}</b>.\n\n"
+        "Спасибо за поддержку проекта 🖤"
+    )
+
+    await message.answer(
+        text,
+        reply_markup=build_main_keyboard(get_user_state(user_id).mode_key),
+    )
+
+
+# =========================
+#  Handler: основной текст + LLM
+# =========================
 
 
 @router.message(F.text & ~F.via_bot)
@@ -391,8 +528,8 @@ async def handle_text(message: Message) -> None:
                 f"Тариф: <b>{limits['plan_title']}</b>\n"
                 f"Сегодня использовано: <b>{limits['used_today']}/{limits['limit_today']}</b> запросов.\n\n"
                 "Пригласи друзей по реферальной ссылке (кнопка «🎁 Реферал» внизу), "
-                "чтобы получить дополнительные дневные лимиты.\n"
-                "Также позже здесь появятся платные тарифы / апгрейды."
+                "чтобы получить дополнительные дневные лимиты.\n\n"
+                "Или открой /plans и апгрейдни тариф до Pro/VIP."
             ),
             reply_markup=build_main_keyboard(state.mode_key),
         )
