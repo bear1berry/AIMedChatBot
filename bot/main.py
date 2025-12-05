@@ -9,11 +9,10 @@ from aiogram.filters import CommandStart, Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import (
     Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     LabeledPrice,
     PreCheckoutQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 
 from bot.config import (
@@ -50,13 +49,36 @@ class UserState:
 
 user_states: Dict[int, UserState] = {}
 
-# Сообщение-панель с таскбаром на чат (по chat_id)
-panel_messages: Dict[int, int] = {}
+# Подписи для кнопок нижнего таскбара
+MODE_BUTTON_LABELS = {
+    "universal": "🧠 Универсальный",
+    "med": "⚕️ Медицина",
+    "coach": "🔥 Наставник",
+    "biz": "💼 Бизнес / Идеи",
+    "creative": "🎨 Креатив",
+}
+
+SERVICE_BUTTON_LABELS = {
+    "templates": "⚡ Сценарии",
+    "profile": "👤 Профиль",
+    "referral": "🎁 Реферал",
+    "plans": "💳 Тарифы",
+}
+
+BUY_BUTTON_PRO = "Pro ⭐"
+BUY_BUTTON_VIP = "VIP 💎"
+
+# Все тексты кнопок, чтобы не отправлять их в LLM
+ALL_BUTTON_TEXTS = (
+    list(MODE_BUTTON_LABELS.values())
+    + list(SERVICE_BUTTON_LABELS.values())
+    + [BUY_BUTTON_PRO, BUY_BUTTON_VIP]
+)
 
 
 def get_user_state(user_id: int) -> UserState:
     """
-    Достаём состояние из памяти и синхронизируем с файловым хранилищем.
+    Берём состояние пользователя из памяти + синхронизируем с файловым хранилищем.
     """
     if user_id not in user_states:
         stored = storage.get_or_create_user(user_id)
@@ -66,54 +88,56 @@ def get_user_state(user_id: int) -> UserState:
 
 
 # =========================
-#  Клавиатура (нижний таскбар)
+#  Нижний таскбар (ReplyKeyboard)
 # =========================
 
 
-def build_main_keyboard(active_mode_key: str) -> InlineKeyboardMarkup:
+def build_main_keyboard() -> ReplyKeyboardMarkup:
     """
-    Нижний таскбар: режимы ассистента + сервисные кнопки + (опционально) Pro/VIP.
-    Все интерактивные действия — только здесь.
+    Постоянная клавиатура внизу. Никаких inline-кнопок в сообщениях.
     """
-    mode_buttons = [
-        InlineKeyboardButton(
-            text=("• " + cfg["title"] if key == active_mode_key else cfg["title"]),
-            callback_data=f"mode:{key}",
-        )
-        for key, cfg in ASSISTANT_MODES.items()
+    rows = [
+        [
+            KeyboardButton(text=MODE_BUTTON_LABELS["universal"]),
+            KeyboardButton(text=MODE_BUTTON_LABELS["med"]),
+        ],
+        [
+            KeyboardButton(text=MODE_BUTTON_LABELS["coach"]),
+            KeyboardButton(text=MODE_BUTTON_LABELS["biz"]),
+        ],
+        [KeyboardButton(text=MODE_BUTTON_LABELS["creative"])],
+        [
+            KeyboardButton(text=SERVICE_BUTTON_LABELS["templates"]),
+            KeyboardButton(text=SERVICE_BUTTON_LABELS["profile"]),
+        ],
+        [
+            KeyboardButton(text=SERVICE_BUTTON_LABELS["referral"]),
+            KeyboardButton(text=SERVICE_BUTTON_LABELS["plans"]),
+        ],
     ]
 
-    service_buttons = [
-        InlineKeyboardButton(text="⚡ Сценарии", callback_data="service:templates"),
-        InlineKeyboardButton(text="👤 Профиль", callback_data="service:profile"),
-        InlineKeyboardButton(text="🎁 Реферал", callback_data="service:referral"),
-        InlineKeyboardButton(text="💳 Тарифы", callback_data="service:plans"),
-    ]
-
-    rows = [mode_buttons, service_buttons]
-
-    # Кнопки покупки тарифов тоже часть нижнего таскбара
+    # Кнопки покупки тарифов тоже в таскбаре
     if PAYMENTS_ENABLED:
-        buy_buttons = [
-            InlineKeyboardButton(text="Pro ⭐", callback_data="buy:pro"),
-            InlineKeyboardButton(text="VIP 💎", callback_data="buy:vip"),
-        ]
-        rows.append(buy_buttons)
+        rows.append(
+            [
+                KeyboardButton(text=BUY_BUTTON_PRO),
+                KeyboardButton(text=BUY_BUTTON_VIP),
+            ]
+        )
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
-    return keyboard
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Напиши запрос...",
+    )
 
 
 # =========================
-#  Router
+#  Router и вспомогалки
 # =========================
 
 router = Router()
-
-
-# =========================
-#  Вспомогательные функции
-# =========================
 
 
 def _ref_level(invited_count: int) -> str:
@@ -126,23 +150,17 @@ def _ref_level(invited_count: int) -> str:
     return "—"
 
 
-def _plan_description(plan: str) -> str:
-    cfg = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
-    return cfg.get("description", "")
-
-
 # =========================
-#  Handlers: старт, профиль, режимы
+#  Старт, профиль, тарифы
 # =========================
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     user_id = message.from_user.id
-    chat_id = message.chat.id
     state = get_user_state(user_id)
 
-    # Обработка реферального кода из /start
+    # Реферальный код из /start
     ref_msg = ""
     ref_code_raw = (command.args or "").strip() if command else ""
     if ref_code_raw:
@@ -170,7 +188,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     text = (
         "🖤 <b>BlackBoxGPT</b>\n\n"
         "Твой персональный ИИ-ассистент.\n"
-        "Навигация — только нижний таскбар, просто пиши запрос.\n\n"
+        "Управление — только нижний таскбар. Просто пиши запрос.\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
         f"Тариф: <b>{limits['plan_title']}</b>\n"
@@ -178,38 +196,10 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         f"{ref_msg}"
     )
 
-    kb = build_main_keyboard(state.mode_key)
-
-    # Пытаемся обновить существующую панель, а не плодить новые
-    panel_msg_id = panel_messages.get(chat_id)
-    if panel_msg_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=panel_msg_id,
-                text=text,
-                reply_markup=kb,
-            )
-            return
-        except Exception:
-            # если не удалось (сообщение удалено и т.п.) — создаём новое
-            pass
-
-    sent = await message.answer(
+    await message.answer(
         text,
-        reply_markup=kb,
+        reply_markup=build_main_keyboard(),
     )
-    panel_messages[chat_id] = sent.message_id
-
-
-@router.message(Command("mode"))
-async def cmd_mode(message: Message) -> None:
-    state = get_user_state(message.from_user.id)
-    text_lines = ["Выбери режим ассистента:\n"]
-    for key, cfg in ASSISTANT_MODES.items():
-        prefix = "•" if key == state.mode_key else "–"
-        text_lines.append(f"{prefix} {cfg['title']} — {cfg['description']}")
-    await message.answer("\n".join(text_lines))
 
 
 @router.message(Command("profile"))
@@ -245,7 +235,7 @@ async def cmd_profile(message: Message) -> None:
 @router.message(Command("reset"))
 async def cmd_reset(message: Message) -> None:
     """
-    Сбрасывает диалоговый контекст (history) для пользователя.
+    Сброс диалогового контекста.
     """
     user_id = message.from_user.id
     storage.reset_history(user_id)
@@ -253,16 +243,13 @@ async def cmd_reset(message: Message) -> None:
     state.last_answer = None
     state.last_prompt = None
 
-    await message.answer(
-        "🔄 Диалоговый контекст сброшен. Можем начать с чистого листа.",
-    )
+    await message.answer("🔄 Диалоговый контекст сброшен. Можем начать с чистого листа.")
 
 
 @router.message(Command("plans"))
 async def cmd_plans(message: Message) -> None:
     """
-    Обзор тарифов (только текст).
-    Покупка — через нижний таскбар (кнопки Pro/VIP).
+    Обзор тарифов текстом. Покупка — кнопками Pro/VIP в таскбаре.
     """
     user_id = message.from_user.id
     limits = storage.get_limits(user_id)
@@ -282,25 +269,30 @@ async def cmd_plans(message: Message) -> None:
         f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
         "запросов в день к своему тарифу.\n"
     )
-    lines.append("Купить Pro или VIP можно через нижний таскбар.")
+    if PAYMENTS_ENABLED:
+        lines.append("Оформить Pro/VIP можно кнопками Pro ⭐ / VIP 💎 в нижнем таскбаре.")
 
     await message.answer("\n".join(lines))
 
 
 # =========================
-#  Handlers: смена режима, сервисные панели
+#  Кнопки режимов (нижний таскбар)
 # =========================
 
 
-@router.callback_query(F.data.startswith("mode:"))
-async def cb_change_mode(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
+@router.message(F.text.in_(list(MODE_BUTTON_LABELS.values())))
+async def mode_button(message: Message) -> None:
+    user_id = message.from_user.id
     state = get_user_state(user_id)
+    label = message.text
 
-    _, mode_key = callback.data.split(":", 1)
-    if mode_key not in ASSISTANT_MODES:
-        await callback.answer("Неизвестный режим", show_alert=True)
+    mode_key = None
+    for k, v in MODE_BUTTON_LABELS.items():
+        if v == label:
+            mode_key = k
+            break
+    if mode_key is None or mode_key not in ASSISTANT_MODES:
+        await message.answer("Неизвестный режим.")
         return
 
     state.mode_key = mode_key
@@ -309,7 +301,7 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
     mode_cfg = ASSISTANT_MODES[mode_key]
     limits = storage.get_limits(user_id)
 
-    new_text = (
+    text = (
         "Режим обновлён ✅\n\n"
         f"Текущий режим: <b>{mode_cfg['title']}</b>\n"
         f"<i>{mode_cfg['description']}</i>\n\n"
@@ -317,27 +309,29 @@ async def cb_change_mode(callback: CallbackQuery) -> None:
         f"Лимит на сегодня: <b>{limits['used_today']}/{limits['limit_today']}</b>."
     )
 
-    kb = build_main_keyboard(state.mode_key)
-
-    try:
-        await callback.message.edit_text(
-            new_text,
-            reply_markup=kb,
-        )
-        panel_messages[chat_id] = callback.message.message_id
-    except Exception:
-        sent = await callback.message.answer(new_text, reply_markup=kb)
-        panel_messages[chat_id] = sent.message_id
-
-    await callback.answer("Режим переключен")
+    await message.answer(text)
 
 
-@router.callback_query(F.data.startswith("service:"))
-async def cb_service(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
+# =========================
+#  Кнопки сервисов (нижний таскбар)
+# =========================
+
+
+@router.message(F.text.in_(list(SERVICE_BUTTON_LABELS.values())))
+async def service_button(message: Message) -> None:
+    user_id = message.from_user.id
     state = get_user_state(user_id)
-    _, action = callback.data.split(":", 1)
+    label = message.text
+
+    action = None
+    for k, v in SERVICE_BUTTON_LABELS.items():
+        if v == label:
+            action = k
+            break
+
+    if action is None:
+        await message.answer("Сервис в разработке.")
+        return
 
     if action == "templates":
         text = (
@@ -371,12 +365,11 @@ async def cb_service(callback: CallbackQuery) -> None:
             f"Приглашено: <b>{stats['invited_count']}</b> (уровень: <b>{level}</b>)\n"
         )
     elif action == "referral":
-        # Генерация и показ реферальной ссылки
         code = storage.ensure_ref_code(user_id)
         stats = storage.get_referral_stats(user_id)
         level = _ref_level(stats["invited_count"])
 
-        me = await callback.message.bot.get_me()
+        me = await message.bot.get_me()
         username = me.username or "YourBot"
         link = f"https://t.me/{username}?start=ref_{code}"
 
@@ -408,55 +401,33 @@ async def cb_service(callback: CallbackQuery) -> None:
             f"За каждого приглашённого друга ты получаешь +<b>{REF_BONUS_PER_USER}</b> "
             "запросов в день к своему тарифу.\n"
         )
-        lines.append("Купить Pro или VIP можно кнопками в нижнем таскбаре.")
+        if PAYMENTS_ENABLED:
+            lines.append("Оформить Pro/VIP можно кнопками Pro ⭐ / VIP 💎 в нижнем таскбаре.")
         text = "\n".join(lines)
-    elif action == "plans_info":
-        text = (
-            "💳 <b>Оплата</b>\n\n"
-            "Платёжный провайдер пока не настроен.\n"
-            "Скоро здесь появится возможность оформить Pro/VIP прямо в боте."
-        )
     else:
         text = "Сервис в разработке."
 
-    kb = build_main_keyboard(state.mode_key)
-
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=kb,
-        )
-        panel_messages[chat_id] = callback.message.message_id
-    except Exception:
-        sent = await callback.message.answer(text, reply_markup=kb)
-        panel_messages[chat_id] = sent.message_id
-
-    await callback.answer()
+    await message.answer(text)
 
 
 # =========================
-#  Handlers: оплата и апгрейд тарифа
+#  Покупка тарифов (кнопки Pro/VIP в таскбаре)
 # =========================
 
 
-@router.callback_query(F.data.startswith("buy:"))
-async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
-    user_id = callback.from_user.id
-    _, plan = callback.data.split(":", 1)
-
+@router.message(F.text.in_([BUY_BUTTON_PRO, BUY_BUTTON_VIP]))
+async def buy_button(message: Message, bot: Bot) -> None:
     if not PAYMENTS_ENABLED:
-        await callback.answer(
+        await message.answer(
             "Платежи пока не настроены. Свяжись с админом или попробуй позже.",
-            show_alert=True,
         )
         return
 
-    if plan not in ("pro", "vip"):
-        await callback.answer("Этот тариф недоступен для покупки.", show_alert=True)
-        return
+    label = message.text
+    plan = "pro" if label == BUY_BUTTON_PRO else "vip"
 
     if plan not in PLAN_PRICES:
-        await callback.answer("Цена для этого тарифа не настроена.", show_alert=True)
+        await message.answer("Цена для этого тарифа не настроена.")
         return
 
     price_amount = PLAN_PRICES[plan]
@@ -472,7 +443,7 @@ async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
     payload = f"plan:{plan}"
 
     await bot.send_invoice(
-        chat_id=callback.message.chat.id,
+        chat_id=message.chat.id,
         title=title,
         description=description,
         payload=payload,
@@ -482,14 +453,9 @@ async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
         start_parameter=f"buy_{plan}",
     )
 
-    await callback.answer()
-
 
 @router.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: Bot) -> None:
-    """
-    Обязательный обработчик pre_checkout_query — подтверждаем, что всё ок.
-    """
     try:
         await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
     except Exception as e:  # noqa: BLE001
@@ -503,9 +469,6 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: 
 
 @router.message(F.successful_payment)
 async def successful_payment_handler(message: Message) -> None:
-    """
-    Обработка успешного платежа: апгрейд тарифа.
-    """
     sp = message.successful_payment
     payload = sp.invoice_payload or ""
     user_id = message.from_user.id
@@ -520,7 +483,6 @@ async def successful_payment_handler(message: Message) -> None:
         )
         return
 
-    # Апгрейд плана
     storage.set_plan(user_id, plan)
     limits = storage.get_limits(user_id)
     plan_cfg = PLAN_LIMITS[plan]
@@ -538,23 +500,18 @@ async def successful_payment_handler(message: Message) -> None:
 
 
 # =========================
-#  Handler: основной текст + LLM
+#  Главный LLM-handler
 # =========================
 
 
-@router.message(F.text & ~F.via_bot)
+@router.message(F.text & ~F.via_bot & ~F.text.in_(ALL_BUTTON_TEXTS))
 async def handle_text(message: Message) -> None:
     """
-    Главный обработчик любых текстовых запросов пользователя.
-    Поддерживает:
-      - диалоговый контекст (history)
-      - стриминг ответа (по чанкам)
-      - тарифы и суточные лимиты
+    Любой обычный текст (не кнопка, не команда) — уходит в LLM.
     """
     user_id = message.from_user.id
     text = message.text or ""
 
-    # Не обрабатываем команды здесь
     if text.startswith("/"):
         return
 
@@ -564,7 +521,7 @@ async def handle_text(message: Message) -> None:
     # Обновляем досье
     storage.update_dossier_on_message(user_id, state.mode_key, text)
 
-    # Проверяем лимиты
+    # Лимиты
     if not storage.can_make_request(user_id):
         limits = storage.get_limits(user_id)
         await message.answer(
@@ -579,7 +536,7 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # Показываем typing-индикатор
+    # typing…
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     waiting_message = await message.answer(
@@ -590,22 +547,19 @@ async def handle_text(message: Message) -> None:
     user_prompt = text.strip()
     state.last_prompt = user_prompt
 
-    # Регистрируем использование лимита
     storage.register_request(user_id)
 
-    # Берём диалоговую историю для контекста
     history = storage.get_history(user_id)
 
     answer_text = ""
     chunk_counter = 0
-    EDIT_EVERY_N_CHUNKS = 3  # апдейтим сообщение почаще для более плавного UX
+    EDIT_EVERY_N_CHUNKS = 3
 
     try:
         async for chunk in ask_llm_stream(state.mode_key, user_prompt, history):
             answer_text += chunk
             chunk_counter += 1
 
-            # поддерживаем typing-индикатор
             if chunk_counter % 5 == 0:
                 try:
                     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -616,10 +570,8 @@ async def handle_text(message: Message) -> None:
                 try:
                     await waiting_message.edit_text(answer_text)
                 except Exception:
-                    # Игнорим ошибки типа "message is not modified" или rate limit
                     pass
 
-        # Стрим закончился — финальный текст
         if not answer_text.strip():
             answer_text = (
                 "Что-то пошло не так при генерации ответа. Попробуй сформулировать запрос по-другому."
@@ -627,7 +579,6 @@ async def handle_text(message: Message) -> None:
 
         state.last_answer = answer_text
 
-        # Обновляем history (user + assistant)
         storage.append_history(user_id, "user", user_prompt)
         storage.append_history(user_id, "assistant", answer_text)
 
