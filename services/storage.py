@@ -1,15 +1,19 @@
 import json
 import os
 import threading
-from datetime import datetime
-from typing import Dict, Any, Tuple, List
+from datetime import datetime, date
+from typing import Dict, Any, List
 
 from bot.config import (
     DEFAULT_MODE_KEY,
-    REF_BASE_LIMIT,
     REF_BONUS_PER_USER,
     MAX_HISTORY_MESSAGES,
+    PLAN_LIMITS,
 )
+
+
+def _today_str() -> str:
+    return date.today().isoformat()  # можно заменить на utcnow().date().isoformat() при желании
 
 
 class Storage:
@@ -17,7 +21,9 @@ class Storage:
     Простое файловое хранилище в JSON.
     Хранит:
       - досье пользователя (mode_key, количество сообщений, последняя активность)
-      - реферальную систему (код, кто пригласил, приглашённые, счётчики запросов)
+      - тариф (plan)
+      - usage по дням (для суточных лимитов)
+      - реферальную систему (код, кто пригласил, приглашённые, total_requests)
       - диалоговую историю (history) для контекста LLM
     """
 
@@ -57,6 +63,7 @@ class Storage:
         if uid not in self.data["users"]:
             self.data["users"][uid] = {
                 "mode_key": DEFAULT_MODE_KEY,
+                "plan": "free",
                 "dossier": {
                     "messages_count": 0,
                     "last_prompt_preview": "",
@@ -66,13 +73,16 @@ class Storage:
                     "code": None,
                     "invited_by": None,
                     "invited_users": [],
-                    "total_requests": 0,
+                    "total_requests": 0,  # суммарно за всё время
                 },
+                "usage": {},   # {"YYYY-MM-DD": used_today}
                 "history": [],
             }
         else:
             # Гарантируем существование ключей для старых записей
             user = self.data["users"][uid]
+            user.setdefault("mode_key", DEFAULT_MODE_KEY)
+            user.setdefault("plan", "free")
             user.setdefault(
                 "dossier",
                 {
@@ -90,6 +100,7 @@ class Storage:
                     "total_requests": 0,
                 },
             )
+            user.setdefault("usage", {})
             user.setdefault("history", [])
 
         return self.data["users"][uid]
@@ -158,34 +169,82 @@ class Storage:
         user["history"] = []
         self._save()
 
+    # ===== Публичные методы: план/тариф =====
+
+    def get_plan(self, user_id: int) -> str:
+        user = self._get_or_create_user_internal(user_id)
+        return user.get("plan", "free")
+
+    def set_plan(self, user_id: int, plan: str) -> None:
+        if plan not in PLAN_LIMITS:
+            return
+        user = self._get_or_create_user_internal(user_id)
+        user["plan"] = plan
+        self._save()
+
     # ===== Публичные методы: лимиты и запросы =====
 
     def register_request(self, user_id: int) -> None:
         """
-        Увеличивает счётчик запросов (используется при обращении к LLM).
+        Увеличивает счётчики запросов: суточный и суммарный.
         """
         user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
+        usage = user.setdefault("usage", {})
+
         referral["total_requests"] = int(referral.get("total_requests", 0)) + 1
+
+        today = _today_str()
+        usage[today] = int(usage.get(today, 0)) + 1
+
         self._save()
 
-    def get_limits(self, user_id: int) -> Tuple[int, int]:
+    def get_limits(self, user_id: int) -> Dict[str, Any]:
         """
-        Возвращает (used, limit) для пользователя.
-        limit = REF_BASE_LIMIT + REF_BONUS_PER_USER * приглашённые
+        Возвращает подробную информацию по лимитам и рефералке:
+        {
+          "plan": "free" / "pro" / "vip",
+          "plan_title": str,
+          "used_today": int,
+          "limit_today": int,
+          "base_limit": int,
+          "ref_bonus": int,
+          "invited_count": int,
+          "total_requests": int,
+        }
         """
         user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
-        invited_users: List[int] = referral.get("invited_users", [])
-        used = int(referral.get("total_requests", 0))
+        usage = user.setdefault("usage", {})
 
+        plan = user.get("plan", "free")
+        plan_cfg = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+        base_limit = int(plan_cfg.get("daily_base", 50))
+
+        invited_users = referral.get("invited_users", [])
         invited_count = len(set(invited_users))
-        limit = REF_BASE_LIMIT + REF_BONUS_PER_USER * invited_count
-        return used, limit
+
+        ref_bonus = REF_BONUS_PER_USER * invited_count
+        limit_today = base_limit + ref_bonus
+
+        today = _today_str()
+        used_today = int(usage.get(today, 0))
+        total_requests = int(referral.get("total_requests", 0))
+
+        return {
+            "plan": plan,
+            "plan_title": plan_cfg.get("title", plan),
+            "used_today": used_today,
+            "limit_today": limit_today,
+            "base_limit": base_limit,
+            "ref_bonus": ref_bonus,
+            "invited_count": invited_count,
+            "total_requests": total_requests,
+        }
 
     def can_make_request(self, user_id: int) -> bool:
-        used, limit = self.get_limits(user_id)
-        return used < limit
+        limits = self.get_limits(user_id)
+        return limits["used_today"] < limits["limit_today"]
 
     # ===== Публичные методы: рефералка =====
 
@@ -263,15 +322,22 @@ class Storage:
         return "ok"
 
     def get_referral_stats(self, user_id: int) -> Dict[str, Any]:
+        """
+        Расширенная инфа для отображения в профиле/реф-панели.
+        """
         user = self._get_or_create_user_internal(user_id)
         referral = user.setdefault("referral", {})
-        invited_users = referral.get("invited_users", [])
-        used, limit = self.get_limits(user_id)
+        limits = self.get_limits(user_id)
 
         return {
             "code": referral.get("code"),
             "invited_by": referral.get("invited_by"),
-            "invited_count": len(set(invited_users)),
-            "used": used,
-            "limit": limit,
+            "invited_count": limits["invited_count"],
+            "plan": limits["plan"],
+            "plan_title": limits["plan_title"],
+            "used_today": limits["used_today"],
+            "limit_today": limits["limit_today"],
+            "base_limit": limits["base_limit"],
+            "ref_bonus": limits["ref_bonus"],
+            "total_requests": limits["total_requests"],
         }
