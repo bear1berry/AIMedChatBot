@@ -33,35 +33,93 @@ storage = Storage()
 router = Router()
 
 # =========================
-#   Нижний таскбар (4 кнопки)
+#   Тексты кнопок (нижний таскбар)
 # =========================
 
-BTN_MODES = "🧠 Режимы"
-BTN_PROFILE = "👤 Профиль"
-BTN_SUBSCRIPTION = "💎 Подписка"
-BTN_REFERRALS = "👥 Рефералы"
+BTN_HOME_MODES = "🧠 Режимы"
+BTN_HOME_PROFILE = "👤 Профиль"
+BTN_HOME_SUBSCRIPTION = "💎 Подписка"
+BTN_HOME_REFERRALS = "👥 Рефералы"
 
-TASKBAR_BUTTONS = {BTN_MODES, BTN_PROFILE, BTN_SUBSCRIPTION, BTN_REFERRALS}
+# кнопки второго уровня (режимы)
+BTN_MODE_UNIVERSAL = "🧠 Универсальный"
+BTN_MODE_MED = "🩺 Медицина"
+BTN_MODE_MENTOR = "🔥 Наставник"
+BTN_MODE_BUSINESS = "💼 Бизнес"
+BTN_MODE_CREATIVE = "🎨 Креатив"
+
+# кнопки второго уровня (подписка)
+BTN_SUB_1M = "💎 1 месяц"
+BTN_SUB_3M = "💎 3 месяца"
+BTN_SUB_12M = "💎 12 месяцев"
+
+# назад
+BTN_BACK = "⬅️ Назад"
+
+ROOT_BUTTONS = {BTN_HOME_MODES, BTN_HOME_PROFILE, BTN_HOME_SUBSCRIPTION, BTN_HOME_REFERRALS}
+
+ALL_MENU_BUTTONS = ROOT_BUTTONS | {
+    BTN_MODE_UNIVERSAL,
+    BTN_MODE_MED,
+    BTN_MODE_MENTOR,
+    BTN_MODE_BUSINESS,
+    BTN_MODE_CREATIVE,
+    BTN_SUB_1M,
+    BTN_SUB_3M,
+    BTN_SUB_12M,
+    BTN_BACK,
+}
 
 
-def build_main_keyboard() -> ReplyKeyboardMarkup:
+# =========================
+#   Клавиатуры
+# =========================
+
+
+def build_root_keyboard() -> ReplyKeyboardMarkup:
     """
-    Минималистичный таскбар в стиле iOS:
-    4 кнопки, ровные ряды, без визуального мусора.
+    Главный таскбар: 4 «капсулы» как на доке iOS.
     """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text=BTN_MODES),
-                KeyboardButton(text=BTN_PROFILE),
-            ],
-            [
-                KeyboardButton(text=BTN_SUBSCRIPTION),
-                KeyboardButton(text=BTN_REFERRALS),
-            ],
+            [KeyboardButton(text=BTN_HOME_MODES), KeyboardButton(text=BTN_HOME_PROFILE)],
+            [KeyboardButton(text=BTN_HOME_SUBSCRIPTION), KeyboardButton(text=BTN_HOME_REFERRALS)],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Напиши запрос или выбери раздел ↓",
+        input_field_placeholder="Напиши запрос или пользуйся таскбаром ↓",
+        one_time_keyboard=False,
+        is_persistent=True,
+    )
+
+
+def build_modes_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Экран «Режимы»: проваливаемся на уровень ниже.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_MODE_UNIVERSAL), KeyboardButton(text=BTN_MODE_MED)],
+            [KeyboardButton(text=BTN_MODE_MENTOR), KeyboardButton(text=BTN_MODE_BUSINESS)],
+            [KeyboardButton(text=BTN_MODE_CREATIVE), KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери режим ↓",
+        one_time_keyboard=False,
+        is_persistent=True,
+    )
+
+
+def build_subscription_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Экран «Подписка»: выбор тарифа только через таскбар.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_SUB_1M), KeyboardButton(text=BTN_SUB_3M)],
+            [KeyboardButton(text=BTN_SUB_12M), KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери тариф ↓",
         one_time_keyboard=False,
         is_persistent=True,
     )
@@ -71,6 +129,7 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
 #   /start + онбординг
 # =========================
 
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
     user = message.from_user
@@ -78,7 +137,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         return
     user_id = user.id
 
-    # Реферальный код: /start <code>
+    # реферал из /start <code>
     if command.args:
         storage.register_referral(user_id, command.args.strip())
 
@@ -86,36 +145,40 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     limits = storage.get_limits(user_id)
     mode_key = storage.get_mode(user_id)
     mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+
     mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
 
     if is_new or not user_data.get("onboarding_seen"):
         storage.mark_onboarding_seen(user_id)
         text = (
-            "🖤 <b>Black Box</b>\n\n"
-            "Минимум кнопок, максимум мозга.\n\n"
-            "Как со мной работать:\n"
-            "1️⃣ Внизу выбери <b>Режимы</b> и посмотри команды переключения.\n"
-            "2️⃣ Просто формулируй задачу человеческим языком.\n"
-            "3️⃣ Если нужно больше мощности — загляни в <b>Подписка</b>.\n\n"
-            "Таскбар — как док на iPhone: 4 «стеклянные» кнопки, всё остальное — через живой текст."
+            "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
+            "Минималистичный ИИ-ассистент без лишних кнопок.\n\n"
+            "• Пиши запрос внизу — отвечаю в реальном времени.\n"
+            "• Управление — только через 4 кнопки таскбара.\n\n"
+            "Попробуй что-нибудь простое, например: «Собери режим дня» или «Разберём мою идею стартапа?»"
         )
     else:
         text = (
-            f"Снова на связи, {user.first_name}.\n\n"
-            f"Текущий режим: <b>{mode_label}</b>\n"
-            f"Лимит на сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b> запросов.\n\n"
-            "Пиши, что нужно, или пользуйся таскбаром снизу."
+            "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
+            f"Режим: <b>{mode_label}</b>\n"
+            f"Лимит на сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
+            "Я здесь. Просто сформулируй задачу — остальное возьму на себя."
         )
 
-    await message.answer(text, reply_markup=build_main_keyboard())
+    await message.answer(text, reply_markup=build_root_keyboard())
 
 
 # =========================
-#   Режимы (через команды /mode_*)
+#   Режимы (проваливание через таскбар)
 # =========================
 
-@router.message(F.text == BTN_MODES)
-async def handle_modes_menu(message: Message) -> None:
+
+@router.message(F.text == BTN_HOME_MODES)
+async def on_modes_entry(message: Message) -> None:
+    """
+    Нажали «Режимы» на главном экране — показываем минимальный текст
+    и меняем таскбар на список режимов.
+    """
     user = message.from_user
     if not user:
         return
@@ -123,79 +186,68 @@ async def handle_modes_menu(message: Message) -> None:
 
     mode_key = storage.get_mode(user_id)
     mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
-    current_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
+    mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
 
     text = (
         "⚙️ <b>Режимы мышления</b>\n\n"
-        f"Сейчас: <b>{current_label}</b>\n\n"
-        "Нажми на нужную команду, чтобы переключиться:\n"
-        "• /mode_universal — 🧠 Универсальный\n"
-        "• /mode_med — 🩺 Медицина\n"
-        "• /mode_mentor — 🔥 Наставник\n"
-        "• /mode_business — 💼 Бизнес\n"
-        "• /mode_creative — 🎨 Креатив\n\n"
-        "Можешь просто тапнуть по команде — Telegram сам подставит её в строку."
+        f"Сейчас: <b>{mode_label}</b>\n\n"
+        "Выбери новый режим внизу. Кнопка «Назад» вернёт на главный экран."
     )
+    await message.answer(text, reply_markup=build_modes_keyboard())
 
-    await message.answer(text)
 
-
-async def _set_mode_and_reply(message: Message, mode_key: str) -> None:
+async def _set_mode_and_back_to_root(message: Message, mode_key: str) -> None:
     user = message.from_user
     if not user:
         return
     user_id = user.id
 
     if mode_key not in ASSISTANT_MODES:
-        await message.answer("Такого режима нет.")
+        await message.answer("Такого режима нет.", reply_markup=build_root_keyboard())
         return
 
     storage.update_mode(user_id, mode_key)
     mode_cfg = ASSISTANT_MODES[mode_key]
-    limits = storage.get_limits(user_id)
-
     mode_label = f"{mode_cfg.get('emoji', '')} {mode_cfg.get('title', mode_key)}".strip()
 
-    text = (
-        f"Режим переключён на <b>{mode_label}</b>.\n\n"
-        f"Сегодняшний лимит: <b>{limits['used_today']} / {limits['limit_today']}</b> запросов.\n\n"
-        "Просто напиши задачу — я подстрою стиль ответа под выбранный режим."
+    await message.answer(
+        f"Режим переключён на <b>{mode_label}</b>.\n\nПиши запрос — я адаптирую стиль ответа под него.",
+        reply_markup=build_root_keyboard(),
     )
 
-    await message.answer(text, reply_markup=build_main_keyboard())
+
+@router.message(F.text == BTN_MODE_UNIVERSAL)
+async def btn_mode_universal(message: Message) -> None:
+    await _set_mode_and_back_to_root(message, "universal")
 
 
-@router.message(Command("mode_universal"))
-async def mode_universal(message: Message) -> None:
-    await _set_mode_and_reply(message, "universal")
+@router.message(F.text == BTN_MODE_MED)
+async def btn_mode_med(message: Message) -> None:
+    await _set_mode_and_back_to_root(message, "med")
 
 
-@router.message(Command("mode_med"))
-async def mode_med(message: Message) -> None:
-    await _set_mode_and_reply(message, "med")
+@router.message(F.text == BTN_MODE_MENTOR)
+async def btn_mode_mentor(message: Message) -> None:
+    await _set_mode_and_back_to_root(message, "mentor")
 
 
-@router.message(Command("mode_mentor"))
-async def mode_mentor(message: Message) -> None:
-    await _set_mode_and_reply(message, "mentor")
+@router.message(F.text == BTN_MODE_BUSINESS)
+async def btn_mode_business(message: Message) -> None:
+    await _set_mode_and_back_to_root(message, "business")
 
 
-@router.message(Command("mode_business"))
-async def mode_business(message: Message) -> None:
-    await _set_mode_and_reply(message, "business")
-
-
-@router.message(Command("mode_creative"))
-async def mode_creative(message: Message) -> None:
-    await _set_mode_and_reply(message, "creative")
+@router.message(F.text == BTN_MODE_CREATIVE)
+async def btn_mode_creative(message: Message) -> None:
+    await _set_mode_and_back_to_root(message, "creative")
 
 
 # =========================
-#   Профиль (план + лимиты + память/досье)
+#   Профиль (план + лимиты + память)
 # =========================
 
-@router.message(F.text == BTN_PROFILE)
-async def handle_profile(message: Message) -> None:
+
+@router.message(F.text == BTN_HOME_PROFILE)
+async def on_profile(message: Message) -> None:
     user = message.from_user
     if not user:
         return
@@ -209,35 +261,36 @@ async def handle_profile(message: Message) -> None:
 
     plan_title = plan_info["plan_title"]
     expires = plan_info["plan_expires_at"]
+
     if plan_info["plan"] == "free":
-        plan_line = f"Тариф: <b>{plan_title}</b> (по умолчанию)"
+        plan_line = f"<b>{plan_title}</b>"
     else:
+        plan_line = f"<b>{plan_title}</b>"
         if expires:
-            plan_line = f"Тариф: <b>{plan_title}</b>\nАктивен до: <b>{expires}</b>"
-        else:
-            plan_line = f"Тариф: <b>{plan_title}</b>"
+            plan_line += f" · до <b>{expires}</b>"
 
     dossier_preview = storage.get_dossier_preview(user_id)
 
     text = (
         "👤 <b>Профиль</b>\n\n"
-        f"{plan_line}\n"
-        f"Режим: <b>{mode_label}</b>\n\n"
-        f"Лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n"
-        f"Всего запросов: <b>{limits['total_requests']}</b>\n\n"
-        "🧠 <b>Память</b>\n\n"
+        f"Тариф: {plan_line}\n"
+        f"Режим: <b>{mode_label}</b>\n"
+        f"Сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b> запросов\n"
+        f"Всего: <b>{limits['total_requests']}</b>\n\n"
+        "🧠 <b>Память (краткий срез)</b>\n\n"
         f"{dossier_preview}"
     )
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_root_keyboard())
 
 
 # =========================
-#   Подписка (Premium через CryptoBot)
+#   Подписка (Premium через CryptoBot, выбор тарифа в таскбаре)
 # =========================
 
-@router.message(F.text == BTN_SUBSCRIPTION)
-async def handle_subscription(message: Message) -> None:
+
+@router.message(F.text == BTN_HOME_SUBSCRIPTION)
+async def on_subscription_entry(message: Message) -> None:
     user = message.from_user
     if not user:
         return
@@ -252,65 +305,32 @@ async def handle_subscription(message: Message) -> None:
     if plan_info["plan"] == "free":
         current_line = f"Текущий тариф: <b>{plan_title}</b>\n"
     else:
+        current_line = f"Текущий тариф: <b>{plan_title}</b>\n"
         if expires:
-            current_line = f"Текущий тариф: <b>{plan_title}</b>, активен до <b>{expires}</b>\n"
-        else:
-            current_line = f"Текущий тариф: <b>{plan_title}</b>\n"
+            current_line += f"Активен до: <b>{expires}</b>\n"
 
     if not CRYPTO_PAY_API_TOKEN:
         text = (
             "💎 <b>Подписка</b>\n\n"
             f"{current_line}"
             f"Лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
-            "Сейчас оплата через CryptoBot ещё не настроена.\n"
+            "Оплата через CryptoBot ещё не настроена.\n"
             "Добавь CRYPTO_PAY_API_TOKEN в .env и перезапусти бота."
         )
-        await message.answer(text)
+        await message.answer(text, reply_markup=build_root_keyboard())
         return
 
-    # Берём цены из конфигурации
-    t1 = SUBSCRIPTION_TARIFFS.get("premium_1m")
-    t3 = SUBSCRIPTION_TARIFFS.get("premium_3m")
-    t12 = SUBSCRIPTION_TARIFFS.get("premium_12m")
-
-    lines = [
-        "💎 <b>Premium-подписка</b>\n",
-        current_line,
-        f"Твой лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n",
-        "Оплата — только в USDT через <b>@CryptoBot</b>.\n",
-        "Тарифы:\n",
-    ]
-
-    if t1:
-        lines.append(
-            f"• /premium_1m — {t1['title']} за <b>{t1['amount']:.2f} USDT</b>\n"
-        )
-    if t3:
-        lines.append(
-            f"• /premium_3m — {t3['title']} за <b>{t3['amount']:.2f} USDT</b>\n"
-        )
-    if t12:
-        lines.append(
-            f"• /premium_12m — {t12['title']} за <b>{t12['amount']:.2f} USDT</b>\n"
-        )
-
-    lines.append(
-        "\nНажми на нужную команду /premium_… — я создам счёт в CryptoBot и дам ссылку.\n"
-        "После оплаты я сам периодически проверю платёж и автоматически активирую подписку."
+    text = (
+        "💎 <b>Premium</b>\n\n"
+        f"{current_line}"
+        f"Твой лимит сегодня: <b>{limits['used_today']} / {limits['limit_today']}</b>\n\n"
+        "Выбери тариф внизу. Оплата — только USDT через @CryptoBot.\n"
+        "После подтверждения оплаты подписка включится автоматически."
     )
+    await message.answer(text, reply_markup=build_subscription_keyboard())
 
-    await message.answer("".join(lines))
 
-
-async def _create_invoice_and_wait(
-    message: Message,
-    tariff_key: str,
-) -> None:
-    """
-    1) Создаёт счёт в CryptoBot.
-    2) Присылает ссылку на оплату.
-    3) В фоне периодически проверяет статус и при оплате включает Premium.
-    """
+async def _create_invoice_and_wait(message: Message, tariff_key: str) -> None:
     user = message.from_user
     if not user:
         return
@@ -319,21 +339,20 @@ async def _create_invoice_and_wait(
 
     tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
     if not tariff:
-        await message.answer("Этот тариф временно недоступен.")
+        await message.answer("Этот тариф временно недоступен.", reply_markup=build_root_keyboard())
         return
 
     if not CRYPTO_PAY_API_TOKEN:
-        await message.answer("Оплата через CryptoBot не настроена.")
+        await message.answer("Оплата через CryptoBot не настроена.", reply_markup=build_root_keyboard())
         return
 
     try:
         invoice_id, pay_url = await create_cryptobot_invoice(user_id, tariff_key)
     except Exception as e:  # noqa: BLE001
         log.exception("Failed to create CryptoBot invoice: %s", e)
-        await message.answer("Не удалось создать счёт. Попробуй ещё раз чуть позже.")
+        await message.answer("Не удалось создать счёт. Попробуй ещё раз чуть позже.", reply_markup=build_root_keyboard())
         return
 
-    # Регистрируем счёт в сторедже
     storage.register_invoice(
         user_id=user_id,
         invoice_id=invoice_id,
@@ -343,16 +362,15 @@ async def _create_invoice_and_wait(
 
     text = (
         f"Счёт создан: <b>{tariff['title']}</b> за <b>{tariff['amount']:.2f} USDT</b>.\n\n"
-        f"1) Перейди по ссылке и оплати:\n{pay_url}\n\n"
-        "2) После успешной оплаты просто вернись в бот.\n\n"
-        "Я сам буду периодически проверять статус счёта и включу Premium автоматически, "
-        "как только CryptoBot подтвердит оплату."
+        f"Оплати по ссылке:\n{pay_url}\n\n"
+        "Я буду периодически проверять статус счёта и включу Premium, как только CryptoBot подтвердит оплату."
     )
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_root_keyboard())
 
-    # Фоновая задача ожидания оплаты
-    asyncio.create_task(_wait_for_payment_and_activate(user_id, chat_id, invoice_id, tariff_key))
+    asyncio.create_task(
+        _wait_for_payment_and_activate(user_id, chat_id, invoice_id, tariff_key)
+    )
 
 
 async def _wait_for_payment_and_activate(
@@ -361,13 +379,9 @@ async def _wait_for_payment_and_activate(
     invoice_id: int,
     tariff_key: str,
     check_interval: int = 20,
-    max_checks: int = 24,  # ~8 минут
+    max_checks: int = 24,
 ) -> None:
-    """
-    Периодически опрашивает CryptoBot по invoice_id,
-    при статусе paid включает premium и пишет пользователю.
-    """
-    from aiogram import Bot as AiogramBot  # локальный импорт, чтобы не ломать типизацию
+    from aiogram import Bot as AiogramBot
 
     bot = AiogramBot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
@@ -398,9 +412,9 @@ async def _wait_for_payment_and_activate(
             else:
                 text += "\n"
 
-            text += "Можешь не стесняться и загружать меня по полной 😉"
+            text += "Можешь загружать меня по полной 😉"
 
-            await bot.send_message(chat_id, text)
+            await bot.send_message(chat_id, text, reply_markup=build_root_keyboard())
             return
 
         if status in {"expired", "cancelled"}:
@@ -409,6 +423,7 @@ async def _wait_for_payment_and_activate(
                 chat_id,
                 f"Статус счёта: <b>{status}</b>.\n"
                 "Если оплату не успел — просто оформи новый тариф из раздела «Подписка».",
+                reply_markup=build_root_keyboard(),
             )
             return
 
@@ -417,22 +432,23 @@ async def _wait_for_payment_and_activate(
     await bot.send_message(
         chat_id,
         "❓ За отведённое время я не увидел подтверждения оплаты от CryptoBot.\n"
-        "Если ты уверен, что оплатил — напиши админу или повторно оформи подписку из раздела «Подписка».",
+        "Если ты уверен, что оплатил — напиши админу или повторно оформи подписку.",
+        reply_markup=build_root_keyboard(),
     )
 
 
-@router.message(Command("premium_1m"))
-async def cmd_premium_1m(message: Message) -> None:
+@router.message(F.text == BTN_SUB_1M)
+async def btn_sub_1m(message: Message) -> None:
     await _create_invoice_and_wait(message, "premium_1m")
 
 
-@router.message(Command("premium_3m"))
-async def cmd_premium_3m(message: Message) -> None:
+@router.message(F.text == BTN_SUB_3M)
+async def btn_sub_3m(message: Message) -> None:
     await _create_invoice_and_wait(message, "premium_3m")
 
 
-@router.message(Command("premium_12m"))
-async def cmd_premium_12m(message: Message) -> None:
+@router.message(F.text == BTN_SUB_12M)
+async def btn_sub_12m(message: Message) -> None:
     await _create_invoice_and_wait(message, "premium_12m")
 
 
@@ -440,8 +456,9 @@ async def cmd_premium_12m(message: Message) -> None:
 #   Рефералы
 # =========================
 
-@router.message(F.text == BTN_REFERRALS)
-async def handle_referrals(message: Message) -> None:
+
+@router.message(F.text == BTN_HOME_REFERRALS)
+async def on_referrals(message: Message) -> None:
     user = message.from_user
     if not user:
         return
@@ -456,31 +473,42 @@ async def handle_referrals(message: Message) -> None:
 
     text = (
         "👥 <b>Рефералы</b>\n\n"
-        "Поделись этим ботом с людьми, которым он реально нужен.\n\n"
+        "Поделись ссылкой с теми, кому реально нужен сильный ИИ-ассистент.\n\n"
         f"Твоя ссылка:\n{ref_link}\n\n"
         f"Приглашено: <b>{info['invited_count']}</b>\n"
         f"Базовый лимит: <b>{info['base_limit']}</b>\n"
         f"Бонус от рефералов: <b>{info['ref_bonus']}</b>\n"
-        f"Итого лимит в день: <b>{info['limit_today']}</b>\n"
+        f"Итого лимит в день: <b>{info['limit_today']}</b>"
     )
 
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_root_keyboard())
+
+
+# =========================
+#   Назад на главный экран
+# =========================
+
+
+@router.message(F.text == BTN_BACK)
+async def on_back(message: Message) -> None:
+    text = (
+        "🖤 <b>BlackBox GPT — Universal AI Assistant</b>\n\n"
+        "Главный экран. Просто напиши запрос или воспользуйся таскбаром снизу."
+    )
+    await message.answer(text, reply_markup=build_root_keyboard())
 
 
 # =========================
 #   Основной диалог (стрим)
 # =========================
 
+
 @router.message(
     F.text
-    & ~F.text.in_(TASKBAR_BUTTONS)
     & ~F.text.startswith("/")
+    & ~F.text.in_(ALL_MENU_BUTTONS)
 )
 async def handle_chat(message: Message) -> None:
-    """
-    Любой текст, который не является командой и не совпадает с
-    кнопками таскбара — уходит в ядро ИИ.
-    """
     user = message.from_user
     if not user:
         return
@@ -498,19 +526,18 @@ async def handle_chat(message: Message) -> None:
             f"Сделано: <b>{limits['used_today']} / {limits['limit_today']}</b>.\n\n"
             "Можно подождать до завтра или оформить Premium в разделе «Подписка»."
         )
-        await message.answer(text, reply_markup=build_main_keyboard())
+        await message.answer(text, reply_markup=build_root_keyboard())
         return
 
     mode_key = storage.get_mode(user_id)
     history = storage.get_history(user_id)
 
-    # Обновляем досье и usage
     storage.append_history(user_id, "user", prompt)
     storage.update_dossier_on_message(user_id, mode_key, prompt)
     storage.increment_usage(user_id)
 
     bot = message.bot
-    sent = await message.answer("🧠 Генерирую ответ...")
+    sent = await message.answer("🧠 Думаю над ответом…")
 
     reply_text = ""
     last_edit = datetime.now()
@@ -519,7 +546,6 @@ async def handle_chat(message: Message) -> None:
         async for chunk in ask_llm_stream(mode_key, prompt, history):
             reply_text += chunk
             now = datetime.now()
-            # чтобы анимация набора была плавной, но не спамила Telegram
             if (now - last_edit).total_seconds() > 0.7 and reply_text:
                 view = reply_text[-4096:]
                 try:
@@ -544,6 +570,7 @@ async def handle_chat(message: Message) -> None:
 #   Сервисные команды
 # =========================
 
+
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     user = message.from_user
@@ -552,7 +579,8 @@ async def cmd_id(message: Message) -> None:
     await message.answer(
         f"Твой Telegram ID: <code>{user.id}</code>\n\n"
         "Добавь его в переменную окружения <b>ADMIN_USER_IDS</b>, "
-        "чтобы включить для себя админ-режим без лимитов."
+        "чтобы включить для себя админ-режим без лимитов.",
+        reply_markup=build_root_keyboard(),
     )
 
 
@@ -566,27 +594,27 @@ async def cmd_reset(message: Message) -> None:
     storage.clear_history(user_id)
     await message.answer(
         "Диалог очищен. Начинаем ветку с нуля.",
-        reply_markup=build_main_keyboard(),
+        reply_markup=build_root_keyboard(),
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     text = (
-        "<b>Кратко по навигации</b>\n\n"
-        f"{BTN_MODES} — переключение режимов (команды /mode_…)\n"
-        f"{BTN_PROFILE} — тариф, лимиты и память\n"
-        f"{BTN_SUBSCRIPTION} — Premium через CryptoBot\n"
-        f"{BTN_REFERRALS} — реферальная ссылка и бонусы к лимиту\n\n"
-        "Дальше всё просто: ты пишешь запрос — я отвечаю, как будто это нативный iOS-ассистент, "
-        "а не бот с кучей кнопок."
+        "<b>Навигация</b>\n\n"
+        f"{BTN_HOME_MODES} — выбор режима\n"
+        f"{BTN_HOME_PROFILE} — тариф, лимиты и память\n"
+        f"{BTN_HOME_SUBSCRIPTION} — оформление Premium\n"
+        f"{BTN_HOME_REFERRALS} — реферальная ссылка и бонусы\n\n"
+        "Дальше всё просто: минимум интерфейса, максимум пользы."
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_root_keyboard())
 
 
 # =========================
 #   Запуск бота
 # =========================
+
 
 async def main() -> None:
     bot = Bot(
@@ -596,7 +624,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    log.info("Starting Black Box bot polling...")
+    log.info("Starting BlackBox bot polling...")
     await dp.start_polling(bot)
 
 
