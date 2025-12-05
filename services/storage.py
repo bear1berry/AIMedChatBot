@@ -1,341 +1,284 @@
+from __future__ import annotations
+
 import json
-import os
-import threading
-from datetime import datetime, date
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from bot.config import (
-    DEFAULT_MODE_KEY,
+    USERS_FILE_PATH,
+    DEFAULT_DAILY_LIMIT,
+    PLAN_BASIC,
+    PLAN_PREMIUM,
     REF_BONUS_PER_USER,
-    MAX_HISTORY_MESSAGES,
-    PLAN_LIMITS,
+    SUBSCRIPTION_TARIFFS,
+    DEFAULT_MODE,
 )
 
 
-def _today_str():
-    """Сегодняшняя дата в формате YYYY-MM-DD."""
-    return date.today().isoformat()
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@dataclass
+class UserRecord:
+    user_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+    mode: str = DEFAULT_MODE
+
+    plan: str = PLAN_BASIC
+    premium_until: Optional[str] = None  # ISO8601 UTC
+
+    daily_date: str = field(default_factory=lambda: date.today().isoformat())
+    daily_used: int = 0
+    total_used: int = 0
+
+    ref_code: Optional[str] = None
+    referred_by: Optional[int] = None
+    ref_count: int = 0
+    ref_bonus_messages: int = 0
+
+    history: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+
+    pending_invoice_id: Optional[int] = None
+    pending_invoice_tariff: Optional[str] = None
+
+    created_at: str = field(default_factory=lambda: _now_utc().isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserRecord":
+        # Простая миграция старых записей
+        if "history" not in data:
+            data["history"] = {}
+        if "ref_bonus_messages" not in data:
+            data["ref_bonus_messages"] = 0
+        if "plan" not in data:
+            data["plan"] = PLAN_BASIC
+        if "mode" not in data:
+            data["mode"] = DEFAULT_MODE
+        return cls(**data)
 
 
 class Storage:
     """
-    Простое файловое хранилище в JSON.
+    Простое JSON-хранилище пользователей.
 
-    Хранит:
-      - досье пользователя (mode_key, messages_count, last_activity)
-      - тариф (plan)
-      - usage по дням (для суточных лимитов)
-      - реферальную систему (code, invited_by, invited_users, total_requests)
-      - диалоговую историю (history) для контекста LLM
+    Формат файла: { "<user_id>": { ...UserRecord... }, ... }
     """
 
-    def __init__(self, path="data/users.json"):
+    def __init__(self, path: Path = USERS_FILE_PATH) -> None:
         self.path = path
-        self._lock = threading.Lock()
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.data = {"users": {}}
+        self._data: Dict[str, Dict[str, Any]] = {}
         self._load()
 
-    # ===== ВНУТРЕННЕЕ =====
+    # --- low-level I/O ---
 
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except Exception:
-                # Если файл битый — стартуем с пустой структурой
-                self.data = {"users": {}}
-        else:
-            self._save()
+    def _load(self) -> None:
+        if not self.path.exists():
+            self._data = {}
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                self._data = raw
+            else:
+                self._data = {}
+        except Exception:
+            # Если файл битый — не роняем бота, просто очищаем.
+            self._data = {}
 
-    def _save(self):
-        with self._lock:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        tmp.replace(self.path)
 
-    def _user_key(self, user_id):
+    # --- helpers ---
+
+    def _key(self, user_id: int) -> str:
         return str(user_id)
 
-    def _get_or_create_user_internal(self, user_id):
-        """
-        Внутренний метод: гарантирует наличие пользователя в self.data
-        и всех нужных полей.
-        """
-        uid = self._user_key(user_id)
-        users = self.data.setdefault("users", {})
-
-        if uid not in users:
-            # Новый пользователь
-            users[uid] = {
-                "mode_key": DEFAULT_MODE_KEY,
-                "plan": "free",
-                "dossier": {
-                    "messages_count": 0,
-                    "last_prompt_preview": "",
-                    "last_activity": None,
-                },
-                "referral": {
-                    "code": None,
-                    "invited_by": None,
-                    "invited_users": [],
-                    "total_requests": 0,
-                },
-                "usage": {},    # { "YYYY-MM-DD": used_today }
-                "history": [],  # диалоговая история
-            }
-        else:
-            user = users[uid]
-            user.setdefault("mode_key", DEFAULT_MODE_KEY)
-            user.setdefault("plan", "free")
-            user.setdefault(
-                "dossier",
-                {
-                    "messages_count": 0,
-                    "last_prompt_preview": "",
-                    "last_activity": None,
-                },
-            )
-            user.setdefault(
-                "referral",
-                {
-                    "code": None,
-                    "invited_by": None,
-                    "invited_users": [],
-                    "total_requests": 0,
-                },
-            )
-            user.setdefault("usage", {})
-            user.setdefault("history", [])
-
-        return users[uid]
-
-    # ===== ПОЛЬЗОВАТЕЛЬ / ДОСЬЕ =====
-
-    def get_or_create_user(self, user_id):
-        """
-        Возвращает словарь пользователя. Если его не было — создаёт.
-        (main.py ожидает именно dict.)
-        """
-        user = self._get_or_create_user_internal(user_id)
-        self._save()
-        return user
-
-    def get_dossier(self, user_id):
-        user = self._get_or_create_user_internal(user_id)
-        return user.get("dossier", {})
-
-    def update_dossier_on_message(self, user_id, mode_key, user_prompt):
-        """
-        Обновляем «досье» при новом сообщении пользователя.
-        """
-        user = self._get_or_create_user_internal(user_id)
-        dossier = user.setdefault("dossier", {})
-        dossier["messages_count"] = int(dossier.get("messages_count", 0)) + 1
-        dossier["last_prompt_preview"] = user_prompt[:120]
-        dossier["last_activity"] = datetime.utcnow().isoformat()
-        user["mode_key"] = mode_key
-        self._save()
-
-    # ===== ИСТОРИЯ ДИАЛОГА =====
-
-    def get_history(self, user_id):
-        user = self._get_or_create_user_internal(user_id)
-        history = user.setdefault("history", [])
-        if not isinstance(history, list):
-            history = []
-            user["history"] = history
-            self._save()
-        return history
-
-    def append_history(self, user_id, role, content):
-        """
-        Добавляет сообщение в историю и ограничивает её длину MAX_HISTORY_MESSAGES.
-        """
-        user = self._get_or_create_user_internal(user_id)
-        history = user.setdefault("history", [])
-        if not isinstance(history, list):
-            history = []
-            user["history"] = history
-
-        history.append({"role": role, "content": content})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history[:] = history[-MAX_HISTORY_MESSAGES:]
-        self._save()
-
-    def reset_history(self, user_id):
-        user = self._get_or_create_user_internal(user_id)
-        user["history"] = []
-        self._save()
-
-    # ===== ТАРИФЫ =====
-
-    def get_plan(self, user_id):
-        user = self._get_or_create_user_internal(user_id)
-        return user.get("plan", "free")
-
-    def set_plan(self, user_id, plan):
-        if plan not in PLAN_LIMITS:
+    def _ensure_ref_code(self, rec: UserRecord) -> None:
+        if rec.ref_code:
             return
-        user = self._get_or_create_user_internal(user_id)
-        user["plan"] = plan
-        self._save()
+        # Простая реф-ссылка: base36 от user_id
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+        n = rec.user_id
+        if n == 0:
+            rec.ref_code = "0"
+            return
+        digits: List[str] = []
+        while n:
+            n, r = divmod(n, 36)
+            digits.append(alphabet[r])
+        rec.ref_code = "".join(reversed(digits))
 
-    # ===== ЛИМИТЫ / ЗАПРОСЫ =====
+    def _ensure_daily_reset(self, rec: UserRecord) -> None:
+        today = date.today().isoformat()
+        if rec.daily_date != today:
+            rec.daily_date = today
+            rec.daily_used = 0
 
-    def register_request(self, user_id):
+    # --- public API ---
+
+    def get_or_create_user(self, user_id: int, tg_user: Any | None = None) -> Tuple[Dict[str, Any], bool]:
         """
-        Увеличивает счётчики запросов: суточный и суммарный.
+        Возвращает (record_dict, created).
         """
-        user = self._get_or_create_user_internal(user_id)
-        referral = user.setdefault("referral", {})
-        usage = user.setdefault("usage", {})
-
-        referral["total_requests"] = int(referral.get("total_requests", 0)) + 1
-
-        today = _today_str()
-        usage[today] = int(usage.get(today, 0)) + 1
-
-        self._save()
-
-    def get_limits(self, user_id):
-        """
-        Возвращает подробную информацию по лимитам и рефералке:
-        {
-          "plan": "free" / "pro" / "vip",
-          "plan_title": str,
-          "used_today": int,
-          "limit_today": int,
-          "base_limit": int,
-          "ref_bonus": int,
-          "invited_count": int,
-          "total_requests": int,
-        }
-        """
-        user = self._get_or_create_user_internal(user_id)
-        referral = user.setdefault("referral", {})
-        usage = user.setdefault("usage", {})
-
-        plan = user.get("plan", "free")
-        plan_cfg = PLAN_LIMITS.get(plan, PLAN_LIMITS.get("free", {}))
-        base_limit = int(plan_cfg.get("daily_base", 50))
-
-        invited_users = referral.get("invited_users", [])
-        invited_count = len(set(invited_users))
-
-        ref_bonus = REF_BONUS_PER_USER * invited_count
-        limit_today = base_limit + ref_bonus
-
-        today = _today_str()
-        used_today = int(usage.get(today, 0))
-        total_requests = int(referral.get("total_requests", 0))
-
-        return {
-            "plan": plan,
-            "plan_title": plan_cfg.get("title", plan),
-            "used_today": used_today,
-            "limit_today": limit_today,
-            "base_limit": base_limit,
-            "ref_bonus": ref_bonus,
-            "invited_count": invited_count,
-            "total_requests": total_requests,
-        }
-
-    def can_make_request(self, user_id):
-        limits = self.get_limits(user_id)
-        return limits["used_today"] < limits["limit_today"]
-
-    # ===== РЕФЕРАЛКА =====
-
-    def _generate_ref_code(self, user_id):
-        """
-        Генерируем устойчивый реф-код на основе user_id.
-        """
-        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        n = user_id if user_id > 0 else abs(user_id) + 1
-        result = ""
-        base = len(alphabet)
-        while n > 0:
-            n, r = divmod(n, base)
-            result = alphabet[r] + result
-        return f"BB{result}"
-
-    def ensure_ref_code(self, user_id):
-        """
-        Убеждаемся, что у пользователя есть реф-код. Если нет — генерируем.
-        Возвращает сам код.
-        """
-        user = self._get_or_create_user_internal(user_id)
-        referral = user.setdefault("referral", {})
-        code = referral.get("code")
-        if not code:
-            code = self._generate_ref_code(user_id)
-            referral["code"] = code
+        key = self._key(user_id)
+        if key in self._data:
+            rec = UserRecord.from_dict(self._data[key])
+            self._ensure_daily_reset(rec)
+            self._ensure_ref_code(rec)
+            self._data[key] = rec.to_dict()
             self._save()
-        return code
+            return self._data[key], False
 
-    def _find_user_by_ref_code(self, code):
+        # Создаём нового
+        rec = UserRecord(user_id=user_id)
+        if tg_user is not None:
+            rec.username = getattr(tg_user, "username", None)
+            rec.first_name = getattr(tg_user, "first_name", None)
+            rec.last_name = getattr(tg_user, "last_name", None)
+
+        self._ensure_ref_code(rec)
+        self._data[key] = rec.to_dict()
+        self._save()
+        return self._data[key], True
+
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        return self._data.get(self._key(user_id))
+
+    def save_user(self, user_dict: Dict[str, Any]) -> None:
+        key = self._key(user_dict["user_id"])
+        self._data[key] = user_dict
+        self._save()
+
+    # --- режимы ---
+
+    def set_mode(self, user_id: int, mode: str) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        rec_dict["mode"] = mode
+        self.save_user(rec_dict)
+        return rec_dict
+
+    # --- лимиты / планы ---
+
+    def is_premium_active(self, user_dict: Dict[str, Any]) -> bool:
+        until_str = user_dict.get("premium_until")
+        if not until_str:
+            return False
+        try:
+            until = datetime.fromisoformat(until_str)
+        except Exception:
+            return False
+        return until > _now_utc()
+
+    def get_daily_limit(self, user_dict: Dict[str, Any]) -> Optional[int]:
         """
-        Ищем владельца данного реф-кода, возвращаем user_id или None.
+        Возвращает лимит сообщений на день.
+        None = безлимит (например для Premium).
         """
-        for uid_str, udata in self.data.get("users", {}).items():
-            ref = udata.get("referral", {})
-            if ref.get("code") == code:
-                try:
-                    return int(uid_str)
-                except ValueError:
-                    continue
+        if self.is_premium_active(user_dict):
+            return None
+        base = DEFAULT_DAILY_LIMIT
+        bonus = int(user_dict.get("ref_bonus_messages") or 0)
+        return base + bonus
+
+    def register_usage(self, user_dict: Dict[str, Any], count: int = 1) -> Dict[str, Any]:
+        user_dict["daily_used"] = int(user_dict.get("daily_used") or 0) + count
+        user_dict["total_used"] = int(user_dict.get("total_used") or 0) + count
+        self.save_user(user_dict)
+        return user_dict
+
+    def activate_premium(self, user_id: int, tariff_code: str) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        tariff = SUBSCRIPTION_TARIFFS[tariff_code]
+        now = _now_utc()
+        until = now + timedelta(days=tariff["days"])
+        rec_dict["plan"] = PLAN_PREMIUM
+        rec_dict["premium_until"] = until.isoformat()
+        # Сбрасываем ожидающий счёт
+        rec_dict["pending_invoice_id"] = None
+        rec_dict["pending_invoice_tariff"] = None
+        self.save_user(rec_dict)
+        return rec_dict
+
+    # --- рефералы ---
+
+    def find_by_ref_code(self, code: str) -> Optional[Dict[str, Any]]:
+        for raw in self._data.values():
+            if raw.get("ref_code") == code:
+                return raw
         return None
 
-    def attach_referral(self, invited_id, code):
+    def apply_referral(self, new_user_id: int, ref_code: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """
-        Привязка пригласившего по коду.
-        Возвращает статус:
-          - "ok"
-          - "not_found"
-          - "already_has_referrer"
-          - "self_referral"
+        Привязывает new_user к рефереру по ref_code.
+        Возвращает (referrer_dict, new_user_dict) или None, если код некорректен.
         """
-        invited = self._get_or_create_user_internal(invited_id)
-        referral = invited.setdefault("referral", {})
+        referrer = self.find_by_ref_code(ref_code)
+        if not referrer:
+            return None
+        if referrer["user_id"] == new_user_id:
+            return None  # нельзя рефералиться на себя
 
-        # Уже есть приглашавший — не трогаем
-        if referral.get("invited_by") is not None:
-            return "already_has_referrer"
+        new_rec, _ = self.get_or_create_user(new_user_id)
+        if new_rec.get("referred_by"):
+            return None  # уже есть реферер
 
-        owner_id = self._find_user_by_ref_code(code)
-        if owner_id is None:
-            return "not_found"
-        if owner_id == invited_id:
-            return "self_referral"
+        # Обновляем нового
+        new_rec["referred_by"] = referrer["user_id"]
+        self.save_user(new_rec)
 
-        referral["invited_by"] = owner_id
+        # Обновляем реферера
+        referrer["ref_count"] = int(referrer.get("ref_count") or 0) + 1
+        referrer["ref_bonus_messages"] = int(referrer.get("ref_bonus_messages") or 0) + REF_BONUS_PER_USER
+        self.save_user(referrer)
 
-        owner = self._get_or_create_user_internal(owner_id)
-        owner_ref = owner.setdefault("referral", {})
-        invited_users = owner_ref.setdefault("invited_users", [])
-        if invited_id not in invited_users:
-            invited_users.append(invited_id)
+        return referrer, new_rec
 
-        self._save()
-        return "ok"
+    # --- история диалогов ---
 
-    def get_referral_stats(self, user_id):
-        """
-        Расширенная инфа для экрана «Рефералы» / профиля.
-        """
-        user = self._get_or_create_user_internal(user_id)
-        referral = user.setdefault("referral", {})
-        limits = self.get_limits(user_id)
+    def add_history_message(self, user_dict: Dict[str, Any], mode: str, role: str, content: str, max_len: int = 20) -> Dict[str, Any]:
+        history = user_dict.setdefault("history", {})
+        conv = history.setdefault(mode, [])
+        conv.append({"role": role, "content": content})
+        if len(conv) > max_len:
+            # Обрезаем старые сообщения
+            conv[:] = conv[-max_len:]
+        user_dict["history"] = history
+        self.save_user(user_dict)
+        return user_dict
 
-        return {
-            "code": referral.get("code"),
-            "invited_by": referral.get("invited_by"),
-            "invited_count": limits["invited_count"],
-            "plan": limits["plan"],
-            "plan_title": limits["plan_title"],
-            "used_today": limits["used_today"],
-            "limit_today": limits["limit_today"],
-            "base_limit": limits["base_limit"],
-            "ref_bonus": limits["ref_bonus"],
-            "total_requests": limits["total_requests"],
-        }
+    def get_history(self, user_dict: Dict[str, Any], mode: str, max_len: int = 20) -> List[Dict[str, str]]:
+        history = user_dict.get("history") or {}
+        conv = history.get(mode) or []
+        if len(conv) > max_len:
+            return conv[-max_len:]
+        return conv
+
+    # --- инвойсы ---
+
+    def set_pending_invoice(self, user_id: int, invoice_id: int, tariff_code: str) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        rec_dict["pending_invoice_id"] = int(invoice_id)
+        rec_dict["pending_invoice_tariff"] = tariff_code
+        self.save_user(rec_dict)
+        return rec_dict
+
+    def clear_pending_invoice(self, user_id: int) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        rec_dict["pending_invoice_id"] = None
+        rec_dict["pending_invoice_tariff"] = None
+        self.save_user(rec_dict)
+        return rec_dict
