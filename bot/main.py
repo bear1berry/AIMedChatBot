@@ -5,6 +5,7 @@ BlackBox GPT Bot main module.
 - Режимы ассистента.
 - Лимит бесплатных сообщений + Premium по подписке.
 - Память / личное досье на пользователя.
+- Реферальная система с бонусными днями Premium.
 """
 
 import asyncio
@@ -23,6 +24,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.filters.command import CommandObject
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
@@ -64,7 +66,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# База: bb_users / bb_usage_stats / bb_subscriptions / bb_invoices
+# База: bb_users / bb_usage_stats / bb_subscriptions / bb_invoices / bb_referrals
 # ---------------------------------------------------------------------------
 
 
@@ -145,6 +147,20 @@ def init_db() -> None:
             """
         )
 
+        # Реферальная программа
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bb_referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_telegram_id INTEGER NOT NULL,
+                referred_telegram_id INTEGER NOT NULL,
+                created_at_ts INTEGER NOT NULL,
+                UNIQUE(referred_telegram_id),
+                CHECK(referrer_telegram_id != referred_telegram_id)
+            )
+            """
+        )
+
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -169,6 +185,10 @@ def get_or_create_user(
     first_name: Optional[str],
     last_name: Optional[str],
 ) -> Dict:
+    """
+    Создаёт пользователя при первом заходе, либо обновляет данные.
+    В словаре результата есть флаг 'is_new' (только что создан).
+    """
     now_ts = int(time.time())
     is_admin = (username or "").lower() in ADMIN_USERNAMES
 
@@ -185,7 +205,10 @@ def get_or_create_user(
                 """,
                 (username, first_name, last_name, int(is_admin), now_ts, telegram_id),
             )
-            return _row_to_user(row)
+            data = _row_to_user(row)
+            data["is_new"] = False
+            data["just_created"] = False
+            return data
 
         cur.execute(
             """
@@ -200,7 +223,10 @@ def get_or_create_user(
         user_id = cur.lastrowid
         cur.execute("SELECT * FROM bb_users WHERE id = ?", (user_id,))
         row = cur.fetchone()
-        return _row_to_user(row)
+        data = _row_to_user(row)
+        data["is_new"] = True
+        data["just_created"] = True
+        return data
 
 
 def get_user(telegram_id: int) -> Optional[Dict]:
@@ -208,7 +234,12 @@ def get_user(telegram_id: int) -> Optional[Dict]:
         cur = conn.cursor()
         cur.execute("SELECT * FROM bb_users WHERE telegram_id = ?", (telegram_id,))
         row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        if not row:
+            return None
+        data = _row_to_user(row)
+        data["is_new"] = False
+        data["just_created"] = False
+        return data
 
 
 def set_user_mode(telegram_id: int, mode: str) -> None:
@@ -428,6 +459,75 @@ def get_last_pending_invoice(telegram_id: int) -> Optional[Dict]:
         }
 
 
+# ----------------------- Реферальная программа -----------------------------
+
+
+def register_referral(referrer_tid: int, referred_tid: int) -> bool:
+    """
+    Регистрирует рефералку.
+    Возвращает True, если это первая регистрация для данного приглашённого.
+    """
+    if referrer_tid == referred_tid:
+        return False
+
+    now_ts = int(time.time())
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        # Уже кто-то привёл этого юзера?
+        cur.execute(
+            "SELECT 1 FROM bb_referrals WHERE referred_telegram_id = ?",
+            (referred_tid,),
+        )
+        if cur.fetchone():
+            return False
+
+        cur.execute(
+            """
+            INSERT INTO bb_referrals (
+                referrer_telegram_id, referred_telegram_id, created_at_ts
+            )
+            VALUES (?, ?, ?)
+            """,
+            (referrer_tid, referred_tid, now_ts),
+        )
+    return True
+
+
+def get_referral_stats(referrer_tid: int) -> int:
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM bb_referrals
+            WHERE referrer_telegram_id = ?
+            """,
+            (referrer_tid,),
+        )
+        row = cur.fetchone()
+        return int(row["c"] if row else 0)
+
+
+def encode_ref_code(telegram_id: int) -> str:
+    """Короткий код по telegram_id (base36)."""
+    n = int(telegram_id)
+    if n == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    res = []
+    while n > 0:
+        n, rem = divmod(n, 36)
+        res.append(digits[rem])
+    return "".join(reversed(res))
+
+
+def decode_ref_code(code: str) -> Optional[int]:
+    try:
+        return int(code, 36)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
@@ -544,10 +644,10 @@ async def generate_ai_reply(telegram_id: int, user_text: str) -> str:
 
     if DEEPSEEK_API_KEY:
         return await _call_deepseek(system_prompt, user_text)
-    elif GROQ_API_KEY:
+    if GROQ_API_KEY:
         return await _call_groq(system_prompt, user_text)
-    else:
-        raise RuntimeError("Нет настроенных ключей LLM")
+
+    raise RuntimeError("Нет настроенных ключей LLM")
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +775,7 @@ BTN_NEW = "💡 Новый запрос"
 BTN_MODES = "🎛 Режим"
 BTN_SUBSCRIPTION = "💎 Подписка"
 BTN_MEMORY = "🧠 Память / профиль"
+BTN_REFERRAL = "👥 Рефералы"
 BTN_HELP = "❔ Помощь"
 
 BTN_MEMORY_ADD = "➕ Добавить факт"
@@ -686,7 +787,7 @@ MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_MODES)],
         [KeyboardButton(text=BTN_MEMORY), KeyboardButton(text=BTN_SUBSCRIPTION)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_REFERRAL), KeyboardButton(text=BTN_HELP)],
     ],
     resize_keyboard=True,
 )
@@ -795,6 +896,7 @@ def _format_profile(telegram_id: int) -> str:
 
     memory_text = user["memory"].strip()
     sub = get_active_subscription(telegram_id)
+    referrals_count = get_referral_stats(telegram_id)
 
     parts: list[str] = [
         "🧠 <b>Твой профиль BlackBox GPT</b>",
@@ -813,6 +915,7 @@ def _format_profile(telegram_id: int) -> str:
     else:
         parts.append("Статус: <b>Free</b>")
 
+    parts.append(f"Рефералов: <b>{referrals_count}</b>")
     parts.append("")
     parts.append("📂 <b>Личное досье</b>:")
 
@@ -830,16 +933,46 @@ def _format_profile(telegram_id: int) -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    user = await _ensure_user(message)
+async def cmd_start(message: Message, command: CommandObject) -> None:
+    user = get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        last_name=message.from_user.last_name,
+    )
     mode = MODES.get(user["mode"], MODES["universal"])
     crown = "👑 " if user["is_admin"] else ""
+
+    referral_text = ""
+    args = (command.args or "").strip() if command else ""
+    if user.get("is_new") and args.startswith("ref_"):
+        code = args[4:]
+        ref_tid = decode_ref_code(code)
+        ref_user = get_user(ref_tid) if ref_tid else None
+        if ref_user and ref_tid != message.from_user.id:
+            if register_referral(ref_tid, message.from_user.id):
+                # Бонусы: по 1 дню Premium
+                add_subscription(ref_tid, "ref_bonus", 1)
+                add_subscription(message.from_user.id, "ref_bonus", 1)
+                referral_text = (
+                    "\n\n🎁 Ты зашёл по реферальной ссылке.\n"
+                    "Тебе начислен <b>1 день BlackBox GPT Premium</b>."
+                )
+                try:
+                    await message.bot.send_message(
+                        ref_tid,
+                        "👥 По твоей реферальной ссылке пришёл новый пользователь.\n"
+                        "Тебе начислен <b>1 день BlackBox GPT Premium</b>.",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to notify referrer %s", ref_tid)
 
     text = (
         f"Привет, {message.from_user.first_name or 'друг'}!\n\n"
         f"Это <b>{crown}BlackBox GPT</b> — универсальный ассистент, который держит контекст и подстраивается под тебя.\n\n"
         "Просто напиши запрос или нажми <b>«Новый запрос»</b>.\n\n"
         f"Сейчас активен режим: <b>{mode.title}</b>."
+        f"{referral_text}"
     )
     await message.answer(text, reply_markup=MAIN_KB)
 
@@ -851,6 +984,7 @@ async def cmd_help(message: Message) -> None:
         "• <b>Новый запрос</b> — просто пиши, как человеку.\n"
         "• <b>Режим</b> — выбираешь стиль работы ассистента.\n"
         "• <b>Память / профиль</b> — досье: цели, контекст, особенности общения.\n"
+        "• <b>Рефералы</b> — личная ссылка с бонусами Premium.\n"
         "• <b>Подписка</b> — безлимитные сообщения после free-лимита.\n\n"
         "Я не заменяю врачей, юристов и т.д., но помогаю структурировать мысли, "
         "найти варианты действий и увидеть риски."
@@ -962,6 +1096,35 @@ async def back_to_main(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Рефералы
+# ---------------------------------------------------------------------------
+
+
+@router.message(F.text == BTN_REFERRAL)
+async def referral_menu(message: Message) -> None:
+    await _ensure_user(message)
+    me = await message.bot.get_me()
+    code = encode_ref_code(message.from_user.id)
+    link = f"https://t.me/{me.username}?start=ref_{code}"
+
+    count = get_referral_stats(message.from_user.id)
+    days_bonus = count  # по одному дню за реферала
+
+    text = (
+        "👥 <b>Реферальная программа BlackBox GPT</b>\n\n"
+        "Как работает:\n"
+        "• Ты отправляешь человеку свою ссылку.\n"
+        "• Он заходит в бота через неё.\n"
+        "• Ему — <b>1 день Premium</b>, тебе — <b>1 день Premium</b>.\n\n"
+        "Твоя личная ссылка:\n"
+        f"<code>{link}</code>\n\n"
+        f"Уже пришло по ссылке: <b>{count}</b> чел.\n"
+        f"Всего бонусных дней Premium: <b>{days_bonus}</b>."
+    )
+    await message.answer(text, reply_markup=MAIN_KB)
+
+
+# ---------------------------------------------------------------------------
 # Подписка
 # ---------------------------------------------------------------------------
 
@@ -993,7 +1156,7 @@ async def _refresh_subscription_status(telegram_id: int) -> Optional[str]:
 
     plan_code = invoice["plan_code"]
     duration_days = None
-    for label, (code, _amount, days) in PLANS.items():
+    for _label, (code, _amount, days) in PLANS.items():
         if code == plan_code:
             duration_days = days
             break
@@ -1042,7 +1205,7 @@ async def show_subscription(message: Message) -> None:
 
 @router.message(F.text.in_(set(PLANS.keys())))
 async def create_subscription_invoice(message: Message) -> None:
-    plan_code, amount, days = PLANS[message.text]
+    plan_code, amount, _days = PLANS[message.text]
     desc = f"Подписка BlackBox GPT Premium — {message.text}"
 
     try:
@@ -1131,6 +1294,7 @@ async def handle_chat(message: Message) -> None:
         BTN_MODES,
         BTN_SUBSCRIPTION,
         BTN_MEMORY,
+        BTN_REFERRAL,
         BTN_HELP,
         BTN_MEMORY_ADD,
         BTN_MEMORY_SHOW,
