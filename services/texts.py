@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
-from bot.config import (
-    FREE_DAILY_LIMIT,
-    FREE_MONTHLY_LIMIT,
-    PREMIUM_DAILY_LIMIT,
-    PREMIUM_MONTHLY_LIMIT,
-)
+# Пытаемся аккуратно импортировать лимиты из конфига
+try:
+    from bot.config import (
+        FREE_DAILY_LIMIT,
+        FREE_MONTHLY_LIMIT,
+        PREMIUM_DAILY_LIMIT,
+        PREMIUM_MONTHLY_LIMIT,
+    )
+except ImportError:  # fallback, если структура другая
+    try:
+        from config import (
+            FREE_DAILY_LIMIT,
+            FREE_MONTHLY_LIMIT,
+            PREMIUM_DAILY_LIMIT,
+            PREMIUM_MONTHLY_LIMIT,
+        )
+    except ImportError:
+        # Резервные значения, чтобы модуль не падал
+        FREE_DAILY_LIMIT = 30
+        FREE_MONTHLY_LIMIT = 300
+        PREMIUM_DAILY_LIMIT = 300
+        PREMIUM_MONTHLY_LIMIT = 3000
 
 
 def _fmt_date(dt: Optional[datetime]) -> str:
@@ -55,17 +71,61 @@ def render_onboarding(
 # =========================
 #  Профиль
 # =========================
-def render_profile(
-    plan_code: str,
-    plan_title: str,
-    is_admin: bool,
-    daily_used: int,
-    monthly_used: int,
-    premium_until: Optional[datetime],
-    total_requests: int,
-    total_tokens: int,
-    ref_code: Optional[str],
-) -> str:
+def render_profile(*args: Any, **kwargs: Any) -> str:
+    """
+    Гибкий рендер профиля.
+
+    Поддерживает разные варианты сигнатуры:
+    - именованные аргументы (plan_code, plan_title, is_admin, daily_used, ...)
+    - позиционные (в том же порядке), если где-то используются.
+    """
+
+    # --- 1. Читаем из kwargs (основной вариант) ---
+    plan_code = kwargs.get("plan_code") or kwargs.get("plan") or "basic"
+    plan_title = (
+        kwargs.get("plan_title")
+        or kwargs.get("plan_name")
+        or kwargs.get("plan")
+        or "Basic"
+    )
+    is_admin = bool(kwargs.get("is_admin", False))
+    daily_used = int(kwargs.get("daily_used", 0) or 0)
+    monthly_used = int(kwargs.get("monthly_used", 0) or 0)
+    premium_until = kwargs.get("premium_until")
+    total_requests = int(kwargs.get("total_requests", 0) or 0)
+    total_tokens = int(kwargs.get("total_tokens", 0) or 0)
+    ref_code = (
+        kwargs.get("ref_code")
+        or kwargs.get("referral_code")
+        or kwargs.get("ref")
+        or None
+    )
+
+    # --- 2. Если kwargs пустой, пробуем разобрать позиционные ---
+    if not kwargs and args:
+        # Ожидаемый порядок:
+        # plan_code, plan_title, is_admin, daily_used, monthly_used,
+        # premium_until, total_requests, total_tokens, ref_code
+        if len(args) > 0:
+            plan_code = args[0]
+        if len(args) > 1:
+            plan_title = args[1]
+        if len(args) > 2:
+            is_admin = bool(args[2])
+        if len(args) > 3:
+            daily_used = int(args[3])
+        if len(args) > 4:
+            monthly_used = int(args[4])
+        if len(args) > 5:
+            premium_until = args[5]
+        if len(args) > 6:
+            total_requests = int(args[6])
+        if len(args) > 7:
+            total_tokens = int(args[7])
+        if len(args) > 8:
+            ref_code = args[8]
+
+    # --- 3. Лимиты по тарифу ---
     if is_admin or plan_code == "admin":
         daily_max = "без ограничений"
         monthly_max = "без ограничений"
@@ -224,10 +284,29 @@ def render_payment_check_result(status: str) -> str:
 # =========================
 #  Рефералы
 # =========================
-def render_referrals(
-    ref_link: str,
-    total_refs: int,
-) -> str:
+def render_referrals(*args: Any, **kwargs: Any) -> str:
+    """
+    Гибкий рендер экрана рефералок.
+
+    Поддерживает:
+    - ref_link, total_refs через kwargs
+    - позиционные аргументы (ref_link, total_refs)
+    """
+    ref_link = kwargs.get("ref_link")
+    total_refs = kwargs.get("total_refs")
+
+    if ref_link is None and args:
+        ref_link = args[0]
+    if total_refs is None and len(args) > 1:
+        total_refs = args[1]
+
+    if ref_link is None:
+        ref_link = "—"
+    if total_refs is None:
+        total_refs = 0
+
+    total_refs = int(total_refs)
+
     return (
         "👥 *Реферальная программа*\n\n"
         "Позови друзей в Black Box GPT и получай бонусы.\n\n"
