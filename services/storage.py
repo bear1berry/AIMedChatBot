@@ -1,84 +1,96 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from aiogram.types import User as TgUser
 
 from bot.config import (
     USERS_FILE_PATH,
-    DEFAULT_DAILY_LIMIT,
-    PLAN_BASIC,
-    PLAN_PREMIUM,
-    REF_BONUS_PER_USER,
-    SUBSCRIPTION_TARIFFS,
-    DEFAULT_MODE,
+    DEFAULT_MODE_KEY,
+    ADMIN_IDS,
 )
 
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class UserRecord:
-    user_id: int
+    id: int
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
 
-    mode: str = DEFAULT_MODE
+    mode_key: str = DEFAULT_MODE_KEY
 
-    plan: str = PLAN_BASIC
-    premium_until: Optional[str] = None  # ISO8601 UTC
+    plan_type: str = "basic"  # basic | premium
+    premium_until: Optional[float] = None
 
-    daily_date: str = field(default_factory=lambda: date.today().isoformat())
     daily_used: int = 0
-    total_used: int = 0
+    monthly_used: int = 0
+    last_daily_reset: Optional[str] = None  # YYYY-MM-DD
+    last_monthly_reset: Optional[str] = None  # YYYY-MM
+
+    total_requests: int = 0
+    total_tokens: int = 0
 
     ref_code: Optional[str] = None
-    referred_by: Optional[int] = None
-    ref_count: int = 0
-    ref_bonus_messages: int = 0
+    referred_by: Optional[str] = None
+    referrals_count: int = 0
 
-     history: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+    last_invoice_id: Optional[int] = None
+    last_tariff_key: Optional[str] = None
 
-    pending_invoice_id: Optional[int] = None
-    pending_invoice_tariff: Optional[str] = None
+    style_hint: Optional[str] = None
 
-    created_at: str = field(default_factory=lambda: _now_utc().isoformat())
+    created_at: float = field(default_factory=lambda: time.time())
+    updated_at: float = field(default_factory=lambda: time.time())
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserRecord":
+        """
+        Аккуратно восстанавливаем запись, игнорируя лишние поля из старых версий.
+        """
+        return cls(
+            id=int(data.get("id")),
+            username=data.get("username"),
+            first_name=data.get("first_name"),
+            last_name=data.get("last_name"),
+            mode_key=data.get("mode_key", DEFAULT_MODE_KEY),
+            plan_type=data.get("plan_type", "basic"),
+            premium_until=data.get("premium_until"),
+            daily_used=int(data.get("daily_used", 0)),
+            monthly_used=int(data.get("monthly_used", 0)),
+            last_daily_reset=data.get("last_daily_reset"),
+            last_monthly_reset=data.get("last_monthly_reset"),
+            total_requests=int(data.get("total_requests", 0)),
+            total_tokens=int(data.get("total_tokens", 0)),
+            ref_code=data.get("ref_code"),
+            referred_by=data.get("referred_by"),
+            referrals_count=int(data.get("referrals_count", 0)),
+            last_invoice_id=data.get("last_invoice_id"),
+            # поддержка старого имени поля, если оно было
+            last_tariff_key=data.get("last_tariff_key") or data.get("last_invoice_code"),
+            style_hint=data.get("style_hint"),
+            created_at=float(data.get("created_at", time.time())),
+            updated_at=float(data.get("updated_at", time.time())),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "UserRecord":
-        # Простая миграция старых записей
-        if "history" not in data:
-            data["history"] = {}
-        if "ref_bonus_messages" not in data:
-            data["ref_bonus_messages"] = 0
-        if "plan" not in data:
-            data["plan"] = PLAN_BASIC
-        if "mode" not in data:
-            data["mode"] = DEFAULT_MODE
-        return cls(**data)
 
-
-class Storage:␊
-    """
-    Простое JSON-хранилище пользователей.
-
-    Формат файла: { "<user_id>": { ...UserRecord... }, ... }
-    """
-
-    def __init__(self, path: Path = USERS_FILE_PATH) -> None:
+class Storage:
+    def __init__(self, path: Path = USERS_FILE_PATH):
         self.path = path
         self._data: Dict[str, Dict[str, Any]] = {}
         self._load()
 
-    # --- low-level I/O ---
+    # --- low-level ---
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -90,181 +102,154 @@ class Storage:␊
             if isinstance(raw, dict):
                 self._data = raw
             else:
+                logger.warning("Unexpected users.json format, resetting")
                 self._data = {}
-        except Exception:
-@@ -143,55 +143,93 @@ class Storage:
-            self._save()
-            return self._data[key], False
+        except Exception as e:
+            logger.exception("Failed to load users.json: %s", e)
+            self._data = {}
 
-        # Создаём нового
-        rec = UserRecord(user_id=user_id)
-        if tg_user is not None:
-            rec.username = getattr(tg_user, "username", None)
-            rec.first_name = getattr(tg_user, "first_name", None)
-            rec.last_name = getattr(tg_user, "last_name", None)
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            tmp.replace(self.path)
+        except Exception as e:
+            logger.exception("Failed to save users.json: %s", e)
+
+    def _key(self, user_id: int) -> str:
+        return str(user_id)
+
+    # --- helpers ---
+
+    def _ensure_ref_code(self, rec: UserRecord) -> None:
+        if not rec.ref_code:
+            # Простая, но устойчивая схема
+            rec.ref_code = f"u{rec.id}"
+
+    def _refresh_plan_from_premium(self, rec: UserRecord) -> None:
+        if rec.plan_type == "premium" and rec.premium_until is not None:
+            if time.time() > rec.premium_until:
+                rec.plan_type = "basic"
+
+    def _refresh_limits_dates(self, rec: UserRecord) -> None:
+        now = time.localtime()
+        day_key = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
+        month_key = f"{now.tm_year:04d}-{now.tm_mon:02d}"
+
+        if rec.last_daily_reset != day_key:
+            rec.daily_used = 0
+            rec.last_daily_reset = day_key
+
+        if rec.last_monthly_reset != month_key:
+            rec.monthly_used = 0
+            rec.last_monthly_reset = month_key
+
+    # --- public API ---
+
+    def get_or_create_user(self, user_id: int, tg_user: Optional[TgUser] = None) -> Tuple[UserRecord, bool]:
+        key = self._key(user_id)
+        created = False
+        if key in self._data:
+            try:
+                rec = UserRecord.from_dict(self._data[key])
+            except Exception:
+                logger.exception("Failed to restore user %s, recreating", key)
+                rec = UserRecord(id=user_id)
+                created = True
+        else:
+            rec = UserRecord(id=user_id)
+            created = True
+
+        # Обновляем базовые поля
+        if tg_user:
+            rec.username = tg_user.username
+            rec.first_name = tg_user.first_name
+            rec.last_name = tg_user.last_name
 
         self._ensure_ref_code(rec)
+        self._refresh_plan_from_premium(rec)
+        self._refresh_limits_dates(rec)
+        rec.updated_at = time.time()
+
         self._data[key] = rec.to_dict()
         self._save()
-        return self._data[key], True
+        return rec, created
 
-    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
-        return self._data.get(self._key(user_id))
-
-    def save_user(self, user_dict: Dict[str, Any]) -> None:
-        key = self._key(user_dict["user_id"])
-        self._data[key] = user_dict
+    def save_user(self, rec: UserRecord) -> None:
+        key = self._key(rec.id)
+        self._ensure_ref_code(rec)
+        self._refresh_plan_from_premium(rec)
+        self._refresh_limits_dates(rec)
+        rec.updated_at = time.time()
+        self._data[key] = rec.to_dict()
         self._save()
 
-    # --- режимы ---
+    def set_mode(self, user_id: int, mode_key: str) -> None:
+        key = self._key(user_id)
+        if key not in self._data:
+            rec = UserRecord(id=user_id, mode_key=mode_key)
+        else:
+            rec = UserRecord.from_dict(self._data[key])
+            rec.mode_key = mode_key
+        self.save_user(rec)
 
-    def set_mode(self, user_id: int, mode: str) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        rec_dict["mode"] = mode
-        self.save_user(rec_dict)
-        return rec_dict
+    def apply_usage(self, rec: UserRecord, tokens: int) -> None:
+        rec.total_requests += 1
+        rec.total_tokens += max(0, tokens)
+        rec.daily_used += 1
+        rec.monthly_used += 1
+        self.save_user(rec)
 
-    def get_mode(self, user_id: int) -> str:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        return rec_dict.get("mode") or DEFAULT_MODE
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in ADMIN_IDS
 
-    # --- публичные резюме по пользователю ---
+    def effective_plan(self, rec: UserRecord, is_admin: bool) -> str:
+        if is_admin:
+            return "admin"
+        self._refresh_plan_from_premium(rec)
+        return rec.plan_type or "basic"
 
-    def get_plan(self, user_id: int) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        premium_until = rec_dict.get("premium_until")
-        return {
-            "code": rec_dict.get("plan") or PLAN_BASIC,
-            "premium_until": premium_until,
-            "is_premium_active": self.is_premium_active(rec_dict),
-        }
+    def apply_referral(self, new_user_id: int, ref_code: str) -> None:
+        # находим владельца ref_code
+        owner_id = None
+        for key, value in self._data.items():
+            try:
+                if value.get("ref_code") == ref_code:
+                    owner_id = int(key)
+                    break
+            except Exception:
+                continue
+        if not owner_id:
+            return
 
-    def get_limits(self, user_id: int) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        daily_limit = self.get_daily_limit(rec_dict)
-        used_today = int(rec_dict.get("daily_used") or 0)
-        remaining = None if daily_limit is None else max(daily_limit - used_today, 0)
-        return {
-            "daily_limit": daily_limit,
-            "used_today": used_today,
-            "remaining_daily": remaining,
-            "total_used": int(rec_dict.get("total_used") or 0),
-            "is_premium": self.is_premium_active(rec_dict),
-            "premium_until": rec_dict.get("premium_until"),
-        }
+        # обновляем владельца
+        owner_rec = UserRecord.from_dict(self._data[str(owner_id)])
+        owner_rec.referrals_count += 1
+        self.save_user(owner_rec)
 
-    def get_referral_stats(self, user_id: int) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        return {
-            "ref_count": int(rec_dict.get("ref_count") or 0),
-            "ref_bonus_messages": int(rec_dict.get("ref_bonus_messages") or 0),
-            "ref_code": rec_dict.get("ref_code"),
-            "referred_by": rec_dict.get("referred_by"),
-        }
+        # отмечаем у нового пользователя, что он пришёл по рефке
+        new_key = self._key(new_user_id)
+        if new_key in self._data:
+            rec = UserRecord.from_dict(self._data[new_key])
+        else:
+            rec = UserRecord(id=new_user_id)
+        rec.referred_by = ref_code
+        self.save_user(rec)
 
-    # --- лимиты / планы ---
+    def store_invoice(self, rec: UserRecord, invoice_id: int, tariff_key: str) -> None:
+        rec.last_invoice_id = invoice_id
+        rec.last_tariff_key = tariff_key
+        self.save_user(rec)
 
-    def is_premium_active(self, user_dict: Dict[str, Any]) -> bool:
-        until_str = user_dict.get("premium_until")
-        if not until_str:
-            return False
-        try:
-            until = datetime.fromisoformat(until_str)
-        except Exception:
-            return False
-        return until > _now_utc()
+    def get_last_invoice(self, rec: UserRecord) -> Tuple[Optional[int], Optional[str]]:
+        return rec.last_invoice_id, rec.last_tariff_key
 
-    def get_daily_limit(self, user_dict: Dict[str, Any]) -> Optional[int]:
-        """
-        Возвращает лимит сообщений на день.
-        None = безлимит (например для Premium).
-        """
-        if self.is_premium_active(user_dict):
-            return None
-        base = DEFAULT_DAILY_LIMIT
-        bonus = int(user_dict.get("ref_bonus_messages") or 0)
-        return base + bonus
-
-    def register_usage(self, user_dict: Dict[str, Any], count: int = 1) -> Dict[str, Any]:
-@@ -238,47 +276,81 @@ class Storage:
-
-        # Обновляем нового
-        new_rec["referred_by"] = referrer["user_id"]
-        self.save_user(new_rec)
-
-        # Обновляем реферера
-        referrer["ref_count"] = int(referrer.get("ref_count") or 0) + 1
-        referrer["ref_bonus_messages"] = int(referrer.get("ref_bonus_messages") or 0) + REF_BONUS_PER_USER
-        self.save_user(referrer)
-
-        return referrer, new_rec
-
-    # --- история диалогов ---
-
-    def add_history_message(self, user_dict: Dict[str, Any], mode: str, role: str, content: str, max_len: int = 20) -> Dict[str, Any]:
-        history = user_dict.setdefault("history", {})
-        conv = history.setdefault(mode, [])
-        conv.append({"role": role, "content": content})
-        if len(conv) > max_len:
-            # Обрезаем старые сообщения
-            conv[:] = conv[-max_len:]
-        user_dict["history"] = history
-        self.save_user(user_dict)
-        return user_dict
-
-    def get_history(self, user_dict: Dict[str, Any], mode: str, max_len: int = 20) -> List[Dict[str, str]]:
-        history = user_dict.get("history") or {}
-        conv = history.get(mode) or []
-        if len(conv) > max_len:
-            return conv[-max_len:]
-        return conv
-
-    def get_chat_history(self, user_id: int, mode: Optional[str] = None, max_len: int = 20) -> List[Dict[str, str]]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        mode_to_use = mode or rec_dict.get("mode") or DEFAULT_MODE
-        return self.get_history(rec_dict, mode_to_use, max_len=max_len)
-
-    def append_chat_history(
-        self, user_id: int, role: str, content: str, mode: Optional[str] = None
-    ) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        mode_to_use = mode or rec_dict.get("mode") or DEFAULT_MODE
-        return self.add_history_message(rec_dict, mode_to_use, role, content)
-
-    def update_on_request(
-        self, user_id: int, mode: str, user_prompt: Optional[str] = None
-    ) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        rec_dict["daily_used"] = int(rec_dict.get("daily_used") or 0) + 1
-        rec_dict["total_used"] = int(rec_dict.get("total_used") or 0) + 1
-        if user_prompt:
-            rec_dict = self.add_history_message(rec_dict, mode, "user", user_prompt)
-        self.save_user(rec_dict)
-        return rec_dict
-
-
-    # --- инвойсы ---
-
-    def set_pending_invoice(self, user_id: int, invoice_id: int, tariff_code: str) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        rec_dict["pending_invoice_id"] = int(invoice_id)
-        rec_dict["pending_invoice_tariff"] = tariff_code
-        self.save_user(rec_dict)
-        return rec_dict
-
-    def clear_pending_invoice(self, user_id: int) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        rec_dict["pending_invoice_id"] = None
-        rec_dict["pending_invoice_tariff"] = None
-        self.save_user(rec_dict)
-        return rec_dict
-
-
-_storage: Optional[Storage] = None
-
-
-def get_storage() -> Storage:
-    global _storage
-    if _storage is None:
-        _storage = Storage()
-    return _storage
+    def activate_premium(self, rec: UserRecord, months: int) -> None:
+        now = time.time()
+        base = rec.premium_until if rec.premium_until and rec.premium_until > now else now
+        # грубо считаем месяц как 30 дней
+        rec.premium_until = base + 30 * 24 * 3600 * months
+        rec.plan_type = "premium"
+        self.save_user(rec)
