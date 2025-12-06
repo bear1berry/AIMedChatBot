@@ -21,16 +21,16 @@ else:
 
 # --- Tokens & API keys ---
 
-BOT_TOKEN: str | None = os.getenv("BOT_TOKEN")
-DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in .env")
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is not set in .env")
-
-print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")
-print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")
+BOT_TOKEN: str | None = os.getenv("BOT_TOKEN") or "TEST_BOT_TOKEN"
+DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY") or "TEST_DEEPSEEK_KEY"
+␊
+if not os.getenv("BOT_TOKEN"):
+    print("[CONFIG] BOT_TOKEN is not set; using a placeholder value for local runs.")
+if not os.getenv("DEEPSEEK_API_KEY"):
+    print("[CONFIG] DEEPSEEK_API_KEY is not set; using a placeholder value for local runs.")
+␊
+print(f"[CONFIG] BOT_TOKEN loaded? {'YES' if BOT_TOKEN else 'NO'}")␊
+print(f"[CONFIG] DEEPSEEK_API_KEY loaded? {'YES' if DEEPSEEK_API_KEY else 'NO'}")␊
 
 # Optional: DeepSeek base URL & model (OpenAI-совместимый API)
 DEEPSEEK_API_BASE_URL: str = os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com")
@@ -45,6 +45,13 @@ CRYPTO_PAY_API_URL: str = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot
 
 OWNER_ID_ENV = os.getenv("OWNER_ID", "").strip()
 OWNER_ID = int(OWNER_ID_ENV) if OWNER_ID_ENV.isdigit() else None
+ADMIN_IDS = [OWNER_ID] if OWNER_ID is not None else []
+LOG_CHAT_ID_ENV = os.getenv("LOG_CHAT_ID", "").strip()
+LOG_CHAT_ID = int(LOG_CHAT_ID_ENV) if LOG_CHAT_ID_ENV.isdigit() else None
+
+# --- Misc ---
+REF_BASE_URL = os.getenv("REF_BASE_URL", "https://t.me/yourbot")
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "2000"))
 
 # --- Планы и лимиты ---
 
@@ -58,29 +65,29 @@ DEFAULT_DAILY_LIMIT: int = 30
 REF_BONUS_PER_USER: int = 10
 
 # Тарифы подписки (цены в USDT через CryptoBot)
-SUBSCRIPTION_TARIFFS = {
-    "month": {
-        "code": "month",
-        "title": "1 месяц Premium",
-        "days": 30,
-        "price_usdt": 7.99,
-        "asset": "USDT",
-    },
-    "quarter": {
-        "code": "quarter",
-        "title": "3 месяца Premium",
-        "days": 90,
-        "price_usdt": 26.99,
-        "asset": "USDT",
-    },
-    "year": {
-        "code": "year",
-        "title": "12 месяцев Premium",
-        "days": 365,
-        "price_usdt": 82.99,
-        "asset": "USDT",
-    },
-}
+SUBSCRIPTION_TARIFFS = {␊
+    "month_1": {
+        "code": "month_1",
+        "title": "1 месяц Premium",␊
+        "days": 30,␊
+        "price_usdt": 7.99,␊
+        "asset": "USDT",␊
+    },␊
+    "month_3": {
+        "code": "month_3",
+        "title": "3 месяца Premium",␊
+        "days": 90,␊
+        "price_usdt": 26.99,␊
+        "asset": "USDT",␊
+    },␊
+    "month_12": {
+        "code": "month_12",
+        "title": "12 месяцев Premium",␊
+        "days": 365,␊
+        "price_usdt": 82.99,␊
+        "asset": "USDT",␊
+    },␊
+}␊
 
 # --- Файлы хранилища ---
 
@@ -106,52 +113,3 @@ ASSISTANT_MODES = {
             "Если запрос неясен — сначала уточни, но не злоупотребляй вопросами."
         ),
     },
-    "medicine": {
-        "code": "medicine",
-        "emoji": "🩺",
-        "title": "Медицина",
-        "button": "🩺 Медицина",
-        "description": "Профессиональный разбор медицины простым языком. Памятки, алгоритмы, разбор статей.",
-        "system_prompt": (
-            "Ты — ИИ-ассистент врача-эпидемиолога. "
-            "Отвечай строго на основе доказательной медицины и актуальных клинических рекомендаций. "
-            "Обязательно подчёркивай, что не ставишь диагноз и не заменяешь очный приём."
-        ),
-    },
-    "mentor": {
-        "code": "mentor",
-        "emoji": "🔥",
-        "title": "Наставник",
-        "button": "🔥 Наставник",
-        "description": "Личный наставник: режим, дисциплина, цели, разбор состояний и поддержка.",
-        "system_prompt": (
-            "Ты — личный наставник пользователя. "
-            "Помогаешь в дисциплине, саморазвитии, постановке и разборе целей. "
-            "Будь поддерживающим, но прямым: меньше воды, больше конкретики, структурных планов и шагов."
-        ),
-    },
-    "business": {
-        "code": "business",
-        "emoji": "💼",
-        "title": "Бизнес",
-        "button": "💼 Бизнес",
-        "description": "Запуски, стратегии, идеи, проверки гипотез, тексты для продаж.",
-        "system_prompt": (
-            "Ты — стратегический бизнес-ассистент. "
-            "Помогаешь с идеями, проверкой гипотез, маркетингом, структурой продуктов и текстами. "
-            "Отвечай чётко, логично, с фокусом на практику и цифры."
-        ),
-    },
-    "creative": {
-        "code": "creative",
-        "emoji": "🎨",
-        "title": "Креатив",
-        "button": "🎨 Креатив",
-        "description": "Айдентика, идеи, визуалы, тексты, сценарии — всё, где нужен креатив.",
-        "system_prompt": (
-            "Ты — креативный директор и копирайтер. "
-            "Генерируй идеи для визуала, текстов, историй, сценариев. "
-            "Сохраняй структурность и внятность, даже когда предлагаешь смелые концепции."
-        ),
-    },
-}
