@@ -1,72 +1,92 @@
 from __future__ import annotations
 
-from typing import Any, AsyncGenerator, Dict, List
+import asyncio
+import logging
+from typing import AsyncGenerator, Dict, Any, List
 
 import httpx
 
-from bot.config import DEEPSEEK_API_KEY, DEEPSEEK_API_BASE_URL, DEEPSEEK_MODEL␊
+from bot.config import DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_MODEL, ASSISTANT_MODES
+
+logger = logging.getLogger(__name__)
 
 
-async def generate_answer(␊
-    system_prompt: str,
-    history: List[Dict[str, str]],
-    user_message: str,
-    timeout: float = 60.0,
-) -> str:
-    """
-    Вызывает DeepSeek Chat Completions (OpenAI-совместимый API) и возвращает один текстовый ответ.
-    """
-    messages: List[Dict[str, str]] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{DEEPSEEK_API_BASE_URL.rstrip('/')}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": messages,
-                "stream": False,
-            },
-        )
+async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
         resp.raise_for_status()
-        data: Dict[str, Any] = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError("DeepSeek API вернул пустой список choices")
-        message = choices[0].get("message") or {}
-        content = message.get("content") or ""
-        return str(content).strip()
+        data = resp.json()
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.exception("Unexpected DeepSeek response: %s", data)
+            raise RuntimeError("Unexpected DeepSeek response") from e
+
+
+def _estimate_tokens(*texts: str) -> int:
+    # Небольшая грубая оценка токенов
+    total_chars = sum(len(t or "") for t in texts)
+    return max(1, total_chars // 4)
 
 
 async def ask_llm_stream(
     mode_key: str,
     user_prompt: str,
-    history: List[Dict[str, str]] | None = None,
-) -> AsyncGenerator[str, None]:
-    """Compatibility wrapper expected by the bot logic.
-
-    The upstream DeepSeek API supports streaming responses, but for local
-    development and tests we keep implementation simple and yield the full
-    answer as a single chunk.  This keeps the rest of the code operational
-    without requiring a live network connection during automated checks.
+    style_hint: str | None = None,
+) -> AsyncGenerator[Dict[str, Any], None]:
     """
+    Возвращает async-генератор с частями текста.
+    Каждый yield: {"delta": str, "full": str, "tokens": int}
+    """
+    mode = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES["universal"]
+    system_prompt = mode["system_prompt"]
+    if style_hint:
+        system_prompt += (
+            "\n\nДополнительно учитывай стиль общения пользователя:\n"
+            f"{style_hint.strip()}"
+        )
 
-    system_prompt = ""
-    from bot.config import ASSISTANT_MODES, DEFAULT_MODE  # local import to avoid cycles
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE])
-    system_prompt = mode_cfg.get("system_prompt") or ""
+    full_text = await _call_deepseek(messages)
+    est_tokens = _estimate_tokens(user_prompt, full_text)
 
-    answer = await generate_answer(
-        system_prompt=system_prompt,
-        history=history or [],
-        user_message=user_prompt,
-    )
-    yield answer
+    # Плавное "живое" печатание — отдаём текст батчами
+    words = full_text.split()
+    chunks: List[str] = []
+    current = ""
+    for w in words:
+        candidate = (current + " " + w) if current else w
+        if len(candidate) >= 120:  # размер батча
+            chunks.append(candidate)
+            current = ""
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    assembled = ""
+    for chunk in chunks:
+        assembled = (assembled + " " + chunk) if assembled else chunk
+        yield {
+            "delta": chunk,
+            "full": assembled,
+            "tokens": est_tokens,
+        }
+        await asyncio.sleep(0.05)
+
+    if not chunks:
+        # На всякий случай, если текст оказался пустым
+        yield {"delta": "", "full": full_text, "tokens": est_tokens}
