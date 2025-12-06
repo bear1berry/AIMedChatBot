@@ -1,71 +1,38 @@
+# bot/main.py
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
-import os
-import sqlite3
 import textwrap
-import time
-from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Optional, Tuple
 
-import httpx
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ChatType, ParseMode
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BotCommand,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
 )
-from dotenv import load_dotenv
 
+from bot.config import (
+    ASSISTANT_MODES,
+    BOT_TOKEN,
+    DEFAULT_DAILY_LIMIT,
+    DEFAULT_MODE,
+    OWNER_ID,
+    PLAN_BASIC,
+    PLAN_PREMIUM,
+    SUBSCRIPTION_TARIFFS,
+)
+from services.llm import generate_answer
+from services.payments import create_cryptobot_invoice, get_invoice_status
+from services.storage import Storage, UserRecord
 
 # ---------------------------------------------------------------------------
-# Конфигурация
+# Логирование и инициализация
 # ---------------------------------------------------------------------------
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# Crypto Pay
-CRYPTO_PAY_API_TOKEN = os.getenv("CRYPTO_PAY_API_TOKEN")
-CRYPTO_PAY_API_URL = os.getenv("CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api")
-
-# База
-DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscription.db")
-
-# Лимит бесплатных сообщений
-FREE_MESSAGES_LIMIT = int(os.getenv("FREE_MESSAGES_LIMIT", "20"))
-
-# Админы (username без @, через запятую / пробел)
-ADMIN_USERNAMES = {
-    u.strip().lower()
-    for u in os.getenv("ADMIN_USERNAMES", "").replace(",", " ").split()
-    if u.strip()
-}
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment (.env)")
-
-LLM_AVAILABLE = bool(DEEPSEEK_API_KEY or GROQ_API_KEY)
-CRYPTO_ENABLED = bool(CRYPTO_PAY_API_TOKEN)
-
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,946 +40,658 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+router = Router()
+dp = Dispatcher()
+dp.include_router(router)
+
+storage = Storage()
 
 # ---------------------------------------------------------------------------
-# Тарифы (только Crypto / USDT)
+# UI: кнопки и клавиатура
 # ---------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
-class Plan:
-    code: str
-    title: str
-    months: int
-    price_usdt: float
-    description: str
+BTN_MODES = "🧠 Режимы"
+BTN_PROFILE = "👤 Профиль"
+BTN_SUBSCRIPTION = "💎 Подписка"
+BTN_REFERRALS = "👥 Рефералы"
 
 
-PLANS: dict[str, Plan] = {
-    "1m": Plan(
-        code="1m",
-        title="1 месяц доступа",
-        months=1,
-        price_usdt=7.99,
-        description="Стартовый доступ к BlackBox GPT на 1 месяц",
-    ),
-    "3m": Plan(
-        code="3m",
-        title="3 месяца доступа",
-        months=3,
-        price_usdt=26.99,
-        description="Удобный пакет на 3 месяца со скидкой",
-    ),
-    "12m": Plan(
-        code="12m",
-        title="12 месяцев доступа",
-        months=12,
-        price_usdt=82.99,
-        description="Годовой доступ с максимальной выгодой",
-    ),
-}
+def build_main_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Нижний таскбар. Никаких инлайнов — всё управление здесь.
+    """
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_MODES), KeyboardButton(text=BTN_PROFILE)],
+            [KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_REFERRALS)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+    return kb
+
+
+def _wrap(text: str) -> str:
+    return textwrap.dedent(text).strip()
 
 
 # ---------------------------------------------------------------------------
-# База данных (users_v2 + messages для истории)
+# Вспомогательные функции для UserRecord
 # ---------------------------------------------------------------------------
 
-
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    """Создаём необходимые таблицы (пользователи + история сообщений)."""
-    with _get_conn() as conn:
-        cur = conn.cursor()
-
-        # Пользователи
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users_v2 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                is_premium INTEGER NOT NULL DEFAULT 0,
-                premium_until_ts INTEGER,
-                free_used INTEGER NOT NULL DEFAULT 0,
-                created_at_ts INTEGER NOT NULL,
-                updated_at_ts INTEGER NOT NULL
-            )
-            """
-        )
-
-        # История сообщений (для адаптации под стиль общения)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
-                role TEXT NOT NULL,          -- 'user' или 'assistant'
-                content TEXT NOT NULL,
-                created_at_ts INTEGER NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_messages_user_ts
-            ON messages(telegram_id, created_at_ts)
-            """
-        )
-
-        conn.commit()
-
-
-def get_or_create_user(
-    telegram_id: int,
-    username: Optional[str],
-    first_name: Optional[str],
-    last_name: Optional[str],
-) -> sqlite3.Row:
-    now = int(time.time())
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM users_v2 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            cur.execute(
-                """
-                UPDATE users_v2
-                SET username = ?, first_name = ?, last_name = ?, updated_at_ts = ?
-                WHERE telegram_id = ?
-                """,
-                (username, first_name, last_name, now, telegram_id),
-            )
-        else:
-            cur.execute(
-                """
-                INSERT INTO users_v2 (
-                    telegram_id,
-                    username,
-                    first_name,
-                    last_name,
-                    is_premium,
-                    premium_until_ts,
-                    free_used,
-                    created_at_ts,
-                    updated_at_ts
-                )
-                VALUES (?, ?, ?, ?, 0, NULL, 0, ?, ?)
-                """,
-                (telegram_id, username, first_name, last_name, now, now),
-            )
-        conn.commit()
-
-        cur.execute(
-            "SELECT * FROM users_v2 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        return cur.fetchone()
-
-
-def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM users_v2 WHERE lower(username) = ?",
-            (username.lower(),),
-        )
-        return cur.fetchone()
-
-
-def user_is_premium(user_row: sqlite3.Row) -> bool:
-    until_ts = user_row["premium_until_ts"]
-    if not until_ts:
+def is_premium(user: UserRecord) -> bool:
+    if user.tariff != PLAN_PREMIUM:
+        return False
+    if not user.premium_until:
         return False
     try:
-        return int(until_ts) > int(time.time())
-    except (TypeError, ValueError):
+        until = date.fromisoformat(user.premium_until)
+    except ValueError:
         return False
+    return until >= date.today()
 
 
-def grant_premium(telegram_id: int, months: int) -> None:
-    """Выдаём / продлеваем премиум на указанное количество месяцев."""
-    extend_seconds = int(months * 30.4375 * 24 * 3600)  # ~ месяц
-    now = int(time.time())
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT premium_until_ts FROM users_v2 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        current_until = int(row["premium_until_ts"]) if row and row["premium_until_ts"] else 0
-        base = current_until if current_until > now else now
-        new_until = base + extend_seconds
-
-        cur.execute(
-            """
-            UPDATE users_v2
-            SET is_premium = 1, premium_until_ts = ?, updated_at_ts = ?
-            WHERE telegram_id = ?
-            """,
-            (new_until, now, telegram_id),
-        )
-        conn.commit()
+def active_daily_limit(user: UserRecord) -> int:
+    """
+    Итоговый лимит на день: базовый + бонусы за рефералов.
+    В storage уже лежат daily_limit и ref_bonus_limit, но на всякий случай
+    считаем явно.
+    """
+    base = getattr(user, "daily_limit", DEFAULT_DAILY_LIMIT)
+    bonus = getattr(user, "ref_bonus_limit", 0)
+    return base + bonus
 
 
-def get_free_used(telegram_id: int) -> int:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT free_used FROM users_v2 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        if not row or row["free_used"] is None:
-            return 0
-        return int(row["free_used"])
+def refresh_usage_if_needed(user: UserRecord) -> None:
+    """
+    Обнуляем счётчик за сегодня, если дата поменялась.
+    """
+    today_str = date.today().isoformat()
+    last_date = getattr(user, "last_usage_date", None)
+
+    if last_date != today_str:
+        user.last_usage_date = today_str
+        user.used_today = 0  # type: ignore[attr-defined]
 
 
-def increment_free_used(telegram_id: int, delta: int = 1) -> int:
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE users_v2 SET free_used = free_used + ? WHERE telegram_id = ?",
-            (delta, telegram_id),
-        )
-        conn.commit()
-        cur.execute(
-            "SELECT free_used FROM users_v2 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        row = cur.fetchone()
-        if not row or row["free_used"] is None:
-            return delta
-        return int(row["free_used"])
+def register_usage(user: UserRecord) -> None:
+    """
+    Фиксируем один использованный запрос.
+    """
+    refresh_usage_if_needed(user)
+    user.used_today = getattr(user, "used_today", 0) + 1  # type: ignore[attr-defined]
+    user.total_requests = getattr(user, "total_requests", 0) + 1
+    storage.update_user(user)
 
 
-def is_user_admin(username: Optional[str]) -> bool:
-    return bool(username and username.lower() in ADMIN_USERNAMES)
+def remaining_requests(user: UserRecord) -> int:
+    refresh_usage_if_needed(user)
+    limit_today = active_daily_limit(user)
+    used = getattr(user, "used_today", 0)
+    return max(limit_today - used, 0)
+
+
+def get_mode_title(user: UserRecord) -> str:
+    mode_key = getattr(user, "mode_key", DEFAULT_MODE)
+    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE])
+    emoji = mode_cfg.get("emoji", "🧠") or "🧠"
+    title = mode_cfg.get("title", "Универсальный")
+    return f"{emoji} {title}"
+
+
+def set_mode(user: UserRecord, mode_key: str) -> None:
+    if mode_key not in ASSISTANT_MODES:
+        mode_key = DEFAULT_MODE
+    user.mode_key = mode_key  # type: ignore[attr-defined]
+    storage.update_user(user)
+
+
+def ensure_user(message: Message) -> Tuple[UserRecord, bool]:
+    assert message.from_user is not None
+    user_id = message.from_user.id
+    rec, created = storage.get_or_create_user(user_id, message.from_user)
+    return rec, created
 
 
 # ---------------------------------------------------------------------------
-# История сообщений и адаптация стиля
+# Тексты (премиальный стиль)
 # ---------------------------------------------------------------------------
 
+def render_onboarding(user: UserRecord, bot_username: str) -> str:
+    mode_label = get_mode_title(user)
+    plan = "Premium" if is_premium(user) else "Базовый"
+    limit_today = active_daily_limit(user)
 
-def save_message(telegram_id: int, role: str, content: str) -> None:
-    """Сохраняем сообщение пользователя / ассистента в БД."""
-    content = (content or "").strip()
-    if not content:
-        return
+    return _wrap(
+        f"""
+        👋 Привет. Я BlackBox GPT — Universal AI Assistant.
 
-    ts = int(time.time())
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO messages (telegram_id, role, content, created_at_ts)
-            VALUES (?, ?, ?, ?)
-            """,
-            (telegram_id, role, content, ts),
-        )
-        conn.commit()
+        Минималистичный интерфейс. Максимум мозга.
 
+        Снизу — твой таскбар:
+        • 🧠 Режимы — выбираешь мозг под задачу
+        • 👤 Профиль — тариф, режим и лимиты
+        • 💎 Подписка — Premium через USDT (CryptoBot)
+        • 👥 Рефералы — бонусы за приглашения
 
-def get_recent_user_messages(telegram_id: int, limit: int = 30) -> list[str]:
-    """Получаем последние сообщения пользователя (для анализа стиля)."""
-    with _get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT content FROM messages
-            WHERE telegram_id = ? AND role = 'user'
-            ORDER BY created_at_ts DESC
-            LIMIT ?
-            """,
-            (telegram_id, limit),
-        )
-        rows = cur.fetchall()
-    # Разворачиваем: старые → новые
-    return [row["content"] for row in reversed(rows)]
+        Сейчас активен режим: {mode_label}
+        Тариф: {plan} • Лимит на сегодня: {limit_today} запросов.
+
+        Просто напиши свой первый запрос — я подстроюсь под твой стиль общения.
+        Если что-то забудешь — команда /help всегда рядом.
+        """
+    )
 
 
-def build_style_hint(telegram_id: int) -> str:
-    """
-    Строим подсказку для LLM по стилю ответа:
-    - "ты" / "Вы"
-    - объём (кратко / средне / развёрнуто)
-    """
-    messages = get_recent_user_messages(telegram_id, limit=30)
-    if not messages:
-        return ""
+def render_profile(user: UserRecord) -> str:
+    mode_label = get_mode_title(user)
+    plan = "Premium" if is_premium(user) else "Базовый"
+    limit_today = active_daily_limit(user)
+    refresh_usage_if_needed(user)
+    used = getattr(user, "used_today", 0)
+    total = getattr(user, "total_requests", 0)
+    premium_until = getattr(user, "premium_until", None)
 
-    all_text = " ".join(messages)
-    lower = all_text.lower()
+    if is_premium(user) and premium_until:
+        plan_line = f"{plan} (до {premium_until})"
+    else:
+        plan_line = plan
 
-    # Примитивное определение формальности
-    formal_markers = [
-        "здравствуйте",
-        "добрый день",
-        "добрый вечер",
-        "уважаем",
-        "будьте добры",
+    return _wrap(
+        f"""
+        👤 Профиль
+
+        Тариф: {plan_line}
+        Режим: {mode_label}
+
+        Лимит на сегодня: {used} / {limit_today} запросов
+        Всего запросов за всё время: {total}
+
+        Хочешь больше свободы и скорости — загляни в раздел «{BTN_SUBSCRIPTION}».
+        """
+    )
+
+
+def render_modes(user: UserRecord) -> str:
+    current_mode = get_mode_title(user)
+
+    lines = [
+        "🧠 Режимы мышления",
+        "",
+        f"Сейчас активен: {current_mode}",
+        "",
+        "Доступные режимы:",
     ]
-    is_formal = any(m in lower for m in formal_markers) or " вы " in lower
 
-    lengths = [len(m) for m in messages if m.strip()]
-    avg_len = sum(lengths) / len(lengths) if lengths else 0
+    # Отображаем только ключевые поля, без избыточности.
+    for key, cfg in ASSISTANT_MODES.items():
+        emoji = cfg.get("emoji", "🧠") or "🧠"
+        title = cfg.get("title", key)
+        desc = cfg.get("description", "")
+        lines.append(f"• /mode_{key} — {emoji} {title}")
+        if desc:
+            lines.append(f"  {desc}")
 
-    if avg_len < 80:
-        length_hint = (
-            "Отвечай более кратко и структурировано — 3–6 ёмких абзацев "
-            "или списком из 5–9 пунктов."
-        )
-    elif avg_len > 200:
-        length_hint = (
-            "Можно отвечать развёрнуто, но без воды: чёткая структура, "
-            "подзаголовки и чёткий вывод в конце."
-        )
-    else:
-        length_hint = (
-            "Держи баланс между краткостью и глубиной: объясняй понятно, "
-            "но не растекайся мыслью по древу."
+    lines.append("")
+    lines.append(
+        "Просто тапни по команде — Telegram сам подставит её в строку ввода."
+    )
+
+    return "\n".join(lines)
+
+
+def render_subscription_overview() -> str:
+    t1 = SUBSCRIPTION_TARIFFS["premium_1m"]
+    t3 = SUBSCRIPTION_TARIFFS["premium_3m"]
+    t12 = SUBSCRIPTION_TARIFFS["premium_12m"]
+
+    return _wrap(
+        f"""
+        💎 Подписка
+
+        Оплата — только в USDT через @CryptoBot.
+
+        Тарифы:
+        • /premium_1m  — Premium • 1 месяц  за {t1.price_usdt:.2f} USDT
+        • /premium_3m  — Premium • 3 месяца за {t3.price_usdt:.2f} USDT
+        • /premium_12m — Premium • 12 месяцев за {t12.price_usdt:.2f} USDT
+
+        Нажми на нужную команду — я создам счёт в CryptoBot и отправлю ссылку.
+        После оплаты я автоматически проверю платёж
+        и активирую Premium на выбранный срок.
+        """
+    )
+
+
+def render_subscription_invoice(plan_key: str, pay_url: str) -> str:
+    tariff = SUBSCRIPTION_TARIFFS[plan_key]
+    months = tariff.months
+    price = tariff.price_usdt
+    limit = tariff.daily_limit
+
+    return _wrap(
+        f"""
+        💎 Premium — оформление
+
+        План: {months} мес. • {price:.2f} USDT
+        Дневной лимит после активации: {limit} запросов.
+
+        🔗 Ссылка на оплату в CryptoBot:
+        {pay_url}
+
+        После оплаты вернись в бот — я сам периодически проверяю статус
+        и автоматически активирую подписку, как только платёж подтвердится.
+        """
+    )
+
+
+def render_subscription_status(user: UserRecord) -> str:
+    if is_premium(user):
+        premium_until = getattr(user, "premium_until", None)
+        limit = active_daily_limit(user)
+        return _wrap(
+            f"""
+            💎 Статус подписки
+
+            Подписка: Premium
+            Действует до: {premium_until}
+            Текущий лимит: {limit} запросов в день.
+
+            Наслаждайся свободой. Если появятся вопросы — /help.
+            """
         )
 
-    if is_formal:
-        tone_hint = (
-            "Обращайся к пользователю на «Вы», стиль спокойный, деловой и уважительный."
-        )
-    else:
-        tone_hint = (
-            "Обращайся к пользователю на «ты», стиль живой, поддерживающий, "
-            "но без панибратства."
-        )
+    limit = active_daily_limit(user)
+    return _wrap(
+        f"""
+        💎 Статус подписки
 
-    return (
-        "Адаптируй стиль ответов под пользователя. "
-        f"{tone_hint} {length_hint}"
+        Сейчас у тебя Базовый план: {limit} запросов в день.
+
+        Оформить Premium можно в разделе «{BTN_SUBSCRIPTION}»
+        или командами:
+        • /premium_1m
+        • /premium_3m
+        • /premium_12m
+        """
+    )
+
+
+def render_referrals(user: UserRecord, bot_username: str) -> str:
+    # Уникальный реф-код в хранилище
+    ref_code = getattr(user, "ref_code", None)
+    if not ref_code:
+        ref_code = storage.ensure_ref_code(user)
+    invited = getattr(user, "referrals_count", 0)
+    bonus = getattr(user, "ref_bonus_limit", 0)
+    limit = active_daily_limit(user)
+
+    ref_link = f"https://t.me/{bot_username}?start={ref_code}"
+
+    return _wrap(
+        f"""
+        👥 Рефералы
+
+        Поделись ботом с людьми, которым он реально нужен.
+        За каждого друга, который начнёт пользоваться ботом,
+        ты получаешь дополнительные запросы в день.
+
+        Твоя личная ссылка:
+        {ref_link}
+
+        Приглашено: {invited}
+        Бонус к дневному лимиту: +{bonus}
+        Итоговый лимит в день: {limit}
+
+        Лучший реферал — тот, кому это действительно поможет.
+        """
+    )
+
+
+def render_limit_exceeded(user: UserRecord) -> str:
+    refresh_usage_if_needed(user)
+    used = getattr(user, "used_today", 0)
+    limit = active_daily_limit(user)
+
+    return _wrap(
+        f"""
+        🚫 Лимит на сегодня исчерпан.
+
+        Уже использовано: {used} / {limit} запросов.
+
+        Что можно сделать:
+        • Подождать до завтра — лимит обновится автоматически.
+        • Оформить 💎 Premium, чтобы сильно расширить границы.
+        • Зайти в «{BTN_REFERRALS}» и получить бонусы за приглашённых друзей.
+
+        Если нужна помощь с выбором — загляни в раздел «{BTN_SUBSCRIPTION}».
+        """
+    )
+
+
+def render_generic_error() -> str:
+    return _wrap(
+        """
+        Что-то пошло не так на моей стороне.
+
+        Я уже записал это в логи. Попробуй ещё раз чуть позже.
+        Если ошибка повторяется — напиши моему создателю.
+        """
     )
 
 
 # ---------------------------------------------------------------------------
-# LLM (DeepSeek / Groq)
+# LLM: стиль и обработка запросов
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "Ты — BlackBox GPT, универсальный ИИ-ассистент в Telegram. "
-    "Отвечай чётко, по делу, структурировано и дружелюбно. "
-    "Избегай лишней воды, давай максимум пользы. "
-    "Если вопрос касается здоровья, медицины, диагнозов или лечения — "
-    "давай только общую справочную информацию и обязательно советуй "
-    "обратиться к врачу. "
-    "Всегда отвечай на русском языке, если явно не просят другой язык."
+STYLE_HINT_BASE = _wrap(
+    """
+    Пиши чистым, аккуратным русским языком.
+    Структурируй ответ по блокам, используй списки и **жирный** только там,
+    где это действительно усиливает смысл.
+    Эмодзи можно использовать, но умеренно — как акценты, а не как шум.
+    Общий тон: умный, спокойный, по-братски, но без панибратства и пошлости.
+    """
 )
 
 
-async def _call_deepseek(user_text: str, style_hint: Optional[str]) -> str:
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DEEPSEEK_API_KEY is not configured")
-
-    sys_prompt = SYSTEM_PROMPT
-    if style_hint:
-        sys_prompt = SYSTEM_PROMPT + "\n\n" + style_hint
-
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.7,
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"DeepSeek API вернул пустой ответ: {data}")
-    return choices[0]["message"]["content"].strip()
-
-
-async def _call_groq(user_text: str, style_hint: Optional[str]) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-
-    sys_prompt = SYSTEM_PROMPT
-    if style_hint:
-        sys_prompt = SYSTEM_PROMPT + "\n\n" + style_hint
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.7,
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(GROQ_API_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"Groq API вернул пустой ответ: {data}")
-    return choices[0]["message"]["content"].strip()
-
-
-async def generate_ai_reply(user_text: str, style_hint: Optional[str] = None) -> str:
+async def answer_with_typing(message: Message, text: str) -> None:
     """
-    Универсальный генератор ответа: DeepSeek → Groq → fallback.
-    Учитывает style_hint для подстройки под пользователя.
+    Лёгкая имитация "живого" ответа: показываем typing, пока формируем текст.
+    Саму стриминговую генерацию пока не включаем, чтобы не ломать стабильность.
     """
-    last_error: Optional[Exception] = None
-
-    if DEEPSEEK_API_KEY:
-        try:
-            return await _call_deepseek(user_text, style_hint)
-        except Exception as e:
-            last_error = e
-            logger.exception("DeepSeek API error: %r", e)
-
-    if GROQ_API_KEY:
-        try:
-            return await _call_groq(user_text, style_hint)
-        except Exception as e:
-            last_error = e
-            logger.exception("Groq API error: %r", e)
-
-    if last_error:
-        return (
-            "⚠️ Произошла внутренняя ошибка при обращении к ИИ.\n"
-            "Попробуй повторить запрос немного позже."
-        )
-
-    return (
-        "⚠️ ИИ-модель сейчас не настроена.\n"
-        "Проверь конфигурацию бота или свяжись с администратором."
-    )
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await message.answer(text)
 
 
 # ---------------------------------------------------------------------------
-# Crypto Pay (создание инвойса)
+# Handlers: команды и таскбар
 # ---------------------------------------------------------------------------
-
-
-async def crypto_create_invoice(plan: Plan, telegram_id: int) -> dict:
-    """
-    Создаёт инвойс в Crypto Pay API для указанного тарифа.
-    Возвращает объект Invoice из result.
-    """
-    if not CRYPTO_ENABLED:
-        raise RuntimeError("Crypto Pay API is not configured")
-
-    headers = {
-        "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-    payload_obj = {
-        "telegram_id": telegram_id,
-        "plan": plan.code,
-        "created_at": int(time.time()),
-    }
-
-    data = {
-        "currency_type": "crypto",
-        "asset": "USDT",  # фиксируем оплату в USDT
-        "amount": f"{plan.price_usdt:.2f}",
-        "description": f"Подписка {plan.title} для BlackBox GPT",
-        "payload": json.dumps(payload_obj),
-        "allow_comments": False,
-        "allow_anonymous": True,
-        "expires_in": 3600,
-    }
-
-    async with httpx.AsyncClient(base_url=CRYPTO_PAY_API_URL, timeout=15) as client:
-        resp = await client.post("/createInvoice", headers=headers, json=data)
-        resp.raise_for_status()
-        body = resp.json()
-
-    if not body.get("ok"):
-        raise RuntimeError(f"Crypto Pay API error: {body}")
-
-    invoice = body.get("result") or {}
-    return invoice
-
-
-# ---------------------------------------------------------------------------
-# Доступ / лимиты
-# ---------------------------------------------------------------------------
-
-
-async def _ensure_user(message: Message) -> sqlite3.Row:
-    from_user = message.from_user
-    return get_or_create_user(
-        telegram_id=from_user.id,
-        username=from_user.username,
-        first_name=from_user.first_name,
-        last_name=from_user.last_name,
-    )
-
-
-async def _check_access(message: Message) -> Tuple[bool, sqlite3.Row]:
-    """
-    Возвращает (allowed, user_row).
-    Если allowed == False — лимит бесплатных сообщений исчерпан.
-    """
-    user = await _ensure_user(message)
-    username = message.from_user.username
-
-    # Админы — всегда без ограничений
-    if is_user_admin(username):
-        return True, user
-
-    # Премиум — без ограничений
-    if user_is_premium(user):
-        return True, user
-
-    # Если нет подключённой модели — лимит не считаем
-    if not LLM_AVAILABLE:
-        return True, user
-
-    used = int(user["free_used"] or 0)
-    if used >= FREE_MESSAGES_LIMIT:
-        return False, user
-
-    new_used = increment_free_used(user["telegram_id"])
-    logger.info(
-        "User %s used free message #%s / %s",
-        user["telegram_id"],
-        new_used,
-        FREE_MESSAGES_LIMIT,
-    )
-    return True, user
-
-
-# ---------------------------------------------------------------------------
-# UI helpers
-# ---------------------------------------------------------------------------
-
-
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text=" Начать диалог"),
-                KeyboardButton(text="⚡ Подписка"),
-            ],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def subscription_plans_keyboard() -> InlineKeyboardMarkup:
-    # Кнопки собираем из PLANS, чтобы цены всегда совпадали
-    inline_rows = []
-    for code in ("1m", "3m", "12m"):
-        plan = PLANS[code]
-        inline_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{plan.title} — {plan.price_usdt} USDT",
-                    callback_data=f"plan:{code}",
-                )
-            ]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=inline_rows)
-
-
-MENU_TEXTS = {" Начать диалог", "⚡ Подписка"}
-
-
-# ---------------------------------------------------------------------------
-# Живое печатание текста (stream через edit_message)
-# ---------------------------------------------------------------------------
-
-STREAM_CHUNK_SIZE = 80
-STREAM_MAX_STEPS = 40
-STREAM_DELAY_SECONDS = 0.12
-
-
-def _chunk_text_for_streaming(text: str) -> list[str]:
-    """Режем текст на куски для поэтапного редактирования сообщения."""
-    text = text.strip()
-    if not text:
-        return []
-
-    words = text.split()
-    if not words:
-        return [text]
-
-    raw_chunks: list[str] = []
-    current = ""
-
-    for w in words:
-        if len(current) + len(w) + (1 if current else 0) <= STREAM_CHUNK_SIZE:
-            current = f"{current} {w}".strip()
-        else:
-            if current:
-                raw_chunks.append(current)
-            current = w
-
-    if current:
-        raw_chunks.append(current)
-
-    # Ограничиваем количество шагов, чтобы не спамить Telegram обновлениями
-    if len(raw_chunks) <= STREAM_MAX_STEPS:
-        return raw_chunks
-
-    step = math.ceil(len(raw_chunks) / STREAM_MAX_STEPS)
-    chunks: list[str] = []
-    for i in range(0, len(raw_chunks), step):
-        chunks.append(" ".join(raw_chunks[i : i + step]))
-    return chunks
-
-
-async def stream_reply_text(message: Message, text: str) -> None:
-    """
-    Показываем ответ как «живое» печатание:
-    - сначала отправляем сообщение,
-    - потом по чуть-чуть дописываем текст через edit_message_text.
-    """
-    text = (text or "").strip()
-    if not text:
-        return
-
-    chunks = _chunk_text_for_streaming(text)
-
-    # Если текст короткий — не мучаемся, отправляем как есть
-    if len(chunks) <= 1:
-        await message.answer(text)
-        return
-
-    bot = message.bot
-
-    # Первое сообщение
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    current = chunks[0]
-    sent = await message.answer(current, parse_mode=None)
-
-    for chunk in chunks[1:]:
-        await asyncio.sleep(STREAM_DELAY_SECONDS)
-        current = f"{current} {chunk}".strip()
-        try:
-            await bot.edit_message_text(
-                current,
-                chat_id=sent.chat.id,
-                message_id=sent.message_id,
-                parse_mode=None,  # без HTML, чтобы не ломать разметку при обрезке
-            )
-            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        except Exception as e:
-            logger.exception("Streaming edit error: %r", e)
-            # Фоллбек: просто отправляем финальный текст отдельным сообщением
-            if current != text:
-                await message.answer(text, parse_mode=None)
-            break
-
-
-# ---------------------------------------------------------------------------
-# Router & handlers
-# ---------------------------------------------------------------------------
-
-router = Router()
-
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    user_row = await _ensure_user(message)
-    is_premium = user_is_premium(user_row)
-
-    name = message.from_user.first_name or "друг"
-
-    premium_line = (
-        "У тебя уже активирован Premium-доступ: можешь общаться без ограничений.\n\n"
-        if is_premium
-        else f"Сейчас у тебя есть {FREE_MESSAGES_LIMIT} бесплатных сообщений, "
-        "после — можно оформить премиум-подписку через USDT.\n\n"
-    )
-
-    text = (
-        f"Привет, {name} 👋\n\n"
-        "Я — <b>BlackBox GPT — Universal AI Assistant</b>.\n\n"
-        "Как со мной лучше всего работать:\n\n"
-        "1️⃣ Нажми кнопку «Начать диалог» внизу.\n"
-        "2️⃣ Пиши любые запросы: от стратегии и кода до медицины и личных вопросов.\n"
-        "3️⃣ Я анализирую твою манеру общения и постепенно подстраиваюсь под твой стиль, "
-        "чтобы диалог ощущался максимально живым.\n\n"
-        + premium_line +
-        "Если нужно больше мощности и свободы — загляни в раздел «⚡ Подписка».\n\n"
-        "Готов? Просто нажми «Начать диалог» и напиши, чем тебе помочь прямо сейчас."
-    )
-
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    user, created = ensure_user(message)
+    bot: Bot = message.bot
+    me = await bot.get_me()
+    text = render_onboarding(user, me.username or "BlackBoxGPT_bot")
+    await message.answer(text, reply_markup=build_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    text = (
-        "❓ <b>Что умеет BlackBox GPT</b>\n\n"
-        "• Отвечать на вопросы по любой теме\n"
-        "• Помогать с текстами, сценариями, структурой мыслей\n"
-        "• Поддерживать в рабочих и личных задачах\n"
-        "• Подсказывать по коду и технологиям\n\n"
-        "Команды:\n"
-        "/start — главное меню\n"
-        "/subscription — оформить подписку\n"
-        "/help — эта справка\n"
+    user, _ = ensure_user(message)
+    bot: Bot = message.bot
+    me = await bot.get_me()
+
+    text = _wrap(
+        f"""
+        🧾 Справка
+
+        Я — BlackBox GPT, универсальный ИИ-ассистент.
+
+        Как со мной работать:
+        • Просто пиши сообщения — я отвечаю в рамках твоего режима.
+        • Снизу таскбар: «{BTN_MODES}», «{BTN_PROFILE}», «{BTN_SUBSCRIPTION}», «{BTN_REFERRALS}».
+        • Режимы переключаются командами /mode_...
+
+        Если потеряешься — всегда можно снова набрать /start.
+
+        Твой бот: @{me.username}
+        """
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=build_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
 
-async def _send_subscription_menu(message: Message) -> None:
-    lines = ["⚡ <b>Подписка BlackBox GPT Premium</b>\n"]
-    if LLM_AVAILABLE:
-        lines.append(
-            f"Бесплатный лимит — {FREE_MESSAGES_LIMIT} сообщений.\n"
-            "Дальше — безлимитный доступ по подписке.\n"
-        )
-
-    lines.append("\nТарифы:")
-
-    for code in ("1m", "3m", "12m"):
-        plan = PLANS[code]
-        lines.append(f"• {plan.title} — {plan.price_usdt} USDT")
-
-    lines.append("\nВыбери нужный план — я создам ссылку на оплату в Crypto Bot.")
-
-    text = "\n".join(lines)
-    await message.answer(text, reply_markup=subscription_plans_keyboard())
+# --- таскбар ---
 
 
-@router.message(Command("subscription"))
-async def cmd_subscription(message: Message) -> None:
-    await _send_subscription_menu(message)
+@router.message(F.text == BTN_PROFILE)
+async def on_profile(message: Message) -> None:
+    user, _ = ensure_user(message)
+    await message.answer(render_profile(user), parse_mode=ParseMode.MARKDOWN)
 
 
-@router.message(F.text == "⚡ Подписка")
-async def subscription_button(message: Message) -> None:
-    await _send_subscription_menu(message)
+@router.message(F.text == BTN_MODES)
+async def on_modes(message: Message) -> None:
+    user, _ = ensure_user(message)
+    await message.answer(render_modes(user), parse_mode=ParseMode.MARKDOWN)
 
 
-@router.callback_query(F.data.startswith("plan:"))
-async def subscription_plan_selected(callback: CallbackQuery) -> None:
-    plan_code = callback.data.split(":", 1)[1]
-    plan = PLANS.get(plan_code)
-
-    if not plan:
-        await callback.answer("Неизвестный тариф", show_alert=True)
-        return
-
-    if not CRYPTO_ENABLED:
-        await callback.answer(
-            "Платёжный модуль ещё не настроен.\nСвяжись с админом.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        invoice = await crypto_create_invoice(plan, callback.from_user.id)
-    except Exception as e:
-        logger.exception("Error while creating invoice: %r", e)
-        await callback.answer(
-            "Ошибка при создании счёта.\nПопробуй ещё раз чуть позже.",
-            show_alert=True,
-        )
-        return
-
-    pay_url = (
-        invoice.get("bot_invoice_url")
-        or invoice.get("pay_url")
-        or invoice.get("web_app_invoice_url")
-        or invoice.get("mini_app_invoice_url")
-    )
-
-    if not pay_url:
-        logger.error("Invoice without pay url: %r", invoice)
-        await callback.answer(
-            "Не удалось получить ссылку на оплату.\nПопробуй позже.",
-            show_alert=True,
-        )
-        return
-
-    text = (
-        "✅ <b>Оформление подписки BlackBox GPT</b>\n\n"
-        f"План: {plan.title}\n"
-        f"Сумма: {plan.price_usdt} USDT\n\n"
-        "Нажми кнопку ниже, чтобы перейти к оплате через Crypto Bot.\n\n"
-        "После успешной оплаты можно реализовать автоактивацию премиума через "
-        "webhook Crypto Pay или активировать доступ вручную командой админа."
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💳 Оплатить через Crypto Bot",
-                    url=pay_url,
-                )
-            ]
-        ]
-    )
-
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+@router.message(F.text == BTN_SUBSCRIPTION)
+async def on_subscription(message: Message) -> None:
+    await message.answer(render_subscription_overview(), parse_mode=ParseMode.MARKDOWN)
 
 
-@router.message(F.text == " Начать диалог")
-async def start_dialog(message: Message) -> None:
+@router.message(F.text == BTN_REFERRALS)
+async def on_referrals(message: Message) -> None:
+    user, _ = ensure_user(message)
+    bot: Bot = message.bot
+    me = await bot.get_me()
     await message.answer(
-        "Окей, я с тобой. Напиши, чем тебе помочь прямо сейчас 🤝",
-    )
-
-
-@router.message(Command("grant_premium"))
-async def cmd_grant_premium(message: Message) -> None:
-    """
-    /grant_premium <telegram_id | @username> <месяцев>
-    Доступно только админам (ADMIN_USERNAMES).
-    """
-    if not is_user_admin(message.from_user.username):
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) < 3:
-        await message.reply(
-            "Использование:\n"
-            "/grant_premium <telegram_id | @username> <месяцев>\n\n"
-            "Примеры:\n"
-            "/grant_premium 123456789 1\n"
-            "/grant_premium @nickname 3"
-        )
-        return
-
-    target = parts[1]
-    try:
-        months = int(parts[2])
-    except ValueError:
-        await message.reply("Количество месяцев должно быть целым числом.")
-        return
-
-    if target.startswith("@"):
-        user_row = get_user_by_username(target[1:])
-        if not user_row:
-            await message.reply("Пользователь с таким username не найден в базе.")
-            return
-        telegram_id = int(user_row["telegram_id"])
-    else:
-        try:
-            telegram_id = int(target)
-        except ValueError:
-            await message.reply("Некорректный telegram_id.")
-            return
-
-    grant_premium(telegram_id, months)
-    await message.reply(
-        f"Премиум на {months} мес. выдан пользователю `{telegram_id}`.",
+        render_referrals(user, me.username or "BlackBoxGPT_bot"),
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-@router.message(F.chat.type == ChatType.PRIVATE)
-async def handle_private_chat(message: Message) -> None:
-    """
-    Общий хэндлер для диалога с ИИ.
-    """
-    if not message.text:
-        return
+# --- смена режимов ---
 
-    # Спец-кнопки обрабатываются отдельными хэндлерами
-    if message.text in MENU_TEXTS:
-        return
 
-    # Команды — отдельные хэндлеры
-    if message.text.startswith("/"):
-        return
+@router.message(Command("mode_universal"))
+async def cmd_mode_universal(message: Message) -> None:
+    user, _ = ensure_user(message)
+    set_mode(user, "universal")
+    await message.answer(
+        _wrap(
+            """
+            🧠 Режим переключён на: Универсальный.
 
-    allowed, _user_row = await _check_access(message)
-    if not allowed:
-        used = get_free_used(message.from_user.id)
-        text = (
-            "⚠️ Лимит бесплатных сообщений исчерпан.\n\n"
-            f"Ты уже использовал {used} / {FREE_MESSAGES_LIMIT}.\n\n"
-            "Чтобы продолжить общение без ограничений, оформи премиум-подписку."
+            Можно задавать любые вопросы: от жизни и быта до сложного кода.
+            """
         )
-        await message.answer(text, reply_markup=subscription_plans_keyboard())
+    )
+
+
+@router.message(Command("mode_med"))
+async def cmd_mode_med(message: Message) -> None:
+    user, _ = ensure_user(message)
+    set_mode(user, "med")
+    await message.answer(
+        _wrap(
+            """
+            🩺 Режим переключён на: Медицина.
+
+            Обсуждаем здоровье, анализы, протоколы лечения — в формате
+            объяснений и подсказок, но без постановки диагнозов
+            и назначения конкретных лекарств.
+            """
+        )
+    )
+
+
+@router.message(Command("mode_mentor"))
+async def cmd_mode_mentor(message: Message) -> None:
+    user, _ = ensure_user(message)
+    set_mode(user, "mentor")
+    await message.answer(
+        _wrap(
+            """
+            🔥 Режим переключён на: Наставник.
+
+            Работаем с целями, фокусом, дисциплиной и внутренним стержнем.
+            """
+        )
+    )
+
+
+@router.message(Command("mode_business"))
+async def cmd_mode_business(message: Message) -> None:
+    user, _ = ensure_user(message)
+    set_mode(user, "business")
+    await message.answer(
+        _wrap(
+            """
+            💼 Режим переключён на: Бизнес.
+
+            Разбор идей, стратегии, воронки, продукты и деньги.
+            """
+        )
+    )
+
+
+@router.message(Command("mode_creative"))
+async def cmd_mode_creative(message: Message) -> None:
+    user, _ = ensure_user(message)
+    set_mode(user, "creative")
+    await message.answer(
+        _wrap(
+            """
+            🎨 Режим переключён на: Креатив.
+
+            Генерируем идеи, визуальные концепты, тексты и всё,
+            что требует нестандартного мышления.
+            """
+        )
+    )
+
+
+# --- подписка / CryptoBot ---
+
+
+async def _handle_premium_command(message: Message, plan_key: str) -> None:
+    user, _ = ensure_user(message)
+
+    try:
+        invoice = await create_cryptobot_invoice(user.user_id, plan_key)
+    except Exception as e:
+        logger.exception("Failed to create CryptoBot invoice: %s", e)
+        await message.answer(render_generic_error())
         return
 
-    user_id = message.from_user.id
+    if not invoice or "pay_url" not in invoice:
+        await message.answer(render_generic_error())
+        return
 
-    # Сохраняем сообщение пользователя
-    save_message(user_id, "user", message.text)
+    pay_url = invoice["pay_url"]
+    storage.register_invoice(user.user_id, plan_key, invoice)  # функция уже есть в storage
+    await message.answer(
+        render_subscription_invoice(plan_key, pay_url),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-    # Подсказка по стилю на основе истории
-    style_hint = build_style_hint(user_id)
 
-    # Получаем ответ от ИИ
-    reply = await generate_ai_reply(message.text, style_hint=style_hint)
+@router.message(Command("premium_1m"))
+async def cmd_premium_1m(message: Message) -> None:
+    await _handle_premium_command(message, "premium_1m")
 
-    # Сохраняем ответ ассистента
-    save_message(user_id, "assistant", reply)
 
-    # Живое печатание ответа
-    await stream_reply_text(message, reply)
+@router.message(Command("premium_3m"))
+async def cmd_premium_3m(message: Message) -> None:
+    await _handle_premium_command(message, "premium_3m")
+
+
+@router.message(Command("premium_12m"))
+async def cmd_premium_12m(message: Message) -> None:
+    await _handle_premium_command(message, "premium_12m")
+
+
+@router.message(Command("premium_status"))
+async def cmd_premium_status(message: Message) -> None:
+    user, _ = ensure_user(message)
+
+    # Если уже Premium — просто показываем статус
+    if is_premium(user):
+        await message.answer(render_subscription_status(user), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Иначе — пробуем проверить последний счёт
+    inv = storage.get_last_invoice(user.user_id)
+    if not inv:
+        await message.answer(render_subscription_status(user), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    try:
+        status = await get_invoice_status(inv.invoice_id)
+    except Exception as e:
+        logger.exception("Failed to check CryptoBot invoice: %s", e)
+        await message.answer(render_generic_error())
+        return
+
+    if status == "paid":
+        # Активируем подписку в сторидже
+        storage.activate_subscription(user, inv.plan_key)
+        user, _ = ensure_user(message)  # перечитываем обновлённого
+        await message.answer(
+            _wrap(
+                """
+                💎 Подписка успешно активирована.
+
+                Premium включён, лимиты расширены.
+                Добро пожаловать в взрослый режим работы с ИИ.
+                """
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await message.answer(
+            _wrap(
+                f"""
+                💎 Подписка пока не активирована.
+
+                Текущий статус последнего счёта: {status!r}.
+
+                Если ты уже оплатил — подожди пару минут и повтори /premium_status.
+                Если статус долго не меняется — напиши создателю бота.
+                """
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Основной обработчик сообщений (диалог)
+# ---------------------------------------------------------------------------
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def on_user_message(message: Message) -> None:
+    user, _ = ensure_user(message)
+
+    # Проверка лимитов только для непремиумных (или по общему правилу)
+    if remaining_requests(user) <= 0:
+        await message.answer(render_limit_exceeded(user), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    text = message.text or ""
+    mode_key = getattr(user, "mode_key", DEFAULT_MODE)
+    mode_cfg = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE])
+
+    system_prompt = mode_cfg["system_prompt"]
+    style_hint = STYLE_HINT_BASE
+
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        reply = await generate_answer(
+            prompt=text,
+            system_prompt=system_prompt,
+            mode_key=mode_key,
+            style_hint=style_hint,
+        )
+    except Exception as e:
+        logger.exception("LLM error: %s", e)
+        await message.answer(render_generic_error())
+        return
+
+    register_usage(user)
+    await message.answer(reply, parse_mode=ParseMode.MARKDOWN)
 
 
 # ---------------------------------------------------------------------------
 # Запуск бота
 # ---------------------------------------------------------------------------
 
-
-async def set_bot_commands(bot: Bot) -> None:
-    commands = [
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="help", description="Что умеет бот"),
-        BotCommand(command="subscription", description="Оформить подписку"),
-    ]
-    await bot.set_my_commands(commands)
-
-
 async def main() -> None:
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
-    logger.info("Initializing database…")
-    init_db()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    await set_bot_commands(bot)
-
-    logger.info("Starting BlackBox GPT bot polling…")
+    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    asyncio.run(main())
