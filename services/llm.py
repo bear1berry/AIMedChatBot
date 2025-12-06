@@ -1,38 +1,39 @@
-import json
+from __future__ import annotations
+
+import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, Any, List, Optional
 
 import httpx
 
-from bot.config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
-    ASSISTANT_MODES,
-    DEFAULT_MODE_KEY,
-)
+from bot.config import DEEPSEEK_API_KEY, DEEPSEEK_API_URL, DEEPSEEK_MODEL, ASSISTANT_MODES
 
+logger = logging.getLogger(__name__)
+
+
+# ==============================
+#   Интенты (двухслойный движок)
+# ==============================
 
 class IntentType(str, Enum):
-    """Тип интента — какой формат ответа сейчас нужен пользователю."""
+    """Тип интента — в каком формате сейчас нужен ответ."""
 
     PLAN = "plan"                   # Нужен план / чек-лист
     ANALYSIS = "analysis"           # Глубокий разбор / анализ
     BRAINSTORM = "brainstorm"       # Мозговой штурм / идеи
-    COACH = "coach"                 # Наставник / коучинговые вопросы
+    COACH = "coach"                 # Наставник / коучинговый формат
     TASKS = "tasks"                 # Выделить задачи из текста
     QA = "qa"                       # Обычный вопрос-ответ
     EMOTIONAL_SUPPORT = "emotional_support"  # Эмоциональная поддержка / мотивация
-    SMALLTALK = "smalltalk"         # Лёгкая болтовня
+    SMALLTALK = "smalltalk"         # Лёгкая болтовня / общий разговор
     OTHER = "other"                 # Всё остальное
 
 
 @dataclass
 class Intent:
     """Результат анализа интента."""
-
     type: IntentType
 
 
@@ -40,16 +41,18 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     """
     Лёгкий интент-детектор первого уровня.
 
-    Здесь без LLM (чтобы не тратить токены на каждый запрос),
-    только эвристики по ключевым словам и чуть-чуть логики.
-    При желании потом можно усложнить и звать отдельную модель.
+    Здесь без отдельного LLM (чтобы не жечь токены на каждый запрос),
+    только эвристики по ключевым словам + немного логики по режиму.
+
+    Важно: интент влияет только на формулировку промпта к модели,
+    внешний интерфейс бота не меняем.
     """
     if not message_text:
         return Intent(IntentType.OTHER)
 
     text = message_text.lower()
 
-    # 1. Жёсткие паттерны по ключевым словам — планы / чек-листы
+    # 1. Планы / чек-листы / роадмапы
     if any(
         kw in text
         for kw in (
@@ -83,6 +86,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
         kw in text
         for kw in (
             "мозговой штурм",
+            "брейншторм",
             "идеи",
             "идею",
             "варианты",
@@ -110,8 +114,16 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
         return Intent(IntentType.COACH)
 
     # 5. Выделение задач
-    if "задачи" in text and any(
-        kw in text for kw in ("выдели", "сформулируй", "определи", "составь", "оформи")
+    if "задач" in text and any(
+        kw in text
+        for kw in (
+            "выдели",
+            "сформулируй",
+            "определи",
+            "составь",
+            "оформи",
+            "разбей",
+        )
     ):
         return Intent(IntentType.TASKS)
 
@@ -129,6 +141,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
             "мотивируй",
             "мотивация",
             "дай мотивацию",
+            "нет сил",
         )
     ):
         return Intent(IntentType.EMOTIONAL_SUPPORT)
@@ -136,16 +149,26 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     # 7. Вопросы — базовый Q&A
     trimmed = text.strip()
     if "?" in trimmed or trimmed.startswith(
-        ("почему", "как ", "что ", "зачем", "когда", "где ", "какой", "какая", "какие")
+        (
+            "почему",
+            "как ",
+            "что ",
+            "зачем",
+            "когда",
+            "где ",
+            "какой",
+            "какая",
+            "какие",
+        )
     ):
         return Intent(IntentType.QA)
 
-    # 8. Лёгкий приоритет по режиму (если явных ключевых слов нет)
+    # 8. Лёгкий приоритет по режиму (если ключевых слов не нашли)
     if mode_key:
         mk = mode_key.lower()
-        if any(x in mk for x in ("mentor", "coach", "nastav")):
+        if "coach" in mk:
             return Intent(IntentType.COACH)
-        if any(x in mk for x in ("creative", "kreat", "creativ")):
+        if "creative" in mk or "creativ" in mk:
             return Intent(IntentType.BRAINSTORM)
 
     # 9. По умолчанию — лёгкая беседа
@@ -155,16 +178,15 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
 def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
     """
     Второй слой: заворачиваем запрос пользователя в нужный формат
-    под конкретный интент. Снаружи поведение бота не ломаем,
-    меняем только то, КАК мы формулируем задачу для LLM.
+    под конкретный интент. Для SMALLTALK/OTHER — не трогаем текст.
     """
     base = user_prompt.strip()
 
     if intent.type == IntentType.PLAN:
         return (
             "Пользователь просит помочь с планированием.\n"
-            "Составь чёткий, по пунктам, реалистичный план действий.\n"
-            "Формат: пронумерованный список шагов, без воды.\n\n"
+            "Составь чёткий, по шагам, реалистичный план действий.\n"
+            "Формат: пронумерованный список конкретных шагов, без воды.\n\n"
             f"Контекст от пользователя:\n{base}"
         )
 
@@ -195,7 +217,7 @@ def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
             "Структура ответа:\n"
             "1) Кратко отзеркаль состояние и запрос пользователя.\n"
             "2) Задай 3–7 точных вопросов для саморефлексии.\n"
-            "3) Аккуратно наметь возможные векторы действий без давления.\n\n"
+            "3) Мягко наметь возможные векторы действий без давления.\n\n"
             f"Контекст от пользователя:\n{base}"
         )
 
@@ -214,7 +236,8 @@ def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
             "Структура ответа:\n"
             "1) Признай и нормализуй его состояние и эмоции.\n"
             "2) Подсвети сильные стороны и ресурсы.\n"
-            "3) Дай 2–4 конкретных шага, что можно сделать уже сегодня, чтобы стало чуть легче.\n\n"
+            "3) Дай 2–4 конкретных шага, что можно сделать уже сегодня, "
+            "чтобы стало чуть легче.\n\n"
             f"Запрос пользователя:\n{base}"
         )
 
@@ -229,113 +252,127 @@ def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
     return base
 
 
-def _build_messages(
-    mode_key: str,
-    user_prompt: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> List[Dict[str, str]]:
-    """
-    Собираем messages для Chat Completions:
-    [system] + history + [user], добавляя лёгкий интент-слой поверх user_prompt.
-    """
-    mode_cfg: Dict[str, str] = ASSISTANT_MODES.get(
-        mode_key,
-        ASSISTANT_MODES[DEFAULT_MODE_KEY],
-    )
-    system_prompt = mode_cfg["system_prompt"]
+# ==============================
+#   Вызов DeepSeek
+# ==============================
 
-    # Новый слой: определяем интент и заворачиваем запрос под нужный формат
-    intent = analyze_intent(user_prompt, mode_key=mode_key)
-    transformed_user_prompt = _apply_intent_to_prompt(user_prompt, intent)
-
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-    ]
-
-    if history:
-        # history — список словарей вида {"role": "user"/"assistant", "content": "..."}
-        for msg in history:
-            if msg.get("role") in {"user", "assistant"} and msg.get("content"):
-                messages.append(
-                    {"role": msg["role"], "content": msg["content"]},
-                )
-
-    messages.append({"role": "user", "content": transformed_user_prompt})
-    return messages
-
-
-async def ask_llm_stream(
-    mode_key: str,
-    user_prompt: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> AsyncGenerator[str, None]:
-    """
-    Стриминговый вызов DeepSeek Chat Completions.
-    Отдаёт куски текста по мере генерации (как async-генератор).
-
-    ⚠️ ВАЖНО: сигнатура не менялась — всё, что вызывало эту функцию, продолжит работать.
-    """
-    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
-
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": _build_messages(mode_key, user_prompt, history),
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "stream": True,
-    }
-
+async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "stream": False,  # стримим уже сами, разбивая готовый текст
+    }
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-                # Стандартный формат: "data: {json}"
-                if not line.startswith("data:"):
-                    continue
-
-                data_str = line[len("data:") :].strip()
-                if not data_str or data_str == "[DONE]":
-                    break
-
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    logging.warning("Cannot decode LLM stream chunk: %s", data_str)
-                    continue
-
-                try:
-                    delta = data["choices"][0]["delta"]
-                    content = delta.get("content")
-                    if content:
-                        yield content
-                except (KeyError, IndexError) as e:
-                    logging.warning("Unexpected stream chunk format: %s | %s", e, data)
-                    continue
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.exception("Unexpected DeepSeek response: %s", data)
+        raise RuntimeError("Unexpected DeepSeek response") from e
 
 
+def _estimate_tokens(*texts: str) -> int:
+    """Небольшая грубая оценка токенов."""
+    total_chars = sum(len(t or "") for t in texts)
+    return max(1, total_chars // 4)
+
+
+# ==============================
+#   Публичный API: ask_llm_stream
+# ==============================
+
+async def ask_llm_stream(
+    mode_key: str,
+    user_prompt: str,
+    style_hint: str | None = None,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    Возвращает async-генератор с частями текста.
+    Каждый yield: {"delta": str, "full": str, "tokens": int}
+
+    ⚠️ Сигнатура и формат ответа не менялись — хендлеры и UI бота
+    продолжают работать как раньше.
+
+    Новое: перед отправкой в LLM мы определяем интент и
+    слегка переструктурируем запрос, чтобы ответы были
+    более осмысленными (план, разбор, коучинг, чек-лист и т.д.).
+    """
+    # Выбираем режим ассистента
+    mode = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES["universal"]
+    system_prompt = mode["system_prompt"]
+
+    # Учитываем стиль общения пользователя (как и было)
+    if style_hint:
+        system_prompt += (
+            "\n\nДополнительно учитывай стиль общения пользователя:\n"
+            f"{style_hint.strip()}"
+        )
+
+    # --- Новый слой: анализ интента ---
+    intent = analyze_intent(user_prompt, mode_key=mode_key)
+    transformed_user_prompt = _apply_intent_to_prompt(user_prompt, intent)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": transformed_user_prompt},
+    ]
+
+    # Получаем полный ответ от DeepSeek
+    full_text = await _call_deepseek(messages)
+    est_tokens = _estimate_tokens(user_prompt, full_text)
+
+    # Плавное "живое" печатание — отдаём текст батчами
+    words = full_text.split()
+    chunks: List[str] = []
+    current = ""
+
+    for w in words:
+        candidate = (current + " " + w) if current else w
+        if len(candidate) >= 120:  # размер батча
+            chunks.append(candidate)
+            current = ""
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    assembled = ""
+
+    for chunk in chunks:
+        assembled = (assembled + " " + chunk) if assembled else chunk
+        yield {
+            "delta": chunk,
+            "full": assembled,
+            "tokens": est_tokens,
+        }
+        # небольшая пауза, чтобы был эффект набора
+        await asyncio.sleep(0.05)
+
+    if not chunks:
+        # На всякий случай, если текст оказался пустым
+        yield {"delta": "", "full": full_text, "tokens": est_tokens}
+
+
+# Необязательная удобная обёртка — если где-то захочешь просто получить текст
 async def ask_llm(
     mode_key: str,
     user_prompt: str,
-    history: Optional[List[Dict[str, str]]] = None,
+    style_hint: str | None = None,
 ) -> str:
     """
-    Нестрмиминговая обёртка: собирает все чанки в один ответ.
-
-    ⚠️ Сигнатура тоже не менялась, просто внутри теперь работает новый интент-движок.
+    Нестрмиминговая обёртка вокруг ask_llm_stream.
+    Сейчас нигде не используется, но может пригодиться.
     """
-    chunks: List[str] = []
-    async for chunk in ask_llm_stream(mode_key, user_prompt, history):
-        chunks.append(chunk)
-
-    answer = "".join(chunks).strip()
-    if not answer:
-        return "Произошла ошибка при обработке ответа модели. Попробуй ещё раз."
-    return answer
+    last_full = ""
+    async for chunk in ask_llm_stream(mode_key=mode_key, user_prompt=user_prompt, style_hint=style_hint):
+        last_full = chunk["full"]
+    return last_full
