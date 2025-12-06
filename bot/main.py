@@ -28,7 +28,7 @@ from bot.config import (
 from services.llm import ask_llm_stream
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
-from services import texts as txt
+from services import texts as txt  # ВАЖНО: services.texts, а не bot.text
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -56,7 +56,7 @@ BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
 
-# --- Разметка клавиатур (liquid glass — это уже визуал Telegram, тут просто структура) ---
+# --- Разметка клавиатур ---
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
