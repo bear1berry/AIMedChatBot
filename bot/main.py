@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -22,11 +23,11 @@ from bot.config import (
     SUBSCRIPTION_TARIFFS,
     REF_BASE_URL,
 )
-from services.llm import ask_llm_stream
+from services.llm import ask_llm_stream, make_daily_summary
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
 from services import texts as txt
-from services import metrics  # <<< новый импорт
+from services import metrics
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -54,7 +55,7 @@ BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
 
-# --- Разметка клавиатур ---
+# --- Разметка клавиатур (строго без инлайнов) ---
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -146,6 +147,59 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
         return "Достигнут месячный лимит запросов для текущего тарифа."
 
     return None
+
+
+def _today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _yesterday_key() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+async def _maybe_daily_summary(message: Message, user: UserRecord) -> None:
+    """
+    На первое сообщение нового дня:
+    - если за вчера ещё нет summary → делаем краткий recap,
+      сохраняем в daily_summaries и показываем пользователю.
+    """
+    today = _today_key()
+    if user.last_summary_date == today:
+        return
+
+    yesterday = _yesterday_key()
+    existing = storage.get_daily_summary(user.id, yesterday)
+    if existing:
+        user.last_summary_date = today
+        storage.save_user(user)
+        return
+
+    texts_for_day = storage.get_messages_for_date(user.id, yesterday)
+    if not texts_for_day:
+        user.last_summary_date = today
+        storage.save_user(user)
+        return
+
+    try:
+        summary = await make_daily_summary(texts_for_day)
+    except Exception as e:
+        logger.exception("Failed to build daily summary: %s", e)
+        user.last_summary_date = today
+        storage.save_user(user)
+        return
+
+    summary = (summary or "").strip()
+    if not summary:
+        user.last_summary_date = today
+        storage.save_user(user)
+        return
+
+    storage.add_daily_summary(user.id, yesterday, summary)
+    user.last_summary_date = today
+    storage.save_user(user)
+
+    recap_text = txt.render_daily_recap(yesterday, summary)
+    await message.answer(recap_text, reply_markup=MAIN_KB)
 
 
 async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
@@ -491,6 +545,9 @@ async def on_user_message(message: Message) -> None:
         except Exception as m_err:
             logger.exception("Failed to log limit_hit metrics: %s", m_err)
         return
+
+    # Авто-рефлексия: если новый день — аккуратно подводим итоги вчера
+    await _maybe_daily_summary(message, user)
 
     # Логируем входящее сообщение пользователя
     try:
