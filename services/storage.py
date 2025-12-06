@@ -42,7 +42,7 @@ class UserRecord:
     ref_count: int = 0
     ref_bonus_messages: int = 0
 
-    history: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+     history: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
 
     pending_invoice_id: Optional[int] = None
     pending_invoice_tariff: Optional[str] = None
@@ -66,7 +66,7 @@ class UserRecord:
         return cls(**data)
 
 
-class Storage:
+class Storage:␊
     """
     Простое JSON-хранилище пользователей.
 
@@ -92,54 +92,7 @@ class Storage:
             else:
                 self._data = {}
         except Exception:
-            # Если файл битый — не роняем бота, просто очищаем.
-            self._data = {}
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
-        tmp.replace(self.path)
-
-    # --- helpers ---
-
-    def _key(self, user_id: int) -> str:
-        return str(user_id)
-
-    def _ensure_ref_code(self, rec: UserRecord) -> None:
-        if rec.ref_code:
-            return
-        # Простая реф-ссылка: base36 от user_id
-        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-        n = rec.user_id
-        if n == 0:
-            rec.ref_code = "0"
-            return
-        digits: List[str] = []
-        while n:
-            n, r = divmod(n, 36)
-            digits.append(alphabet[r])
-        rec.ref_code = "".join(reversed(digits))
-
-    def _ensure_daily_reset(self, rec: UserRecord) -> None:
-        today = date.today().isoformat()
-        if rec.daily_date != today:
-            rec.daily_date = today
-            rec.daily_used = 0
-
-    # --- public API ---
-
-    def get_or_create_user(self, user_id: int, tg_user: Any | None = None) -> Tuple[Dict[str, Any], bool]:
-        """
-        Возвращает (record_dict, created).
-        """
-        key = self._key(user_id)
-        if key in self._data:
-            rec = UserRecord.from_dict(self._data[key])
-            self._ensure_daily_reset(rec)
-            self._ensure_ref_code(rec)
-            self._data[key] = rec.to_dict()
+@@ -143,55 +143,93 @@ class Storage:
             self._save()
             return self._data[key], False
 
@@ -171,6 +124,44 @@ class Storage:
         self.save_user(rec_dict)
         return rec_dict
 
+    def get_mode(self, user_id: int) -> str:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        return rec_dict.get("mode") or DEFAULT_MODE
+
+    # --- публичные резюме по пользователю ---
+
+    def get_plan(self, user_id: int) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        premium_until = rec_dict.get("premium_until")
+        return {
+            "code": rec_dict.get("plan") or PLAN_BASIC,
+            "premium_until": premium_until,
+            "is_premium_active": self.is_premium_active(rec_dict),
+        }
+
+    def get_limits(self, user_id: int) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        daily_limit = self.get_daily_limit(rec_dict)
+        used_today = int(rec_dict.get("daily_used") or 0)
+        remaining = None if daily_limit is None else max(daily_limit - used_today, 0)
+        return {
+            "daily_limit": daily_limit,
+            "used_today": used_today,
+            "remaining_daily": remaining,
+            "total_used": int(rec_dict.get("total_used") or 0),
+            "is_premium": self.is_premium_active(rec_dict),
+            "premium_until": rec_dict.get("premium_until"),
+        }
+
+    def get_referral_stats(self, user_id: int) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        return {
+            "ref_count": int(rec_dict.get("ref_count") or 0),
+            "ref_bonus_messages": int(rec_dict.get("ref_bonus_messages") or 0),
+            "ref_code": rec_dict.get("ref_code"),
+            "referred_by": rec_dict.get("referred_by"),
+        }
+
     # --- лимиты / планы ---
 
     def is_premium_active(self, user_dict: Dict[str, Any]) -> bool:
@@ -195,46 +186,7 @@ class Storage:
         return base + bonus
 
     def register_usage(self, user_dict: Dict[str, Any], count: int = 1) -> Dict[str, Any]:
-        user_dict["daily_used"] = int(user_dict.get("daily_used") or 0) + count
-        user_dict["total_used"] = int(user_dict.get("total_used") or 0) + count
-        self.save_user(user_dict)
-        return user_dict
-
-    def activate_premium(self, user_id: int, tariff_code: str) -> Dict[str, Any]:
-        rec_dict, _ = self.get_or_create_user(user_id)
-        tariff = SUBSCRIPTION_TARIFFS[tariff_code]
-        now = _now_utc()
-        until = now + timedelta(days=tariff["days"])
-        rec_dict["plan"] = PLAN_PREMIUM
-        rec_dict["premium_until"] = until.isoformat()
-        # Сбрасываем ожидающий счёт
-        rec_dict["pending_invoice_id"] = None
-        rec_dict["pending_invoice_tariff"] = None
-        self.save_user(rec_dict)
-        return rec_dict
-
-    # --- рефералы ---
-
-    def find_by_ref_code(self, code: str) -> Optional[Dict[str, Any]]:
-        for raw in self._data.values():
-            if raw.get("ref_code") == code:
-                return raw
-        return None
-
-    def apply_referral(self, new_user_id: int, ref_code: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """
-        Привязывает new_user к рефереру по ref_code.
-        Возвращает (referrer_dict, new_user_dict) или None, если код некорректен.
-        """
-        referrer = self.find_by_ref_code(ref_code)
-        if not referrer:
-            return None
-        if referrer["user_id"] == new_user_id:
-            return None  # нельзя рефералиться на себя
-
-        new_rec, _ = self.get_or_create_user(new_user_id)
-        if new_rec.get("referred_by"):
-            return None  # уже есть реферер
+@@ -238,47 +276,81 @@ class Storage:
 
         # Обновляем нового
         new_rec["referred_by"] = referrer["user_id"]
@@ -267,6 +219,30 @@ class Storage:
             return conv[-max_len:]
         return conv
 
+    def get_chat_history(self, user_id: int, mode: Optional[str] = None, max_len: int = 20) -> List[Dict[str, str]]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        mode_to_use = mode or rec_dict.get("mode") or DEFAULT_MODE
+        return self.get_history(rec_dict, mode_to_use, max_len=max_len)
+
+    def append_chat_history(
+        self, user_id: int, role: str, content: str, mode: Optional[str] = None
+    ) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        mode_to_use = mode or rec_dict.get("mode") or DEFAULT_MODE
+        return self.add_history_message(rec_dict, mode_to_use, role, content)
+
+    def update_on_request(
+        self, user_id: int, mode: str, user_prompt: Optional[str] = None
+    ) -> Dict[str, Any]:
+        rec_dict, _ = self.get_or_create_user(user_id)
+        rec_dict["daily_used"] = int(rec_dict.get("daily_used") or 0) + 1
+        rec_dict["total_used"] = int(rec_dict.get("total_used") or 0) + 1
+        if user_prompt:
+            rec_dict = self.add_history_message(rec_dict, mode, "user", user_prompt)
+        self.save_user(rec_dict)
+        return rec_dict
+
+
     # --- инвойсы ---
 
     def set_pending_invoice(self, user_id: int, invoice_id: int, tariff_code: str) -> Dict[str, Any]:
@@ -282,3 +258,13 @@ class Storage:
         rec_dict["pending_invoice_tariff"] = None
         self.save_user(rec_dict)
         return rec_dict
+
+
+_storage: Optional[Storage] = None
+
+
+def get_storage() -> Storage:
+    global _storage
+    if _storage is None:
+        _storage = Storage()
+    return _storage
