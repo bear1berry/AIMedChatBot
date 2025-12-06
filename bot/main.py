@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================
-#   Константы интерфейса
+#   Константы UI
 # ==============================
 
 BTN_MODES = "🧠 Режимы"
@@ -80,9 +80,7 @@ class UserSession:
 
 
 USER_SESSIONS: Dict[int, UserSession] = {}
-
-# Для "✏️ Продолжить"
-LAST_ANSWERS: Dict[int, Answer] = {}
+LAST_ANSWERS: Dict[int, Answer] = {}  # для "продолжи"
 
 
 def get_session(user_id: int) -> UserSession:
@@ -99,6 +97,9 @@ def update_history(
     assistant_text: str,
     max_turns: int = 8,
 ) -> None:
+    """
+    Храним последние N обменов user/assistant для контекста.
+    """
     session.history.append({"role": "user", "content": user_prompt})
     session.history.append({"role": "assistant", "content": assistant_text})
 
@@ -147,12 +148,16 @@ async def stream_answer(
     force_mode: Optional[str] = None,  # "quick" | "deep"
 ) -> Answer:
     """
-    Рендерит ответ "живым печатанием" и возвращает Answer для истории.
-    Только текст + Markdown, никаких inline-кнопок.
+    Рендерит ответ «живым печатанием» и возвращает Answer.
+    Никаких inline-кнопок: только текст + подсказки "подробнее" / "продолжи".
     """
     chat_id = message.chat.id
 
-    draft = await message.answer("…", reply_markup=build_root_keyboard(), parse_mode="Markdown")
+    draft = await message.answer(
+        "…",
+        reply_markup=build_root_keyboard(),
+        parse_mode="Markdown",
+    )
     msg_id = draft.message_id
 
     answer = await generate_answer(
@@ -162,43 +167,51 @@ async def stream_answer(
         style_hint=style_hint,
         force_mode=force_mode,
     )
-
     LAST_ANSWERS[chat_id] = answer
 
     text_acc = ""
+    delay = 0.02 if answer.meta.get("answer_mode") == "quick" else 0.04
 
+    # Стримим смысловые куски
     for ch in answer.chunks:
         sep = "\n\n" if text_acc else ""
         text_acc += sep + ch.text
 
-        text_to_show = text_acc
-        if answer.has_more:
-            text_to_show = text_acc + "\n\n✏️ _Чтобы продолжить, напиши_: `продолжи`"
-
         try:
             await message.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=text_to_show,
+                text=text_acc,
                 reply_markup=build_root_keyboard(),
                 parse_mode="Markdown",
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to edit message: %s", e)
+            logger.warning("Failed to edit message during stream: %s", e)
 
-        await asyncio.sleep(0.03 if answer.meta.get("answer_mode") == "quick" else 0.06)
+        await asyncio.sleep(delay)
 
-    if not answer.chunks:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=answer.full_text or "Что-то пошло не так, попробуй ещё раз.",
-                reply_markup=build_root_keyboard(),
-                parse_mode="Markdown",
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to edit empty answer: %s", e)
+    # Финальное сообщение + подсказки
+    final_text = text_acc or answer.full_text or "Что-то пошло не так, попробуй ещё раз."
+
+    hints: List[str] = []
+    if answer.meta.get("can_expand") and not answer.has_more:
+        hints.append("🔍 Чтобы раскрыть глубже, напиши: `подробнее`.")
+    if answer.has_more:
+        hints.append("✏️ Чтобы продолжить, напиши: `продолжи`.")
+
+    if hints:
+        final_text = final_text + "\n\n" + "\n".join(hints)
+
+    try:
+        await message.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=final_text,
+            reply_markup=build_root_keyboard(),
+            parse_mode="Markdown",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Failed to edit message on finalize: %s", e)
 
     return answer
 
@@ -220,8 +233,8 @@ async def on_start(message: Message) -> None:
 
     text = (
         "*BlackBox GPT* — универсальный ИИ-ассистент премиум-класса.\n\n"
-        "🖤 Минимализм: на экране только диалог и аккуратный таскбар снизу.\n"
-        "🧠 Масштаб: от медицины и бизнеса до личного развития.\n\n"
+        "🖤 *Минимализм.* На экране только диалог и аккуратный таскбар снизу.\n"
+        "🧠 *Мощность.* От медицины и бизнеса до личного развития и креатива.\n\n"
         "_Напиши первый запрос или выбери режим в таскбаре._"
     )
     await message.answer(text, reply_markup=build_root_keyboard(), parse_mode="Markdown")
@@ -237,10 +250,10 @@ async def on_modes_menu(message: Message) -> None:
     text = (
         "*Режимы BlackBox GPT*\n\n"
         "Выбери, в каком фокусе сейчас нужен ассистент:\n"
-        "• универсальный умный собеседник,\n"
-        "• аккуратный медицинский помощник,\n"
-        "• личный наставник и коуч,\n"
-        "• бизнес-архитектор,\n"
+        "• универсальный умный собеседник;\n"
+        "• аккуратный медицинский помощник;\n"
+        "• личный наставник и коуч;\n"
+        "• бизнес-архитектор;\n"
         "• креативный генератор идей."
     )
     await message.answer(text, reply_markup=build_modes_keyboard(), parse_mode="Markdown")
@@ -251,7 +264,7 @@ async def on_back(message: Message) -> None:
     session = get_session(message.from_user.id)
     session.ui_screen = UI_ROOT
 
-    text = "_Возвращаюсь в основной режим. Таскбар снова универсальный._"
+    text = "_Возвращаюсь в основной экран. Таскбар снова универсальный._"
     await message.answer(text, reply_markup=build_root_keyboard(), parse_mode="Markdown")
 
 
@@ -261,9 +274,9 @@ async def on_profile(message: Message) -> None:
 
     text = (
         "*Профиль*\n\n"
-        f"Текущий режим: `{session.active_mode}`\n\n"
-        "_В следующих обновлениях здесь появятся настройки стиля ответов, глубины "
-        "разбора и твои долгосрочные цели._"
+        f"Текущий режим: `{session.active_mode}`\n"
+        "Диалоговая память: активна (учитываются последние несколько сообщений).\n\n"
+        "_Позже здесь появятся твои цели, привычки и тон общения под тебя._"
     )
     await message.answer(text, reply_markup=build_root_keyboard(), parse_mode="Markdown")
 
@@ -272,12 +285,12 @@ async def on_profile(message: Message) -> None:
 async def on_subscription(message: Message) -> None:
     text = (
         "*Подписка BlackBox GPT*\n\n"
-        "Планируется премиум-доступ с:\n"
-        "• более мощными моделями,\n"
-        "• расширенной памятью диалогов,\n"
-        "• приоритетной скоростью ответов,\n"
+        "В планах премиум-доступ с:\n"
+        "• более мощными моделями;\n"
+        "• расширенной памятью диалогов;\n"
+        "• приоритетной скоростью ответов;\n"
         "• дополнительными режимами и инструментами.\n\n"
-        "_Сейчас раздел в разработке. Инфраструктуру мы уже готовим._"
+        "_Сейчас раздел в разработке, инфраструктура уже подготавливается._"
     )
     await message.answer(text, reply_markup=build_root_keyboard(), parse_mode="Markdown")
 
@@ -287,8 +300,8 @@ async def on_referrals(message: Message) -> None:
     text = (
         "*Реферальная система*\n\n"
         "Позже здесь появится твоя персональная ссылка, по которой можно будет "
-        "приглашать людей в BlackBox GPT и получать бонусы.\n\n"
-        "_Механика уже продумывается, останется только нажать кнопку запуска._"
+        "приглашать людей и получать бонусы.\n\n"
+        "_Механика продумывается так, чтобы это выглядело честно и выгодно для тебя._"
     )
     await message.answer(text, reply_markup=build_root_keyboard(), parse_mode="Markdown")
 
@@ -302,10 +315,10 @@ async def on_mode_select(message: Message) -> None:
 
     desc_map = {
         "universal": "Универсальный режим для любых задач.",
-        "medical": "Безопасные, аккуратные ответы по медицине. Не заменяет врача.",
+        "medical": "Осторожные, структурированные ответы по медицине. Не заменяет врача.",
         "mentor": "Фокус на росте, рефлексии и конкретных шагах.",
         "business": "Цифры, гипотезы, риск/выгода и тестирование идей.",
-        "creative": "Идеи, формулировки, творческие решения.",
+        "creative": "Идеи, формулировки и нестандартные решения.",
     }
     description = desc_map.get(mode_key, "Режим обновлён.")
 
@@ -377,9 +390,9 @@ async def on_expand_text(message: Message) -> None:
 async def on_user_message(message: Message) -> None:
     """
     Главный диалог:
-    - учитываем текущий режим (универсальный / мед / наставник / бизнес / креатив),
-    - пробрасываем историю,
-    - запускаем живое печатание.
+    - учитываем текущий режим;
+    - пробрасываем историю;
+    - запускаем живое печатание 2.0.
     """
     text = (message.text or "").strip()
     if not text:
@@ -390,7 +403,7 @@ async def on_user_message(message: Message) -> None:
         )
         return
 
-    # Команды и текст из таскбара здесь не обрабатываем
+    # Команды и текст из таскбара не обрабатываем здесь
     if text.startswith("/"):
         return
     if text in MENU_BUTTON_TEXTS:
