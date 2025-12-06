@@ -162,7 +162,13 @@ async def _maybe_daily_summary(message: Message, user: UserRecord) -> None:
     На первое сообщение нового дня:
     - если за вчера ещё нет summary → делаем краткий recap,
       сохраняем в daily_summaries и показываем пользователю.
+    Премиум-фича: работает только для premium/admin.
     """
+    is_admin = storage.is_admin(user.id)
+    plan_code = storage.effective_plan(user, is_admin)
+    if plan_code not in ("premium", "admin"):
+        return
+
     today = _today_key()
     if user.last_summary_date == today:
         return
@@ -202,15 +208,23 @@ async def _maybe_daily_summary(message: Message, user: UserRecord) -> None:
     await message.answer(recap_text, reply_markup=MAIN_KB)
 
 
-async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
+async def _send_streaming_answer(
+    message: Message,
+    user: UserRecord,
+    text: str,
+    plan_code: str,
+) -> None:
     """
     Реальное «живое» печатание:
     - сначала отправляем заглушку «Думаю…»
     - затем постепенно редактируем одно сообщение по мере прихода чанков от LLM
+    - для премиум/админ включаем «стратегический мозг» (более глубокие ответы)
     """
     typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
     style_hint = user.style_hint or ""
     final_full_text: str = ""
+
+    is_premium = plan_code in ("premium", "admin")
 
     try:
         last_chunk: Dict[str, Any] | None = None
@@ -219,6 +233,7 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
             mode_key=user.mode_key or DEFAULT_MODE_KEY,
             user_prompt=text,
             style_hint=style_hint,
+            is_premium=is_premium,
         ):
             last_chunk = chunk
             full = chunk["full"]
@@ -252,6 +267,7 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
                 mode_key=user.mode_key or DEFAULT_MODE_KEY,
                 request_text=text,
                 response_text=final_full_text or "",
+                plan_code=plan_code,
             )
         except Exception as m_err:
             logger.exception("Failed to log chat_turn metrics: %s", m_err)
@@ -555,7 +571,7 @@ async def on_user_message(message: Message) -> None:
     except Exception as e:
         logger.exception("Failed to log user message: %s", e)
 
-    await _send_streaming_answer(message, user, text)
+    await _send_streaming_answer(message, user, text, plan_code)
 
 
 async def main() -> None:
