@@ -1,84 +1,73 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Dict, Any, Optional
 
 import httpx
 
 from bot.config import CRYPTO_PAY_API_URL, CRYPTO_PAY_API_TOKEN, SUBSCRIPTION_TARIFFS
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def _headers() -> Dict[str, str]:
-    return {
-        "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-
-async def create_cryptobot_invoice(tariff_code: str, user_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Создаёт инвойс в Crypto Bot и возвращает (invoice_id, invoice_url).
-
-    tariff_code: один из ключей SUBSCRIPTION_TARIFFS: "month" / "quarter" / "year".
-    """
+async def _cryptopay_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not CRYPTO_PAY_API_TOKEN:
-        log.warning("CRYPTO_PAY_API_TOKEN is not set; crypto payments disabled.")
-        return None
+        raise RuntimeError("CRYPTO_PAY_API_TOKEN is not configured")
 
-    tariff = SUBSCRIPTION_TARIFFS.get(tariff_code)
-    if not tariff:
-        log.error("Unknown tariff_code %r", tariff_code)
-        return None
-
-    payload: Dict[str, Any] = {
-        "asset": tariff["asset"],            # например, "USDT"
-        "amount": str(tariff["price_usdt"]), # строкой
-        "description": tariff["title"],
-        "payload": str(user_id),
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTO_PAY_API_TOKEN,
     }
 
+    url = CRYPTO_PAY_API_URL.rstrip("/") + f"/{method}"
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            f"{CRYPTO_PAY_API_URL.rstrip('/')}/createInvoice",
-            json=payload,
-            headers=_headers(),
-        )
+        resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("ok"):
-            log.error("Crypto Pay createInvoice error: %s", data)
-            return None
-        invoice = data.get("result") or {}
-        invoice_id = invoice.get("invoice_id")
-        url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
-        if invoice_id is None or not url:
-            log.error("Crypto Pay createInvoice missing fields: %s", invoice)
-            return None
-        return {"id": int(invoice_id), "url": str(url)}
+            raise RuntimeError(f"CryptoPay API error: {data}")
+        return data["result"]
+
+
+async def create_cryptobot_invoice(tariff_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Создать счёт в CryptoBot для выбранного тарифа.
+    Возвращает dict с полями invoice_id, bot_invoice_url, amount, status и т.д.
+    """
+    tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
+    if not tariff:
+        raise ValueError(f"Unknown tariff: {tariff_key}")
+
+    payload = {
+        "asset": "USDT",
+        "amount": tariff["price_usdt"],
+        "description": tariff["title"],
+        "payload": tariff["code"],
+        "allow_comments": False,
+        "allow_anonymous": True,
+    }
+
+    try:
+        result = await _cryptopay_request("createInvoice", payload)
+        return result
+    except Exception as e:
+        logger.exception("Failed to create CryptoBot invoice: %s", e)
+        return None
 
 
 async def get_invoice_status(invoice_id: int) -> Optional[str]:
     """
-    Возвращает статус инвойса: 'active' | 'paid' | 'expired' или None при ошибке.
+    Получить статус счёта по его ID.
+    Возвращает строку статуса (active/paid/cancelled/expired) или None.
     """
-    if not CRYPTO_PAY_API_TOKEN:
-        log.warning("CRYPTO_PAY_API_TOKEN is not set; crypto payments disabled.")
-        return None
-
-    params = {
-        "invoice_ids": str(invoice_id),
+    payload = {
+        "invoice_ids": [invoice_id],
     }
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{CRYPTO_PAY_API_URL.rstrip('/')}/getInvoices",
-            params=params,
-            headers=_headers(),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            log.error("Crypto Pay getInvoices error: %s", data)
+    try:
+        result = await _cryptopay_request("getInvoices", payload)
+        if not result:
             return None
+        invoice = result[0]
+        return invoice.get("status")
+    except Exception as e:
+        logger.exception("Failed to get CryptoBot invoice status: %s", e)
+        return None
