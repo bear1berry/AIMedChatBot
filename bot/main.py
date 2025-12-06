@@ -30,13 +30,15 @@ from services.llm import ask_llm_stream
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
 
+# ------------------ ЛОГИ ------------------ #
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# --- UI LABELS ---
+# ------------------ UI: ТЕКСТЫ КНОПОК ------------------ #
 
 BTN_MODES = "🧠 Режимы"
 BTN_PROFILE = "👤 Профиль"
@@ -56,7 +58,7 @@ BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
 
-# --- Keyboards ---
+# ------------------ КЛАВИАТУРЫ (таскбар) ------------------ #
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -94,7 +96,7 @@ REF_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# --- Core objects ---
+# ------------------ ЯДРО ------------------ #
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 dp = Dispatcher()
@@ -102,7 +104,7 @@ router = Router()
 storage = Storage()
 
 
-# --- helpers ---
+# ------------------ HELPERS ------------------ #
 
 def _plan_title(plan_code: str, is_admin: bool) -> str:
     if is_admin or plan_code == "admin":
@@ -113,11 +115,12 @@ def _plan_title(plan_code: str, is_admin: bool) -> str:
 
 
 def _mode_title(mode_key: str) -> str:
-    mode = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
-    return mode["title"]
+    cfg = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
+    return cfg["title"]
 
 
 def _estimate_prompt_tokens(text: str) -> int:
+    # грубая оценка
     return max(1, len(text) // 4)
 
 
@@ -140,9 +143,13 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
 
 
 async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
-    typing = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
+    """
+    "Живое" печатание: LLM отдаёт ответ батчами, мы редактируем одно сообщение.
+    """
+    typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
 
     style_hint = user.style_hint or ""
+
     try:
         last_chunk = None
         async for chunk in ask_llm_stream(
@@ -152,20 +159,22 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
         ):
             last_chunk = chunk
             full = chunk["full"]
-            # ограничиваем до лимита Telegram
+
             if len(full) > 4000:
                 full = full[:3990] + "…"
+
             try:
-                await typing.edit_text(full)
+                await typing_msg.edit_text(full)
             except Exception as e:
                 logger.debug("Failed to edit message while streaming: %s", e)
                 break
-        # Обновляем статистику по токенам
+
         tokens = last_chunk.get("tokens", 0) if last_chunk else 0
         storage.apply_usage(user, tokens)
+
     except Exception as e:
         logger.exception("LLM error: %s", e)
-        await typing.edit_text(txt.render_generic_error())
+        await typing_msg.edit_text(txt.render_generic_error())
 
 
 def _tariff_key_by_button(button_text: str) -> Optional[str]:
@@ -178,7 +187,7 @@ def _tariff_key_by_button(button_text: str) -> Optional[str]:
     return None
 
 
-# --- Handlers ---
+# ------------------ HANDLERS ------------------ #
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -189,7 +198,7 @@ async def cmd_start(message: Message) -> None:
 
     user, created = storage.get_or_create_user(user_id, message.from_user)
 
-    # Рефералы
+    # Рефералка
     if start_param.startswith("ref_") and created:
         ref_code = start_param.replace("ref_", "", 1)
         storage.apply_referral(user_id, ref_code)
@@ -207,7 +216,14 @@ async def cmd_start(message: Message) -> None:
         mode_title=mode_title,
     )
     await message.answer(text_body, reply_markup=MAIN_KB)
-    logger.info("User %s started bot (created=%s, plan=%s, mode=%s)", user_id, created, plan_code, user.mode_key)
+
+    logger.info(
+        "User %s started bot (created=%s, plan=%s, mode=%s)",
+        user_id,
+        created,
+        plan_code,
+        user.mode_key,
+    )
 
 
 @router.message(F.text == BTN_BACK_MAIN)
@@ -252,7 +268,13 @@ async def on_modes_root(message: Message) -> None:
     await message.answer(text_body, reply_markup=MODES_KB)
 
 
-@router.message(F.text.in_({BTN_MODE_UNIVERSAL, BTN_MODE_MEDICINE, BTN_MODE_COACH, BTN_MODE_BUSINESS, BTN_MODE_CREATIVE}))
+@router.message(F.text.in_({
+    BTN_MODE_UNIVERSAL,
+    BTN_MODE_MEDICINE,
+    BTN_MODE_COACH,
+    BTN_MODE_BUSINESS,
+    BTN_MODE_CREATIVE,
+}))
 async def on_mode_select(message: Message) -> None:
     user_id = message.from_user.id
     mapping = {
@@ -275,6 +297,7 @@ async def on_subscription(message: Message) -> None:
     is_admin = storage.is_admin(user_id)
     plan_code = storage.effective_plan(user, is_admin)
     plan_title = _plan_title(plan_code, is_admin)
+
     text_body = txt.render_subscription_overview(plan_title, user.premium_until)
     await message.answer(text_body, reply_markup=SUB_KB)
 
@@ -330,6 +353,7 @@ async def on_subscription_check(message: Message) -> None:
         tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
         months = int(tariff.get("months", 1)) if tariff else 1
         storage.activate_premium(user, months)
+
     text_body = txt.render_payment_check_result(status)
     await message.answer(text_body, reply_markup=SUB_KB)
 
@@ -345,7 +369,6 @@ async def on_referrals(message: Message) -> None:
 
 @router.message(F.text.startswith("/"))
 async def on_unknown_command(message: Message) -> None:
-    # Для любых других команд
     await message.answer(
         "Команда не распознана.\n\nИспользуй нижние кнопки навигации или просто напиши запрос.",
         reply_markup=MAIN_KB,
@@ -376,7 +399,7 @@ async def on_user_message(message: Message) -> None:
     await _send_streaming_answer(message, user, text)
 
 
-# --- entrypoint ---
+# ------------------ ENTRYPOINT ------------------ #
 
 async def main() -> None:
     dp.include_router(router)
