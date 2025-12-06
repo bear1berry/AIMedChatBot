@@ -36,6 +36,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+# --- Текст кнопок таскбара ---
+
 BTN_MODES = "🧠 Режимы"
 BTN_PROFILE = "👤 Профиль"
 BTN_SUBSCRIPTION = "💎 Подписка"
@@ -53,6 +55,8 @@ BTN_SUB_1M = "💎 Premium · 1 месяц"
 BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
+
+# --- Разметка клавиатур (liquid glass — это уже визуал Telegram, тут просто структура) ---
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -96,6 +100,9 @@ router = Router()
 storage = Storage()
 
 
+# --- Вспомогательные функции ---
+
+
 def _plan_title(plan_code: str, is_admin: bool) -> str:
     if is_admin or plan_code == "admin":
         return "Admin"
@@ -110,10 +117,12 @@ def _mode_title(mode_key: str) -> str:
 
 
 def _estimate_prompt_tokens(text: str) -> int:
+    # Грубая оценка: 1 токен ≈ 4 символа
     return max(1, len(text) // 4)
 
 
 def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[str]:
+    """Проверка лимитов по тарифу. Возвращает причину блокировки или None."""
     if is_admin or plan_code == "admin":
         return None
 
@@ -132,12 +141,14 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
 
 
 async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
+    """Реальное «живое» печатание: редактируем одно сообщение по мере прихода чанков."""
     typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
 
     style_hint = user.style_hint or ""
 
     try:
         last_chunk: Dict[str, Any] | None = None
+
         async for chunk in ask_llm_stream(
             mode_key=user.mode_key or DEFAULT_MODE_KEY,
             user_prompt=text,
@@ -164,12 +175,16 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
 
 
 def _tariff_key_by_button(button_text: str) -> Optional[str]:
+    """Маппинг текста кнопки → tariff_key из SUBSCRIPTION_TARIFFS."""
     mapping = {
         BTN_SUB_1M: "month_1",
         BTN_SUB_3M: "month_3",
         BTN_SUB_12M: "month_12",
     }
     return mapping.get(button_text)
+
+
+# --- Хендлеры ---
 
 
 @router.message(CommandStart())
@@ -181,6 +196,7 @@ async def cmd_start(message: Message) -> None:
 
     user, created = storage.get_or_create_user(user_id, message.from_user)
 
+    # Реферальный старт
     if start_param.startswith("ref_") and created:
         ref_code = start_param.replace("ref_", "", 1)
         storage.apply_referral(user_id, ref_code)
