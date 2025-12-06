@@ -1,179 +1,198 @@
-"""Text rendering helpers used by the bot handlers.
-
-The original project relied on a more sophisticated templating module that
-is not present in this repository snapshot.  This lightweight implementation
-keeps the handlers operational by returning human-readable strings that cover
-all expected screens and error messages.
-"""
-
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any
+from typing import Optional
 
-from bot.config import ASSISTANT_MODES
+from bot.config import (
+    FREE_DAILY_LIMIT,
+    FREE_MONTHLY_LIMIT,
+    PREMIUM_DAILY_LIMIT,
+    PREMIUM_MONTHLY_LIMIT,
+    REF_BASE_URL,
+)
 
 
-def _mode_title(mode_cfg: Dict[str, Any]) -> str:
-    emoji = mode_cfg.get("emoji") or "🧠"
-    title = mode_cfg.get("title") or "Универсальный"
-    return f"{emoji} {title}"
+@dataclass
+class PlanInfo:
+    code: str
+    title: str
+    daily_limit: int
+    monthly_limit: int
 
 
-def _fmt_datetime(dt_iso: str | None) -> str:
-    if not dt_iso:
+def _fmt_date(ts: Optional[float]) -> str:
+    if not ts:
         return "—"
-    try:
-        dt = datetime.fromisoformat(dt_iso)
-        return dt.strftime("%d.%m.%Y")
-    except Exception:
-        return dt_iso
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
 
 
-def render_onboarding(
-    first_name: str | None,
-    is_new: bool,
-    mode_title: str,
-    limits: Dict[str, Any],
-    ref_stats: Dict[str, Any],
-) -> str:
-    greeting = "👋 Привет" if is_new else "👋 Рад снова тебя видеть"
-    username = f", {first_name}" if first_name else ""
-    ref_part = ""
-    if ref_stats.get("ref_code"):
-        ref_part = f"\nТвоя реферальная ссылка уже готова: {ref_stats['ref_code']}"
-    limit_part = "∞" if limits.get("daily_limit") is None else limits.get("daily_limit", 0)
+def render_onboarding(first_name: str | None, is_new: bool, plan_title: str, mode_title: str) -> str:
+    name = first_name or "друг"
+    status_line = "🆕 Добро пожаловать в BlackBox GPT." if is_new else "Рад снова тебя видеть внутри BlackBox GPT."
     return (
-        f"{greeting}{username}!"\
-        f"\nСейчас активен режим: {mode_title}."\
-        f"\nДневной лимит: {limit_part} запросов."\
-        "\n\nВоспользуйся меню ниже, чтобы выбрать режим, посмотреть профиль или подписку."\
-        f"{ref_part}"
-    )
-
-
-def render_help() -> str:
-    return (
-        "ℹ️ <b>Справка</b>\n\n"
-        "• Используй меню для переключения режима и просмотра лимитов.\n"
-        "• Premium убирает дневные ограничения.\n"
-        "• Реферальная система добавляет бонусные сообщения."
+        f"👋 Привет, *{name}*.\n\n"
+        f"{status_line}\n\n"
+        f"🧠 *Режим сейчас*: _{mode_title}_\n"
+        f"💎 *Тариф*: _{plan_title}_\n\n"
+        "Напиши мне любой запрос — от медицинского вопроса до стратегии роста или креатива.\n\n"
+        "Я отвечаю аккуратно: без лишнего шума, с чистой структурой и уважением к твоему времени."
     )
 
 
 def render_profile(
-    user_id: int,
-    tg_user: Any,
-    mode_cfg: Dict[str, Any],
-    limits: Dict[str, Any],
-    plan: Dict[str, Any],
-    ref_stats: Dict[str, Any],
-    referral_link: str,
+    plan_code: str,
+    plan_title: str,
+    is_admin: bool,
+    daily_used: int,
+    monthly_used: int,
+    premium_until: Optional[float],
+    total_requests: int,
+    total_tokens: int,
+    ref_code: str | None,
 ) -> str:
-    premium_until = _fmt_datetime(plan.get("premium_until")) if plan.get("premium_until") else "—"
-    limit_caption = "безлимит" if limits.get("daily_limit") is None else f"{limits.get('used_today', 0)} / {limits.get('daily_limit', 0)}"
+    if is_admin or plan_code == "admin":
+        plan_line = "💎 *Тариф*: `ADMIN` — без ограничений"
+        daily_limits = "∞"
+        monthly_limits = "∞"
+    else:
+        plan_line = f"💎 *Тариф*: _{plan_title}_"
+        if plan_code == "premium":
+            daily_max = PREMIUM_DAILY_LIMIT
+            monthly_max = PREMIUM_MONTHLY_LIMIT
+        else:
+            daily_max = FREE_DAILY_LIMIT
+            monthly_max = FREE_MONTHLY_LIMIT
+        daily_limits = f"{daily_used} / {daily_max}"
+        monthly_limits = f"{monthly_used} / {monthly_max}"
+
+    ref_line = ""
+    if ref_code:
+        link = f"{REF_BASE_URL}?start=ref_{ref_code}"
+        ref_line = f"\n\n👥 *Твоя реферальная ссылка:*\n`{link}`"
+
     return (
-        "👤 <b>Профиль</b>\n\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Имя: {tg_user.full_name if tg_user else '—'}\n"
-        f"Режим: {_mode_title(mode_cfg)}\n"
-        f"Тариф: {plan.get('code', 'basic')}\n"
-        f"Premium активен до: {premium_until}\n"
-        f"Лимит на сегодня: {limit_caption}\n"
-        f"Всего запросов: {limits.get('total_used', 0)}\n\n"
-        f"Рефералов: {ref_stats.get('ref_count', 0)} (бонус: {ref_stats.get('ref_bonus_messages', 0)})\n"
-        f"Реферальная ссылка: {referral_link}"
+        "👤 *Профиль*\n\n"
+        f"{plan_line}\n"
+        f"📊 *Дневной лимит*: {daily_limits}\n"
+        f"📆 *Месячный лимит*: {monthly_limits}\n"
+        f"⏳ *Premium до*: {_fmt_date(premium_until)}\n\n"
+        f"📈 *Всего запросов*: {total_requests}\n"
+        f"🔢 *Примерно токенов израсходовано*: {total_tokens}\n"
+        f"{ref_line}"
     )
 
 
-def render_limits(mode_cfg: Dict[str, Any], limits: Dict[str, Any], plan: Dict[str, Any]) -> str:
-    limit_caption = "безлимит" if limits.get("daily_limit") is None else limits.get("daily_limit", 0)
-    remaining = "∞" if limits.get("remaining_daily") is None else limits.get("remaining_daily", 0)
+def render_limits_warning(reason: str) -> str:
     return (
-        "📊 <b>Лимиты</b>\n\n"
-        f"Режим: {_mode_title(mode_cfg)}\n"
-        f"Тариф: {plan.get('code', 'basic')}\n"
-        f"Дневной лимит: {limit_caption}\n"
-        f"Осталось сегодня: {remaining}\n"
-        f"Всего использовано: {limits.get('total_used', 0)}"
-    )
-
-
-def render_modes_root() -> str:
-    lines = [f"• {_mode_title(cfg)} — {cfg.get('description', '')}" for cfg in ASSISTANT_MODES.values()]
-    return "🧠 <b>Режимы</b>\n\n" + "\n".join(lines)
-
-
-def render_mode_changed(mode_cfg: Dict[str, Any]) -> str:
-    return f"Режим переключён на {_mode_title(mode_cfg)}"
-
-
-def render_back_to_main() -> str:
-    return "Возврат в главное меню. Чем могу помочь?"
-
-
-def render_subscription_root(limits: Dict[str, Any], plan: Dict[str, Any], tariffs: Dict[str, Any]) -> str:
-    premium_until = _fmt_datetime(plan.get("premium_until")) if plan.get("premium_until") else "—"
-    tariffs_lines = [f"• {tar['title']}: {tar['price_usdt']} {tar['asset']}" for tar in tariffs.values()]
-    limits_info = "безлимит" if limits.get("daily_limit") is None else limits.get("daily_limit", 0)
-    return (
-        "💎 <b>Подписка</b>\n\n"
-        f"Текущий тариф: {plan.get('code', 'basic')}\n"
-        f"Premium активен до: {premium_until}\n"
-        f"Дневной лимит: {limits_info}\n\n"
-        "Доступные тарифы:\n" + "\n".join(tariffs_lines)
-    )
-
-
-def render_subscription_not_available() -> str:
-    return "Оплата временно недоступна. Попробуйте позже."
-
-
-def render_payment_error() -> str:
-    return "Не удалось создать счёт. Повторите попытку позже."
-
-
-def render_subscription_invoice(tariff: Dict[str, Any], invoice: Dict[str, Any]) -> str:
-    return (
-        "Инвойс создан!\n\n"
-        f"Тариф: {tariff.get('title')}\n"
-        f"Сумма: {tariff.get('price_usdt')} {tariff.get('asset')}\n"
-        f"Ссылка на оплату: {invoice.get('url')}"
-    )
-
-
-def render_referrals(stats: Dict[str, Any], referral_link: str) -> str:
-    return (
-        "👥 <b>Рефералы</b>\n\n"
-        f"Всего рефералов: {stats.get('ref_count', 0)}\n"
-        f"Бонусные сообщения: {stats.get('ref_bonus_messages', 0)}\n"
-        f"Твоя ссылка: {referral_link}"
+        "⚠️ *Ограничение по использованию*\n\n"
+        f"{reason}\n\n"
+        "Попробуй сократить запрос или вернуться позже. "
+        "Если хочешь снять ограничения — подключи тариф *Premium* в разделе «Подписка»."
     )
 
 
 def render_empty_prompt_error() -> str:
-    return "Сообщение пустое. Напишите вопрос или задачу."
-
-
-def render_too_long_error(max_tokens: int) -> str:
-    return f"Сообщение слишком длинное. Максимальная длина — {max_tokens} символов."
-
-
-def render_daily_limit_reached(limits: Dict[str, Any]) -> str:
     return (
-        "⛔ Лимит исчерпан."
-        f" Вы использовали {limits.get('used_today', 0)} из {limits.get('daily_limit', 0)} сообщений на сегодня."
+        "🙂 Напиши, пожалуйста, запрос.\n\n"
+        "Могу разобрать ситуацию, помочь с решением, структурировать мысли или сформулировать текст."
     )
 
 
-def render_thinking_message() -> str:
-    return "Думаю над ответом…"
+def render_too_long_prompt_error() -> str:
+    return (
+        "📄 Запрос получился слишком объёмным.\n\n"
+        "Сократи его или разбей на несколько частей. Так я смогу ответить точнее и надёжнее."
+    )
+
+
+def render_mode_switched(mode_title: str) -> str:
+    return (
+        "🧠 *Режим обновлён*\n\n"
+        f"Теперь я работаю в режиме: _{mode_title}_\n\n"
+        "Стиль ответов и приоритеты будут подстроены под него, а внутри — всё то же мощное ядро BlackBox GPT."
+    )
+
+
+def render_subscription_overview(plan_title: str, premium_until: Optional[float]) -> str:
+    base = (
+        "💎 *Подписка BlackBox GPT*\n\n"
+        "Здесь только два уровня:\n"
+        "• _Базовый_ — аккуратный лимит на день и месяц.\n"
+        "• _Premium_ — увеличенные лимиты и приоритетный отклик.\n\n"
+    )
+    current = f"Твой текущий тариф: *{plan_title}*.\n"
+    if plan_title == "Premium":
+        current += f"Premium активен до: *{_fmt_date(premium_until)}*.\n\n"
+    else:
+        current += "\n"
+
+    tail = (
+        "Выбери срок подписки внизу — я открою окно оплаты в CryptoBot (USDT). "
+        "После оплаты просто вернись и нажми «Проверить оплату»."
+    )
+    return base + current + tail
+
+
+def render_payment_link(
+    tariff_title: str,
+    amount: str,
+    invoice_url: str,
+) -> str:
+    return (
+        "✅ *Счёт создан*\n\n"
+        f"Тариф: *{tariff_title}*\n"
+        f"Сумма: *{amount} USDT*\n\n"
+        f"Перейди по ссылке и оплати через CryptoBot:\n{invoice_url}\n\n"
+        "После оплаты вернись в бот и нажми «🔄 Проверить оплату» в разделе «Подписка»."
+    )
+
+
+def render_payment_error() -> str:
+    return (
+        "⚠️ Не удалось создать счёт в CryptoBot.\n\n"
+        "Проверь, что бот @CryptoBot доступен, и попробуй ещё раз чуть позже."
+    )
+
+
+def render_payment_check_result(status: str) -> str:
+    if status == "paid":
+        return (
+            "💎 *Оплата найдена*\n\n"
+            "Подписка *Premium* активирована.\n"
+            "Спасибо за доверие. Теперь лимиты расширены, а приоритет к вычислительным мощностям повышен."
+        )
+    elif status == "active":
+        return (
+            "🕒 Счёт ещё ожидает оплаты.\n\n"
+            "Заверши оплату в CryptoBot и попробуй проверить ещё раз через минуту."
+        )
+    elif status == "not_found":
+        return (
+            "🤔 Я не нашёл активных счетов для проверки.\n\n"
+            "Создай новый счёт в разделе «Подписка» и затем снова нажми «Проверить оплату»."
+        )
+    else:
+        return (
+            "⚠️ Счёт находится в статусе, при котором подписка не может быть активирована "
+            f"(статус: `{status}`).\n\n"
+            "Создай новый счёт и повтори попытку."
+        )
+
+
+def render_referrals(ref_link: str, total_refs: int) -> str:
+    return (
+        "👥 *Реферальная программа*\n\n"
+        "Поделись ботом с теми, кому он реально нужен. Никакого спама — только осознанные приглашения.\n\n"
+        f"🔗 *Твоя ссылка:*\n`{ref_link}`\n\n"
+        f"Всего приглашено: *{total_refs}* человек(а).\n\n"
+        "Отправь эту ссылку тем, кому хочешь прокачать мозг и систему."
+    )
 
 
 def render_generic_error() -> str:
-    return "Произошла ошибка при обращении к модели. Попробуйте ещё раз позже."
-
-
-def normalize_model_answer(answer: str) -> str:
-    # Простейшая нормализация: убираем лишние пробелы по краям
-    return answer.strip()
+    return (
+        "⚠️ Что-то пошло не так на моей стороне.\n\n"
+        "Я уже привёл мысли в порядок — попробуй ещё раз тем же запросом. "
+        "Если ошибка повторяется, напиши создателю бота."
+    )
