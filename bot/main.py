@@ -16,7 +16,7 @@ from aiogram.types import (
 from bot.config import (
     BOT_TOKEN,
     ASSISTANT_MODES,
-    DEFAULT_MODE_KEY,
+    DEFAULT_MODE,
     ADMIN_IDS,
     LOG_CHAT_ID,
     REF_BASE_URL,
@@ -42,64 +42,7 @@ storage = get_storage()
 router = Router()
 
 # --- UI labels --------------------------------------------------------
-
-BTN_MODES = "🧠 Режимы"
-BTN_PROFILE = "👤 Профиль"
-BTN_SUBSCRIPTION = "💎 Подписка"
-BTN_REFERRALS = "👥 Рефералы"
-BTN_BACK = "⬅️ Назад"
-
-BTN_MODE_UNIVERSAL = "🧠 Универсальный"
-BTN_MODE_MEDICINE = "🩺 Медицина"
-BTN_MODE_COACH = "🔥 Наставник"
-BTN_MODE_BUSINESS = "💼 Бизнес"
-BTN_MODE_CREATIVE = "🎨 Креатив"
-
-BTN_SUB_MONTH_1 = "💎 1 месяц"
-BTN_SUB_MONTH_3 = "💎 3 месяца"
-BTN_SUB_MONTH_12 = "💎 12 месяцев"
-
-MAIN_MENU_BUTTONS = {BTN_MODES, BTN_PROFILE, BTN_SUBSCRIPTION, BTN_REFERRALS}
-MODE_BUTTONS = {
-    BTN_MODE_UNIVERSAL: "universal",
-    BTN_MODE_MEDICINE: "medicine",
-    BTN_MODE_COACH: "coach",
-    BTN_MODE_BUSINESS: "business",
-    BTN_MODE_CREATIVE: "creative",
-}
-SUB_BUTTONS = {
-    BTN_SUB_MONTH_1: "month_1",
-    BTN_SUB_MONTH_3: "month_3",
-    BTN_SUB_MONTH_12: "month_12",
-}
-
-
-def build_main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_MODES)],
-            [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SUBSCRIPTION)],
-            [KeyboardButton(text=BTN_REFERRALS)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Спроси обо всём, что угодно…",
-    )
-
-
-def build_modes_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_MODE_UNIVERSAL)],
-            [KeyboardButton(text=BTN_MODE_MEDICINE)],
-            [KeyboardButton(text=BTN_MODE_COACH)],
-            [KeyboardButton(text=BTN_MODE_BUSINESS)],
-            [KeyboardButton(text=BTN_MODE_CREATIVE)],
-            [KeyboardButton(text=BTN_BACK)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Выбери режим работы ассистента…",
-    )
-
+@@ -103,191 +103,191 @@ def build_modes_keyboard() -> ReplyKeyboardMarkup:
 
 def build_subscription_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -125,8 +68,8 @@ def build_main_menu_answer_kwargs() -> Dict[str, Any]:
 # --- Helpers ----------------------------------------------------------
 
 
-def _get_mode_cfg(mode_key: str) -> Dict[str, Any]:
-    return ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE_KEY])
+def _get_mode_cfg(mode_key: str) -> Dict[str, Any]:␊
+    return ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES[DEFAULT_MODE])
 
 
 async def _ensure_user(message: Message) -> Dict[str, Any]:
@@ -147,7 +90,7 @@ async def cmd_start(message: Message):
     user = await _ensure_user(message)
     user_id = message.from_user.id
 
-    mode_key = storage.get_mode(user_id) or DEFAULT_MODE_KEY
+    mode_key = storage.get_mode(user_id) or DEFAULT_MODE
     mode_cfg = _get_mode_cfg(mode_key)
     limits = storage.get_limits(user_id)
     ref_stats = storage.get_referral_stats(user_id)
@@ -186,7 +129,7 @@ async def handle_profile(message: Message):
     user = await _ensure_user(message)
     user_id = message.from_user.id
 
-    mode_key = storage.get_mode(user_id) or DEFAULT_MODE_KEY
+    mode_key = storage.get_mode(user_id) or DEFAULT_MODE
     mode_cfg = _get_mode_cfg(mode_key)
     limits = storage.get_limits(user_id)
     plan = storage.get_plan(user_id)
@@ -228,7 +171,7 @@ async def show_limits(message: Message):
     await _ensure_user(message)
     user_id = message.from_user.id
 
-    mode_key = storage.get_mode(user_id) or DEFAULT_MODE_KEY
+    mode_key = storage.get_mode(user_id) or DEFAULT_MODE
     mode_cfg = _get_mode_cfg(mode_key)
     limits = storage.get_limits(user_id)
     plan = storage.get_plan(user_id)
@@ -265,7 +208,7 @@ async def handle_mode_select(message: Message):
     user_id = message.from_user.id
 
     btn_text = message.text
-    mode_key = MODE_BUTTONS.get(btn_text, DEFAULT_MODE_KEY)
+    mode_key = MODE_BUTTONS.get(btn_text, DEFAULT_MODE)
     storage.set_mode(user_id, mode_key)
 
     mode_cfg = _get_mode_cfg(mode_key)
@@ -291,22 +234,7 @@ async def handle_back_to_main(message: Message):
 # --- Подписка ---------------------------------------------------------
 
 
-@router.message(F.text == BTN_SUBSCRIPTION)
-@router.message(Command("subscription"))
-async def handle_subscription_root(message: Message):
-    await _ensure_user(message)
-    user_id = message.from_user.id
-
-    plan = storage.get_plan(user_id)
-    limits = storage.get_limits(user_id)
-
-    text_to_send = txt.render_subscription_root(
-        limits=limits,
-        plan=plan,
-        tariffs=SUBSCRIPTION_TARIFFS,
-    )
-
-    await message.answer(
+@@ -310,64 +310,72 @@ async def handle_subscription_root(message: Message):
         text_to_send,
         parse_mode=ParseMode.HTML,
         reply_markup=build_subscription_keyboard(),
@@ -333,13 +261,21 @@ async def handle_subscription_select(message: Message):
     # Создаём счёт через CryptoBot
     try:
         invoice = await create_cryptobot_invoice(
-            plan_key=plan_key,
+            tariff_code=plan_key,
             user_id=user_id,
         )
     except Exception as e:
         logger.exception("Failed to create cryptobot invoice: %s", e)
         await message.answer(
             txt.render_payment_error(),
+            parse_mode=ParseMode.HTML,
+            **build_main_menu_answer_kwargs(),
+        )
+        return
+
+    if not invoice:
+        await message.answer(
+            txt.render_subscription_not_available(),
             parse_mode=ParseMode.HTML,
             **build_main_menu_answer_kwargs(),
         )
@@ -371,32 +307,7 @@ async def handle_referrals(message: Message):
         referral_link=referral_link,
     )
 
-    await message.answer(
-        text_to_send,
-        parse_mode=ParseMode.HTML,
-        **build_main_menu_answer_kwargs(),
-    )
-
-
-# --- Обработка свободного текста (LLM) -------------------------------
-
-
-@router.message(F.text)
-async def handle_user_prompt(message: Message):
-    await _ensure_user(message)
-    user_id = message.from_user.id
-    text_input = (message.text or "").strip()
-
-    # Всё, что является кнопками/служебным, уже разобрано выше
-    if (
-        text_input in MAIN_MENU_BUTTONS
-        or text_input in MODE_BUTTONS
-        or text_input in SUB_BUTTONS
-        or text_input == BTN_BACK
-    ):
-        return
-
-    if not text_input:
+@@ -400,61 +408,61 @@ async def handle_user_prompt(message: Message):
         await message.answer(
             txt.render_empty_prompt_error(),
             parse_mode=ParseMode.HTML,
@@ -422,7 +333,7 @@ async def handle_user_prompt(message: Message):
         )
         return
 
-    mode_key = storage.get_mode(user_id) or DEFAULT_MODE_KEY
+    mode_key = storage.get_mode(user_id) or DEFAULT_MODE
 
     # Сообщение "печатаю..."
     typing_msg = await message.answer(
@@ -432,7 +343,7 @@ async def handle_user_prompt(message: Message):
     )
 
     # Обновляем статистику запросов
-    storage.update_on_request(user_id, mode_key)
+    storage.update_on_request(user_id, mode_key, user_prompt=text_input)
 
     full_answer_chunks = []
     try:
@@ -458,35 +369,3 @@ async def handle_user_prompt(message: Message):
             storage.append_chat_history(
                 user_id,
                 role="assistant",
-                content=answer_text,
-            )
-    except Exception as e:
-        logger.exception("LLM error: %s", e)
-        try:
-            await typing_msg.edit_text(
-                txt.render_generic_error(),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-    finally:
-        try:
-            await typing_msg.edit_reply_markup(reply_markup=build_main_keyboard())
-        except Exception:
-            pass
-
-
-# --- Запуск -----------------------------------------------------------
-
-
-async def main():
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    logger.info("Starting bot polling")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
