@@ -2,25 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 
-# Важно: импортируем весь config целиком, чтобы не ловить ImportError
 from bot import config as bot_config
 
 logger = logging.getLogger(__name__)
 
-# ==============================
-#   Конфиг DeepSeek + режимы
-# ==============================
-
 DEEPSEEK_API_KEY: str = getattr(bot_config, "DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL: str = getattr(bot_config, "DEEPSEEK_MODEL", "deepseek-chat")
-
-# Если в config нет явного URL — используем дефолтный эндпоинт DeepSeek
 DEEPSEEK_API_URL: str = getattr(
     bot_config,
     "DEEPSEEK_API_URL",
@@ -30,47 +24,34 @@ DEEPSEEK_API_URL: str = getattr(
 ASSISTANT_MODES: Dict[str, Dict[str, Any]] = getattr(bot_config, "ASSISTANT_MODES", {})
 DEFAULT_MODE_KEY: str = getattr(bot_config, "DEFAULT_MODE_KEY", "universal")
 
+# Чуть меньше лимита Telegram (4096), чтобы не упираться в ограничение
+TELEGRAM_SAFE_LIMIT = 3800
 
-# ==============================
-#   Интенты (двухслойный движок)
-# ==============================
 
 class IntentType(str, Enum):
-    """Тип интента — в каком формате сейчас нужен ответ."""
-
-    PLAN = "plan"                   # Нужен план / чек-лист
-    ANALYSIS = "analysis"           # Глубокий разбор / анализ
-    BRAINSTORM = "brainstorm"       # Мозговой штурм / идеи
-    COACH = "coach"                 # Наставник / коучинговый формат
-    TASKS = "tasks"                 # Выделить задачи из текста
-    QA = "qa"                       # Обычный вопрос-ответ
-    EMOTIONAL_SUPPORT = "emotional_support"  # Эмоциональная поддержка / мотивация
-    SMALLTALK = "smalltalk"         # Лёгкая болтовня / общий разговор
-    OTHER = "other"                 # Всё остальное
+    PLAN = "plan"
+    ANALYSIS = "analysis"
+    BRAINSTORM = "brainstorm"
+    COACH = "coach"
+    TASKS = "tasks"
+    QA = "qa"
+    EMOTIONAL_SUPPORT = "emotional_support"
+    SMALLTALK = "smalltalk"
+    OTHER = "other"
 
 
 @dataclass
 class Intent:
-    """Результат анализа интента."""
     type: IntentType
 
 
 def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
-    """
-    Лёгкий интент-детектор первого уровня.
-
-    Здесь без отдельного LLM (чтобы не жечь токены на каждый запрос),
-    только эвристики по ключевым словам + немного логики по режиму.
-
-    Важно: интент влияет только на формулировку промпта к модели,
-    внешний интерфейс бота не меняем.
-    """
     if not message_text:
         return Intent(IntentType.OTHER)
 
     text = message_text.lower()
 
-    # 1. Планы / чек-листы / роадмапы
+    # План / структура
     if any(
         kw in text
         for kw in (
@@ -85,7 +66,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.PLAN)
 
-    # 2. Анализ / разбор
+    # Глубокий разбор
     if any(
         kw in text
         for kw in (
@@ -99,7 +80,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.ANALYSIS)
 
-    # 3. Мозговой штурм / идеи
+    # Мозговой штурм
     if any(
         kw in text
         for kw in (
@@ -115,7 +96,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.BRAINSTORM)
 
-    # 4. Коучинг / наставничество
+    # Коучинг / наставник
     if any(
         kw in text
         for kw in (
@@ -131,7 +112,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.COACH)
 
-    # 5. Выделение задач
+    # Выделение задач
     if "задач" in text and any(
         kw in text
         for kw in (
@@ -145,7 +126,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.TASKS)
 
-    # 6. Эмоциональная поддержка / мотивация
+    # Эмоциональная поддержка
     if any(
         kw in text
         for kw in (
@@ -164,7 +145,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.EMOTIONAL_SUPPORT)
 
-    # 7. Вопросы — базовый Q&A
+    # Вопрос-ответ
     trimmed = text.strip()
     if "?" in trimmed or trimmed.startswith(
         (
@@ -181,7 +162,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.QA)
 
-    # 8. Лёгкий приоритет по режиму (если ключевых слов не нашли)
+    # Лёгкий байас по режиму
     if mode_key:
         mk = mode_key.lower()
         if "mentor" in mk or "nastav" in mk or "coach" in mk:
@@ -189,18 +170,10 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
         if "creative" in mk or "kreat" in mk or "creativ" in mk:
             return Intent(IntentType.BRAINSTORM)
 
-    # 9. По умолчанию — лёгкая беседа
     return Intent(IntentType.SMALLTALK)
 
 
-def _apply_intent_to_prompt(
-    user_prompt: str,
-    intent: Intent,
-) -> str:
-    """
-    Второй слой: заворачиваем запрос пользователя в нужный формат
-    под конкретный интент. Для SMALLTALK/OTHER — не трогаем текст.
-    """
+def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
     base = user_prompt.strip()
 
     if intent.type == IntentType.PLAN:
@@ -269,22 +242,15 @@ def _apply_intent_to_prompt(
             f"Вопрос пользователя:\n{base}"
         )
 
-    # SMALLTALK / OTHER — не заворачиваем, чтобы не ломать естественный диалог
     return base
 
 
-# ==============================
-#   Поведение режимов (коуч / бизнес / медицина)
-# ==============================
-
 @dataclass
 class ModeBehavior:
-    """Дополнительные правила для режимов."""
-    system_suffix: str = ""   # доп. текст к системному промпту
+    system_suffix: str = ""
 
 
 MODE_BEHAVIORS: Dict[str, ModeBehavior] = {
-    # 🔥 Наставник
     "mentor": ModeBehavior(
         system_suffix=(
             "\n\nРЕЖИМ: ЛИЧНЫЙ НАСТАВНИК.\n"
@@ -295,8 +261,6 @@ MODE_BEHAVIORS: Dict[str, ModeBehavior] = {
             "- в самом конце задавай один уточняющий вопрос, чтобы углубить размышления.\n"
         )
     ),
-
-    # 💼 Бизнес / «режим архитектора» для проектов
     "business": ModeBehavior(
         system_suffix=(
             "\n\nРЕЖИМ: БИЗНЕС-АРХИТЕКТОР.\n"
@@ -308,8 +272,6 @@ MODE_BEHAVIORS: Dict[str, ModeBehavior] = {
             "- по возможности давай ориентиры по цифрам (диапазоны, порядок величин).\n"
         )
     ),
-
-    # 🩺 Медицина
     "medical": ModeBehavior(
         system_suffix=(
             "\n\nРЕЖИМ: ОСТОРОЖНЫЙ МЕДИЦИНСКИЙ АССИСТЕНТ.\n"
@@ -327,7 +289,6 @@ MODE_BEHAVIORS: Dict[str, ModeBehavior] = {
 
 
 def _build_system_prompt(mode_key: str, style_hint: Optional[str]) -> str:
-    """Собираем системный промпт с учётом режима и стиля."""
     mode_cfg: Dict[str, Any] = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES.get(
         DEFAULT_MODE_KEY, {}
     )
@@ -336,19 +297,86 @@ def _build_system_prompt(mode_key: str, style_hint: Optional[str]) -> str:
         "Ты — умный универсальный ассистент. Отвечай структурировано и по делу.",
     )
 
-    # Добавляем специальные правила для режима (коуч, бизнес, медицина и т.д.)
     behavior = MODE_BEHAVIORS.get(mode_key)
     if behavior and behavior.system_suffix:
         base_system_prompt = base_system_prompt.rstrip() + "\n" + behavior.system_suffix
 
-    # Стиль общения пользователя (если где-то ядро его передаёт)
     if style_hint:
         base_system_prompt += (
             "\n\nДополнительно учитывай стиль общения пользователя:\n"
             f"{style_hint.strip()}"
         )
 
+    # Глобальное правило структуры (если не медрежим)
+    if mode_key != "medical":
+        base_system_prompt += (
+            "\n\nСтруктурируй ответы: сначала короткий блок с ключевыми тезисами "
+            "(3–7 пунктов), затем подробное раскрытие по пунктам."
+        )
+
     return base_system_prompt
+
+
+@dataclass
+class AnswerChunk:
+    kind: str  # outline / heading / paragraph / list
+    text: str
+
+
+@dataclass
+class Answer:
+    chunks: List[AnswerChunk]
+    full_text: str
+    has_more: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _estimate_tokens(*texts: str) -> int:
+    total_chars = sum(len(t or "") for t in texts)
+    return max(1, total_chars // 4)
+
+
+def _split_into_semantic_chunks(text: str) -> List[AnswerChunk]:
+    text = text.strip()
+    if not text:
+        return []
+
+    blocks = re.split(r"\n\s*\n", text)
+    chunks: List[AnswerChunk] = []
+
+    for i, block in enumerate(blocks):
+        block = block.strip()
+        if not block:
+            continue
+
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        first = lines[0].strip()
+
+        # Outline / краткий блок
+        if i == 0 and any(
+            kw in first.lower()
+            for kw in ("кратко", "тезисы", "итог", "оглавление")
+        ):
+            kind = "outline"
+        # Списки
+        elif all(
+            ln.lstrip().startswith(("-", "•", "*", "—", "–"))
+            or re.match(r"^\d+[\.\)]\s+", ln.lstrip())
+            for ln in lines
+        ):
+            kind = "list"
+        # Заголовки (короткая строка без точек)
+        elif len(first) < 60 and not any(p in first for p in ".!?"):
+            kind = "heading"
+        else:
+            kind = "paragraph"
+
+        chunks.append(AnswerChunk(kind=kind, text=block))
+
+    return chunks
 
 
 def _prepare_messages(
@@ -356,19 +384,31 @@ def _prepare_messages(
     user_prompt: str,
     history: Optional[List[Dict[str, str]]] = None,
     style_hint: Optional[str] = None,
+    answer_mode: Optional[str] = None,  # "quick" | "deep"
 ) -> List[Dict[str, str]]:
-    """Собираем messages для DeepSeek: system + history + user (через интент-слой)."""
     system_prompt = _build_system_prompt(mode_key, style_hint)
 
-    # Новый слой: анализируем интент и трансформируем запрос
     intent = analyze_intent(user_prompt, mode_key=mode_key)
     transformed_user_prompt = _apply_intent_to_prompt(user_prompt, intent)
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-    ]
+    # Быстрый / глубокий режим
+    if answer_mode == "quick":
+        transformed_user_prompt = (
+            "РЕЖИМ ОТВЕТА: КОРОТКИЙ.\n"
+            "Дай краткий, ёмкий ответ (до 3 абзацев, без большого количества деталей "
+            "и длинных списков).\n\n"
+            + transformed_user_prompt
+        )
+    elif answer_mode == "deep":
+        transformed_user_prompt = (
+            "РЕЖИМ ОТВЕТА: ГЛУБОКИЙ РАЗБОР.\n"
+            "Сначала сделай блок «Кратко» — 3–7 тезисов (оглавление), "
+            "далее подробный разбор по пунктам.\n\n"
+            + transformed_user_prompt
+        )
 
-    # Если ядро где-то передаёт историю — аккуратно добавляем
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
     if history:
         for msg in history:
             role = msg.get("role")
@@ -380,12 +420,7 @@ def _prepare_messages(
     return messages
 
 
-# ==============================
-#   Вызов DeepSeek
-# ==============================
-
 async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
-    """Один запрос к DeepSeek (без стриминга с их стороны)."""
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY не задан в окружении.")
 
@@ -413,15 +448,57 @@ async def _call_deepseek(messages: List[Dict[str, str]]) -> str:
         raise RuntimeError("Unexpected DeepSeek response structure")
 
 
-def _estimate_tokens(*texts: str) -> int:
-    """Грубая оценка числа токенов (чтобы не оставлять ноль)."""
-    total_chars = sum(len(t or "") for t in texts)
-    return max(1, total_chars // 4)
+async def generate_answer(
+    mode_key: str,
+    user_prompt: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    style_hint: Optional[str] = None,
+    force_mode: Optional[str] = None,  # "quick" | "deep"
+) -> Answer:
+    # Определяем режим: быстрый / глубокий
+    if force_mode in ("quick", "deep"):
+        answer_mode = force_mode
+    else:
+        answer_mode = "quick" if len(user_prompt) < 160 else "deep"
 
+    messages = _prepare_messages(
+        mode_key=mode_key,
+        user_prompt=user_prompt,
+        history=history,
+        style_hint=style_hint,
+        answer_mode=answer_mode,
+    )
 
-# ==============================
-#   Публичный API: ask_llm_stream
-# ==============================
+    full_text = await _call_deepseek(messages)
+    est_tokens = _estimate_tokens(user_prompt, full_text)
+
+    visible_text = full_text
+    has_more = False
+    cut_offset = len(full_text)
+
+    # Обрезаем, если упираемся в лимит Telegram
+    if len(full_text) > TELEGRAM_SAFE_LIMIT:
+        visible_text = full_text[:TELEGRAM_SAFE_LIMIT]
+        last_break = visible_text.rfind("\n")
+        if last_break > TELEGRAM_SAFE_LIMIT * 0.6:
+            visible_text = visible_text[:last_break]
+            cut_offset = last_break
+        else:
+            cut_offset = TELEGRAM_SAFE_LIMIT
+        has_more = True
+
+    chunks = _split_into_semantic_chunks(visible_text)
+    meta: Dict[str, Any] = {
+        "answer_mode": answer_mode,
+        "tokens": est_tokens,
+        "truncated": has_more,
+        "cut_offset": cut_offset,
+        "full_text": full_text,
+        "can_expand": answer_mode == "quick",
+    }
+
+    return Answer(chunks=chunks, full_text=visible_text, has_more=has_more, meta=meta)
+
 
 async def _ask_llm_stream_impl(
     mode_key: str,
@@ -430,51 +507,44 @@ async def _ask_llm_stream_impl(
     style_hint: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
-    Внутренняя реализация стриминга.
-
-    Каждый yield: {"delta": str, "full": str, "tokens": int}
-    — это формат, который уже использует твой UI/хендлеры.
+    Обёртка над generate_answer для старого интерфейса стриминга.
     """
-    messages = _prepare_messages(
+    answer = await generate_answer(
         mode_key=mode_key,
         user_prompt=user_prompt,
         history=history,
         style_hint=style_hint,
     )
 
-    full_text = await _call_deepseek(messages)
-    est_tokens = _estimate_tokens(user_prompt, full_text)
-
-    # Имитация "живого" набора — режем на небольшие батчи по длине
-    words = full_text.split()
-    chunks: List[str] = []
-    current = ""
-
-    for w in words:
-        candidate = (current + " " + w) if current else w
-        if len(candidate) >= 120:
-            chunks.append(candidate)
-            current = ""
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-
     assembled = ""
-    if not chunks:
-        # На всякий случай, если ответ пустой
-        yield {"delta": "", "full": full_text, "tokens": est_tokens}
-        return
+    sleep_base = 0.04 if answer.meta.get("answer_mode") == "deep" else 0.02
 
-    for chunk in chunks:
-        assembled = (assembled + " " + chunk) if assembled else chunk
-        yield {
-            "delta": chunk,
+    for idx, ch in enumerate(answer.chunks):
+        sep = "\n\n" if assembled else ""
+        delta = sep + ch.text
+        assembled = assembled + delta
+        payload: Dict[str, Any] = {
+            "delta": delta,
             "full": assembled,
-            "tokens": est_tokens,
+            "tokens": answer.meta.get("tokens", 0),
+            "kind": ch.kind,
         }
-        # Небольшая пауза чтобы создать эффект печати
-        await asyncio.sleep(0.05)
+        if idx == len(answer.chunks) - 1:
+            payload["has_more"] = answer.has_more
+            payload["meta"] = answer.meta
+
+        yield payload
+        await asyncio.sleep(sleep_base)
+
+    # На всякий случай, если чанков нет
+    if not answer.chunks:
+        yield {
+            "delta": "",
+            "full": answer.full_text,
+            "tokens": answer.meta.get("tokens", 0),
+            "has_more": answer.has_more,
+            "meta": answer.meta,
+        }
 
 
 async def ask_llm_stream(
@@ -482,16 +552,8 @@ async def ask_llm_stream(
     **kwargs,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
-    Публичная функция, которую импортирует bot.main.
-
-    Сделана максимально терпимой к разным старым вызовам:
-    - позиционные аргументы: (mode_key, user_prompt) или (mode_key, user_prompt, history)
-    - именованные: mode_key=..., user_prompt=..., history=..., style_hint=...
-
-    Всегда возвращает async-генератор с dict:
-      {"delta": str, "full": str, "tokens": int}
+    Публичная функция стриминга (совместима с тем, как ты её вызывал раньше).
     """
-    # Разбираем mode_key
     if "mode_key" in kwargs:
         mode_key = kwargs["mode_key"]
     elif len(args) >= 1:
@@ -499,7 +561,6 @@ async def ask_llm_stream(
     else:
         mode_key = DEFAULT_MODE_KEY
 
-    # Разбираем user_prompt
     if "user_prompt" in kwargs:
         user_prompt = kwargs["user_prompt"]
     elif len(args) >= 2:
@@ -507,12 +568,10 @@ async def ask_llm_stream(
     else:
         raise TypeError("ask_llm_stream: user_prompt is required")
 
-    # История — только если явно передали
     history: Optional[List[Dict[str, str]]] = kwargs.get("history")
     if history is None and len(args) >= 3 and isinstance(args[2], list):
         history = args[2]
 
-    # Стиль — только по имени (чтобы не путать с history)
     style_hint: Optional[str] = kwargs.get("style_hint")
 
     async for chunk in _ask_llm_stream_impl(
@@ -531,8 +590,7 @@ async def ask_llm(
     style_hint: Optional[str] = None,
 ) -> str:
     """
-    Нестриминговая обёртка: собирает полный ответ в один текст.
-    Если нигде не используешь — можно и не трогать.
+    Нестрочный вариант, просто вернёт финальный текст.
     """
     last_full = ""
     async for chunk in _ask_llm_stream_impl(
