@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -25,20 +25,16 @@ from bot.config import (
     SUBSCRIPTION_TARIFFS,
     REF_BASE_URL,
 )
-from bot import text as txt
 from services.llm import ask_llm_stream
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
-
-# ------------------ ЛОГИ ------------------ #
+from services import texts as txt
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-
-# ------------------ UI: ТЕКСТЫ КНОПОК ------------------ #
 
 BTN_MODES = "🧠 Режимы"
 BTN_PROFILE = "👤 Профиль"
@@ -57,8 +53,6 @@ BTN_SUB_1M = "💎 Premium · 1 месяц"
 BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
-
-# ------------------ КЛАВИАТУРЫ (таскбар) ------------------ #
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -96,15 +90,11 @@ REF_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ------------------ ЯДРО ------------------ #
-
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 dp = Dispatcher()
 router = Router()
 storage = Storage()
 
-
-# ------------------ HELPERS ------------------ #
 
 def _plan_title(plan_code: str, is_admin: bool) -> str:
     if is_admin or plan_code == "admin":
@@ -115,12 +105,11 @@ def _plan_title(plan_code: str, is_admin: bool) -> str:
 
 
 def _mode_title(mode_key: str) -> str:
-    cfg = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
+    cfg: Dict[str, Any] = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
     return cfg["title"]
 
 
 def _estimate_prompt_tokens(text: str) -> int:
-    # грубая оценка
     return max(1, len(text) // 4)
 
 
@@ -143,15 +132,12 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
 
 
 async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
-    """
-    "Живое" печатание: LLM отдаёт ответ батчами, мы редактируем одно сообщение.
-    """
     typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
 
     style_hint = user.style_hint or ""
 
     try:
-        last_chunk = None
+        last_chunk: Dict[str, Any] | None = None
         async for chunk in ask_llm_stream(
             mode_key=user.mode_key or DEFAULT_MODE_KEY,
             user_prompt=text,
@@ -178,16 +164,13 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
 
 
 def _tariff_key_by_button(button_text: str) -> Optional[str]:
-    if button_text == BTN_SUB_1M:
-        return "month_1"
-    if button_text == BTN_SUB_3M:
-        return "month_3"
-    if button_text == BTN_SUB_12M:
-        return "month_12"
-    return None
+    mapping = {
+        BTN_SUB_1M: "month_1",
+        BTN_SUB_3M: "month_3",
+        BTN_SUB_12M: "month_12",
+    }
+    return mapping.get(button_text)
 
-
-# ------------------ HANDLERS ------------------ #
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -198,7 +181,6 @@ async def cmd_start(message: Message) -> None:
 
     user, created = storage.get_or_create_user(user_id, message.from_user)
 
-    # Рефералка
     if start_param.startswith("ref_") and created:
         ref_code = start_param.replace("ref_", "", 1)
         storage.apply_referral(user_id, ref_code)
@@ -255,16 +237,7 @@ async def on_profile(message: Message) -> None:
 
 @router.message(F.text == BTN_MODES)
 async def on_modes_root(message: Message) -> None:
-    text_body = (
-        "🧠 *Режимы работы*\n\n"
-        "Выбери, через какую «линзу» я буду смотреть на твой запрос:\n"
-        "• *Универсальный* — по умолчанию, для всего.\n"
-        "• *Медицина* — аккуратный медицинский ассистент.\n"
-        "• *Наставник* — фокус на рост, систему и дисциплину.\n"
-        "• *Бизнес* — стратегии, решения, деньги.\n"
-        "• *Креатив* — идеи, тексты, концепции.\n\n"
-        "Режим влияет на акценты и подачу, но не срезает интеллект."
-    )
+    text_body = txt.render_modes_root()
     await message.answer(text_body, reply_markup=MODES_KB)
 
 
@@ -398,8 +371,6 @@ async def on_user_message(message: Message) -> None:
 
     await _send_streaming_answer(message, user, text)
 
-
-# ------------------ ENTRYPOINT ------------------ #
 
 async def main() -> None:
     dp.include_router(router)
