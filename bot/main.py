@@ -27,15 +27,13 @@ from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
 from services import texts as txt  # ВАЖНО: services.texts, а не bot.text
 
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-
-# --- Текст кнопок таскбара ---
+# --- Текст кнопок таскбара / режимов / подписки ---
 
 BTN_MODES = "🧠 Режимы"
 BTN_PROFILE = "👤 Профиль"
@@ -53,8 +51,7 @@ BTN_BACK_MAIN = "⬅️ Назад"
 BTN_SUB_1M = "💎 Premium · 1 месяц"
 BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
-BTN_SUB_CHECK = "🔄 Проверить оплату"
-
+BTN_SUB_CHECK = "🔁 Проверить оплату"
 
 # --- Разметка клавиатур ---
 
@@ -68,8 +65,14 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 MODES_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_MODE_UNIVERSAL), KeyboardButton(text=BTN_MODE_MEDICINE)],
-        [KeyboardButton(text=BTN_MODE_COACH), KeyboardButton(text=BTN_MODE_BUSINESS)],
+        [
+            KeyboardButton(text=BTN_MODE_UNIVERSAL),
+            KeyboardButton(text=BTN_MODE_MEDICINE),
+        ],
+        [
+            KeyboardButton(text=BTN_MODE_COACH),
+            KeyboardButton(text=BTN_MODE_BUSINESS),
+        ],
         [KeyboardButton(text=BTN_MODE_CREATIVE)],
         [KeyboardButton(text=BTN_BACK_MAIN)],
     ],
@@ -94,7 +97,6 @@ REF_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
@@ -105,7 +107,6 @@ storage = Storage()
 
 
 # --- Вспомогательные функции ---
-
 
 def _plan_title(plan_code: str, is_admin: bool) -> str:
     if is_admin or plan_code == "admin":
@@ -139,8 +140,10 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
 
     if user.daily_used >= daily_max:
         return "Достигнут дневной лимит запросов для текущего тарифа."
+
     if user.monthly_used >= monthly_max:
         return "Достигнут месячный лимит запросов для текущего тарифа."
+
     return None
 
 
@@ -153,7 +156,6 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
     typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
 
     style_hint = user.style_hint or ""
-
     try:
         last_chunk: Dict[str, Any] | None = None
 
@@ -195,7 +197,6 @@ def _tariff_key_by_button(button_text: str) -> Optional[str]:
 
 # --- Хендлеры ---
 
-
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     user_id = message.from_user.id
@@ -222,6 +223,7 @@ async def cmd_start(message: Message) -> None:
         plan_title=plan_title,
         mode_title=mode_title,
     )
+
     await message.answer(text_body, reply_markup=MAIN_KB)
 
     logger.info(
@@ -242,6 +244,7 @@ async def on_back_main(message: Message) -> None:
 async def on_profile(message: Message) -> None:
     user_id = message.from_user.id
     user, _ = storage.get_or_create_user(user_id, message.from_user)
+
     is_admin = storage.is_admin(user_id)
     plan_code = storage.effective_plan(user, is_admin)
     plan_title = _plan_title(plan_code, is_admin)
@@ -257,6 +260,7 @@ async def on_profile(message: Message) -> None:
         total_tokens=user.total_tokens,
         ref_code=user.ref_code,
     )
+
     await message.answer(text_body, reply_markup=MAIN_KB)
 
 
@@ -266,15 +270,20 @@ async def on_modes_root(message: Message) -> None:
     await message.answer(text_body, reply_markup=MODES_KB)
 
 
-@router.message(F.text.in_({
-    BTN_MODE_UNIVERSAL,
-    BTN_MODE_MEDICINE,
-    BTN_MODE_COACH,
-    BTN_MODE_BUSINESS,
-    BTN_MODE_CREATIVE,
-}))
+@router.message(
+    F.text.in_(
+        {
+            BTN_MODE_UNIVERSAL,
+            BTN_MODE_MEDICINE,
+            BTN_MODE_COACH,
+            BTN_MODE_BUSINESS,
+            BTN_MODE_CREATIVE,
+        }
+    )
+)
 async def on_mode_select(message: Message) -> None:
     user_id = message.from_user.id
+
     mapping = {
         BTN_MODE_UNIVERSAL: "universal",
         BTN_MODE_MEDICINE: "medicine",
@@ -282,8 +291,10 @@ async def on_mode_select(message: Message) -> None:
         BTN_MODE_BUSINESS: "business",
         BTN_MODE_CREATIVE: "creative",
     }
+
     mode_key = mapping.get(message.text, DEFAULT_MODE_KEY)
     storage.set_mode(user_id, mode_key)
+
     mode_title = _mode_title(mode_key)
     await message.answer(txt.render_mode_switched(mode_title), reply_markup=MAIN_KB)
 
@@ -292,11 +303,15 @@ async def on_mode_select(message: Message) -> None:
 async def on_subscription(message: Message) -> None:
     user_id = message.from_user.id
     user, _ = storage.get_or_create_user(user_id, message.from_user)
+
     is_admin = storage.is_admin(user_id)
     plan_code = storage.effective_plan(user, is_admin)
     plan_title = _plan_title(plan_code, is_admin)
 
-    text_body = txt.render_subscription_overview(plan_title, user.premium_until)
+    text_body = txt.render_subscription_overview(
+        plan_title,
+        user.premium_until,
+    )
     await message.answer(text_body, reply_markup=SUB_KB)
 
 
@@ -339,12 +354,18 @@ async def on_subscription_check(message: Message) -> None:
 
     invoice_id, tariff_key = storage.get_last_invoice(user)
     if not invoice_id or not tariff_key:
-        await message.answer(txt.render_payment_check_result("not_found"), reply_markup=SUB_KB)
+        await message.answer(
+            txt.render_payment_check_result("not_found"),
+            reply_markup=SUB_KB,
+        )
         return
 
     status = await get_invoice_status(invoice_id)
     if not status:
-        await message.answer(txt.render_payment_check_result("not_found"), reply_markup=SUB_KB)
+        await message.answer(
+            txt.render_payment_check_result("not_found"),
+            reply_markup=SUB_KB,
+        )
         return
 
     if status == "paid":
@@ -360,15 +381,21 @@ async def on_subscription_check(message: Message) -> None:
 async def on_referrals(message: Message) -> None:
     user_id = message.from_user.id
     user, _ = storage.get_or_create_user(user_id, message.from_user)
+
     ref_link = f"{REF_BASE_URL}?start=ref_{user.ref_code}"
-    text_body = txt.render_referrals(ref_link=ref_link, total_refs=user.referrals_count)
+
+    text_body = txt.render_referrals(
+        ref_link=ref_link,
+        total_refs=user.referrals_count,
+    )
     await message.answer(text_body, reply_markup=REF_KB)
 
 
 @router.message(F.text.startswith("/"))
 async def on_unknown_command(message: Message) -> None:
     await message.answer(
-        "Команда не распознана.\n\nИспользуй нижние кнопки навигации или просто напиши запрос.",
+        "Команда не распознана.\n\n"
+        "Используй нижние кнопки навигации или просто напиши запрос.",
         reply_markup=MAIN_KB,
     )
 
@@ -386,12 +413,16 @@ async def on_user_message(message: Message) -> None:
 
     user_id = message.from_user.id
     user, _ = storage.get_or_create_user(user_id, message.from_user)
+
     is_admin = storage.is_admin(user_id)
     plan_code = storage.effective_plan(user, is_admin)
 
     reason = _check_limits(user, plan_code, is_admin)
     if reason:
-        await message.answer(txt.render_limits_warning(reason), reply_markup=MAIN_KB)
+        await message.answer(
+            txt.render_limits_warning(reason),
+            reply_markup=MAIN_KB,
+        )
         return
 
     await _send_streaming_answer(message, user, text)
