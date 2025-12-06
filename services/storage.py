@@ -1,213 +1,176 @@
 from __future__ import annotations
 
-import json
 import logging
+import os
 import sqlite3
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
-from aiogram.types import User as TgUser
-
-from bot.config import (
-    USERS_FILE_PATH,
-    DEFAULT_MODE_KEY,
-    ADMIN_IDS,
-)
+from typing import Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
 
-# SQLite вместо "опасного JSON"
-DB_PATH: Path = USERS_FILE_PATH.with_suffix(".db")
+# Путь к SQLite-базе
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "aimedbot.db"
 
 
 @dataclass
 class UserRecord:
     id: int
-    username: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
+    username: Optional[str]
+    first_name: Optional[str]
+    last_name: Optional[str]
+    is_bot: bool = False
 
-    mode_key: str = DEFAULT_MODE_KEY
+    mode_key: Optional[str] = None  # текущий режим ассистента
+    plan_code: str = "free"         # базовый/вынужденный код тарифа (free/premium/admin и т.п.)
 
-    # Тариф
-    plan_type: str = "basic"  # basic | premium
-    premium_until: Optional[float] = None
+    premium_until: Optional[str] = None  # YYYY-MM-DD, до какой даты активен premium
 
-    # Лимиты
     daily_used: int = 0
     monthly_used: int = 0
-    last_daily_reset: Optional[str] = None  # YYYY-MM-DD
-    last_monthly_reset: Optional[str] = None  # YYYY-MM
-
-    # Статистика
     total_requests: int = 0
     total_tokens: int = 0
 
-    # Рефералка
-    ref_code: Optional[str] = None
-    referred_by: Optional[str] = None
-    referrals_count: int = 0
+    # технические поля для сброса лимитов
+    daily_date: Optional[str] = None      # YYYY-MM-DD
+    monthly_month: Optional[str] = None   # YYYY-MM
 
-    # Оплата / подписка
+    # рефералька
+    ref_code: Optional[str] = None
+    referrals_count: int = 0
+    referrer_user_id: Optional[int] = None
+
+    # последняя оплата
     last_invoice_id: Optional[int] = None
     last_tariff_key: Optional[str] = None
 
-    # Стиль общения (под твой Style Engine)
+    # стилистика общения
     style_hint: Optional[str] = None
 
-    created_at: float = field(default_factory=lambda: time.time())
-    updated_at: float = field(default_factory=lambda: time.time())
+    # авто-дневник
+    last_summary_date: Optional[str] = None  # YYYY-MM-DD
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "UserRecord":
-        """
-        Аккуратно восстанавливаем запись, игнорируя лишние поля
-        из старых версий (для миграции из JSON).
-        """
-        return cls(
-            id=int(data.get("id")),
-            username=data.get("username"),
-            first_name=data.get("first_name"),
-            last_name=data.get("last_name"),
-            mode_key=data.get("mode_key", DEFAULT_MODE_KEY),
-            plan_type=data.get("plan_type", "basic"),
-            premium_until=data.get("premium_until"),
-            daily_used=int(data.get("daily_used", 0)),
-            monthly_used=int(data.get("monthly_used", 0)),
-            last_daily_reset=data.get("last_daily_reset"),
-            last_monthly_reset=data.get("last_monthly_reset"),
-            total_requests=int(data.get("total_requests", 0)),
-            total_tokens=int(data.get("total_tokens", 0)),
-            ref_code=data.get("ref_code"),
-            referred_by=data.get("referred_by"),
-            referrals_count=int(data.get("referrals_count", 0)),
-            last_invoice_id=data.get("last_invoice_id"),
-            # поддержка старого имени поля, если оно было
-            last_tariff_key=data.get("last_tariff_key")
-            or data.get("last_invoice_code"),
-            style_hint=data.get("style_hint"),
-            created_at=float(data.get("created_at", time.time())),
-            updated_at=float(data.get("updated_at", time.time())),
-        )
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "UserRecord":
-        """Восстановление записи из строки БД."""
         return cls(
             id=row["id"],
             username=row["username"],
             first_name=row["first_name"],
             last_name=row["last_name"],
+            is_bot=bool(row["is_bot"]),
             mode_key=row["mode_key"],
-            plan_type=row["plan_type"],
+            plan_code=row["plan_code"] or "free",
             premium_until=row["premium_until"],
             daily_used=row["daily_used"],
             monthly_used=row["monthly_used"],
-            last_daily_reset=row["last_daily_reset"],
-            last_monthly_reset=row["last_monthly_reset"],
             total_requests=row["total_requests"],
             total_tokens=row["total_tokens"],
+            daily_date=row["daily_date"],
+            monthly_month=row["monthly_month"],
             ref_code=row["ref_code"],
-            referred_by=row["referred_by"],
             referrals_count=row["referrals_count"],
+            referrer_user_id=row["referrer_user_id"],
             last_invoice_id=row["last_invoice_id"],
             last_tariff_key=row["last_tariff_key"],
             style_hint=row["style_hint"],
+            last_summary_date=row["last_summary_date"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 class Storage:
-    """
-    Нормальное хранилище на SQLite.
-
-    Таблицы:
-    - users            — профиль и тариф пользователя
-    - messages         — вся история диалогов (для аналитики/памяти)
-    - projects         — устойчивые темы/проекты (под 2.1)
-    - payments         — истории платежей
-    - referrals        — лог рефералок
-    - daily_summaries  — дневные саммари (под ежедневные отчёты)
-    """
-
-    def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or DB_PATH
-        self._conn = sqlite3.connect(self.db_path)
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self.db_path = db_path
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
-        self._maybe_migrate_from_json()
 
-    # ------------------------------------------------------------------
-    # Инициализация схемы БД
-    # ------------------------------------------------------------------
+    # --------------- Базовая схема БД ---------------
+
     def _init_db(self) -> None:
         cur = self._conn.cursor()
 
-        # users
+        # Пользователи
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                id                INTEGER PRIMARY KEY,
-                username          TEXT,
-                first_name        TEXT,
-                last_name         TEXT,
-                mode_key          TEXT NOT NULL,
-                plan_type         TEXT NOT NULL,
-                premium_until     REAL,
+                id               INTEGER PRIMARY KEY,
+                username         TEXT,
+                first_name       TEXT,
+                last_name        TEXT,
+                is_bot           INTEGER DEFAULT 0,
 
-                daily_used        INTEGER NOT NULL DEFAULT 0,
-                monthly_used      INTEGER NOT NULL DEFAULT 0,
-                last_daily_reset  TEXT,
-                last_monthly_reset TEXT,
+                mode_key         TEXT,
+                plan_code        TEXT,
 
-                total_requests    INTEGER NOT NULL DEFAULT 0,
-                total_tokens      INTEGER NOT NULL DEFAULT 0,
+                premium_until    TEXT,
 
-                ref_code          TEXT,
-                referred_by       TEXT,
-                referrals_count   INTEGER NOT NULL DEFAULT 0,
+                daily_used       INTEGER DEFAULT 0,
+                monthly_used     INTEGER DEFAULT 0,
+                total_requests   INTEGER DEFAULT 0,
+                total_tokens     INTEGER DEFAULT 0,
 
-                last_invoice_id   INTEGER,
-                last_tariff_key   TEXT,
+                daily_date       TEXT,
+                monthly_month    TEXT,
 
-                style_hint        TEXT,
+                ref_code         TEXT UNIQUE,
+                referrals_count  INTEGER DEFAULT 0,
+                referrer_user_id INTEGER,
 
-                created_at        REAL NOT NULL,
-                updated_at        REAL NOT NULL
+                last_invoice_id  INTEGER,
+                last_tariff_key  TEXT,
+
+                style_hint       TEXT,
+                last_summary_date TEXT,
+
+                created_at       REAL,
+                updated_at       REAL
             )
             """
         )
-        cur.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_ref_code
-            ON users(ref_code) WHERE ref_code IS NOT NULL
-            """
-        )
 
-        # messages
+        # Сообщения
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    INTEGER NOT NULL,
-                role       TEXT NOT NULL,   -- 'user' | 'assistant' | 'system'
+                role       TEXT NOT NULL,  -- 'user' / 'assistant' / 'system'
                 content    TEXT NOT NULL,
                 created_at REAL NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
         )
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_ts "
+            "ON messages(user_id, created_at)"
         )
 
-        # projects (под будущие ProjectRecord / 2.1)
+        # Дневные summary
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                date       TEXT NOT NULL,   -- YYYY-MM-DD
+                summary    TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(user_id, date),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+
+        # Проекты пользователя (слой проектов/тем)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS projects (
@@ -216,360 +179,248 @@ class Storage:
                 title        TEXT NOT NULL,
                 description  TEXT,
                 tags         TEXT,
-                last_used_ts REAL NOT NULL,
-                created_at   REAL NOT NULL,
-                UNIQUE(user_id, title),
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-
-        # payments
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payments (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                invoice_id  INTEGER NOT NULL,
-                tariff_key  TEXT NOT NULL,
-                status      TEXT NOT NULL,   -- 'pending' | 'paid' | 'canceled'
-                amount_usdt TEXT,
-                created_at  REAL NOT NULL,
-                paid_at     REAL,
-                UNIQUE(invoice_id),
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                last_used_ts REAL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
         )
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)"
-        )
-
-        # referrals (под аналитику реф-системы)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referrals (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id          INTEGER NOT NULL,
-                referred_user_id  INTEGER NOT NULL,
-                ref_code          TEXT NOT NULL,
-                created_at        REAL NOT NULL,
-                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY(referred_user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_referrals_owner ON referrals(owner_id)"
-        )
-
-        # daily_summaries (для дневных отчётов)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_summaries (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                date       TEXT NOT NULL,  -- YYYY-MM-DD
-                summary    TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                UNIQUE(user_id, date),
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
+            "CREATE INDEX IF NOT EXISTS idx_projects_user "
+            "ON projects(user_id, last_used_ts)"
         )
 
         self._conn.commit()
 
-    # ------------------------------------------------------------------
-    # Миграция из старого JSON (users.json) → SQLite
-    # ------------------------------------------------------------------
-    def _maybe_migrate_from_json(self) -> None:
-        """Мягкая миграция: если БД пустая, а users.json есть — переливаем."""
-        try:
-            cur = self._conn.cursor()
-            cur.execute("SELECT 1 FROM users LIMIT 1")
-            row = cur.fetchone()
-            if row is not None:
-                # уже есть данные в БД — ничего не трогаем
-                return
+    # --------------- Внутренние утилиты ---------------
 
-            if not USERS_FILE_PATH.exists():
-                return
+    def _now_ts(self) -> float:
+        return time.time()
 
-            logger.info("Migrating users from JSON (%s) to SQLite (%s)",
-                        USERS_FILE_PATH, self.db_path)
+    def _today_key(self) -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
 
-            with USERS_FILE_PATH.open("r", encoding="utf-8") as f:
-                raw = json.load(f)
+    def _month_key(self) -> str:
+        return time.strftime("%Y-%m", time.localtime())
 
-            if not isinstance(raw, dict):
-                logger.warning(
-                    "Unexpected users.json format (not dict), skipping migration"
-                )
-                return
+    def _generate_ref_code(self, user_id: int) -> str:
+        # простой детерминированный код, можно потом заменить на более сложный
+        return f"BB{user_id}"
 
-            now = time.time()
-            for key, value in raw.items():
-                try:
-                    rec = UserRecord.from_dict(value)
-                except Exception:
-                    logger.exception("Failed to restore user from JSON: %s", key)
-                    continue
-
-                # Если created_at не было — ставим что-то адекватное
-                if not rec.created_at:
-                    rec.created_at = now
-                if not rec.updated_at:
-                    rec.updated_at = now
-
-                self._upsert_user(rec, commit=False)
-
-            self._conn.commit()
-            logger.info("Migration from JSON completed successfully")
-
-        except Exception as e:
-            logger.exception("Migration from JSON failed: %s", e)
-
-    # ------------------------------------------------------------------
-    # Внутренние вспомогательные методы
-    # ------------------------------------------------------------------
-    def _ensure_ref_code(self, rec: UserRecord) -> None:
-        if not rec.ref_code:
-            # Простая, но устойчивая схема
-            rec.ref_code = f"u{rec.id}"
-
-    def _refresh_plan_from_premium(self, rec: UserRecord) -> None:
-        if rec.plan_type == "premium" and rec.premium_until is not None:
-            if time.time() > rec.premium_until:
-                rec.plan_type = "basic"
-
-    def _refresh_limits_dates(self, rec: UserRecord) -> None:
-        now = time.localtime()
-        day_key = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
-        month_key = f"{now.tm_year:04d}-{now.tm_mon:02d}"
-
-        if rec.last_daily_reset != day_key:
-            rec.daily_used = 0
-            rec.last_daily_reset = day_key
-
-        if rec.last_monthly_reset != month_key:
-            rec.monthly_used = 0
-            rec.last_monthly_reset = month_key
-
-    def _upsert_user(self, rec: UserRecord, commit: bool = True) -> None:
-        self._ensure_ref_code(rec)
-        self._refresh_plan_from_premium(rec)
-        self._refresh_limits_dates(rec)
-        rec.updated_at = time.time()
-
+    def _fetch_user_row(self, user_id: int) -> Optional[sqlite3.Row]:
         cur = self._conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        return cur.fetchone()
+
+    def _upsert_user(self, user: UserRecord) -> None:
+        cur = self._conn.cursor()
+        now_ts = self._now_ts()
+
+        if not user.created_at:
+            user.created_at = now_ts
+        user.updated_at = now_ts
+
         cur.execute(
             """
             INSERT INTO users (
-                id, username, first_name, last_name,
-                mode_key,
-                plan_type, premium_until,
-                daily_used, monthly_used, last_daily_reset, last_monthly_reset,
+                id,
+                username, first_name, last_name, is_bot,
+                mode_key, plan_code,
+                premium_until,
+                daily_used, monthly_used,
                 total_requests, total_tokens,
-                ref_code, referred_by, referrals_count,
+                daily_date, monthly_month,
+                ref_code, referrals_count, referrer_user_id,
                 last_invoice_id, last_tariff_key,
                 style_hint,
+                last_summary_date,
                 created_at, updated_at
             )
             VALUES (
-                :id, :username, :first_name, :last_name,
-                :mode_key,
-                :plan_type, :premium_until,
-                :daily_used, :monthly_used, :last_daily_reset, :last_monthly_reset,
+                :id,
+                :username, :first_name, :last_name, :is_bot,
+                :mode_key, :plan_code,
+                :premium_until,
+                :daily_used, :monthly_used,
                 :total_requests, :total_tokens,
-                :ref_code, :referred_by, :referrals_count,
+                :daily_date, :monthly_month,
+                :ref_code, :referrals_count, :referrer_user_id,
                 :last_invoice_id, :last_tariff_key,
                 :style_hint,
+                :last_summary_date,
                 :created_at, :updated_at
             )
             ON CONFLICT(id) DO UPDATE SET
-                username          = excluded.username,
-                first_name        = excluded.first_name,
-                last_name         = excluded.last_name,
-                mode_key          = excluded.mode_key,
-                plan_type         = excluded.plan_type,
-                premium_until     = excluded.premium_until,
-                daily_used        = excluded.daily_used,
-                monthly_used      = excluded.monthly_used,
-                last_daily_reset  = excluded.last_daily_reset,
-                last_monthly_reset= excluded.last_monthly_reset,
-                total_requests    = excluded.total_requests,
-                total_tokens      = excluded.total_tokens,
-                ref_code          = excluded.ref_code,
-                referred_by       = excluded.referred_by,
-                referrals_count   = excluded.referrals_count,
-                last_invoice_id   = excluded.last_invoice_id,
-                last_tariff_key   = excluded.last_tariff_key,
-                style_hint        = excluded.style_hint,
-                created_at        = users.created_at,
-                updated_at        = excluded.updated_at
+                username         = excluded.username,
+                first_name       = excluded.first_name,
+                last_name        = excluded.last_name,
+                is_bot           = excluded.is_bot,
+                mode_key         = excluded.mode_key,
+                plan_code        = excluded.plan_code,
+                premium_until    = excluded.premium_until,
+                daily_used       = excluded.daily_used,
+                monthly_used     = excluded.monthly_used,
+                total_requests   = excluded.total_requests,
+                total_tokens     = excluded.total_tokens,
+                daily_date       = excluded.daily_date,
+                monthly_month    = excluded.monthly_month,
+                ref_code         = excluded.ref_code,
+                referrals_count  = excluded.referrals_count,
+                referrer_user_id = excluded.referrer_user_id,
+                last_invoice_id  = excluded.last_invoice_id,
+                last_tariff_key  = excluded.last_tariff_key,
+                style_hint       = excluded.style_hint,
+                last_summary_date = excluded.last_summary_date,
+                updated_at       = excluded.updated_at
             """,
-            rec.to_dict(),
+            {
+                "id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "is_bot": int(user.is_bot),
+                "mode_key": user.mode_key,
+                "plan_code": user.plan_code,
+                "premium_until": user.premium_until,
+                "daily_used": user.daily_used,
+                "monthly_used": user.monthly_used,
+                "total_requests": user.total_requests,
+                "total_tokens": user.total_tokens,
+                "daily_date": user.daily_date,
+                "monthly_month": user.monthly_month,
+                "ref_code": user.ref_code,
+                "referrals_count": user.referrals_count,
+                "referrer_user_id": user.referrer_user_id,
+                "last_invoice_id": user.last_invoice_id,
+                "last_tariff_key": user.last_tariff_key,
+                "style_hint": user.style_hint,
+                "last_summary_date": user.last_summary_date,
+                "created_at": user.created_at,
+                "updated_at": user.updated_at,
+            },
         )
-        if commit:
-            self._conn.commit()
+        self._conn.commit()
 
-    # ------------------------------------------------------------------
-    # Публичный API — максимально совместим с твоей текущей логикой
-    # ------------------------------------------------------------------
-    def get_or_create_user(
-        self, user_id: int, tg_user: Optional[TgUser] = None
-    ) -> Tuple[UserRecord, bool]:
-        cur = self._conn.cursor()
-        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        row = cur.fetchone()
+    # --------------- Публичный API ---------------
 
+    def get_or_create_user(self, user_id: int, tg_user) -> Tuple[UserRecord, bool]:
+        """
+        Возвращает (UserRecord, created)
+        tg_user — объект aiogram.types.User (или любой с теми же полями).
+        """
+        row = self._fetch_user_row(user_id)
         created = False
-        if row is not None:
-            rec = UserRecord.from_row(row)
+        if row:
+            user = UserRecord.from_row(row)
         else:
-            rec = UserRecord(id=user_id)
             created = True
+            user = UserRecord(
+                id=user_id,
+                username=getattr(tg_user, "username", None),
+                first_name=getattr(tg_user, "first_name", None),
+                last_name=getattr(tg_user, "last_name", None),
+                is_bot=bool(getattr(tg_user, "is_bot", False)),
+                mode_key="universal",
+                plan_code="free",
+            )
+            # ref_code генерируем сразу
+            user.ref_code = self._generate_ref_code(user_id)
+            self._upsert_user(user)
 
-        # Обновляем базовые поля из Telegram-профиля
-        if tg_user:
-            rec.username = tg_user.username
-            rec.first_name = tg_user.first_name
-            rec.last_name = tg_user.last_name
+        # сброс дневных/месячных лимитов, если нужна дата/месяц
+        today = self._today_key()
+        month = self._month_key()
+        changed = False
 
-        self._upsert_user(rec)  # обновит ref_code, лимиты и т.д.
-        return rec, created
+        if user.daily_date != today:
+            user.daily_date = today
+            user.daily_used = 0
+            changed = True
 
-    def save_user(self, rec: UserRecord) -> None:
-        self._upsert_user(rec)
+        if user.monthly_month != month:
+            user.monthly_month = month
+            user.monthly_used = 0
+            changed = True
 
-    def set_mode(self, user_id: int, mode_key: str) -> None:
-        cur = self._conn.cursor()
-        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        row = cur.fetchone()
+        if changed:
+            self._upsert_user(user)
 
-        if row is not None:
-            rec = UserRecord.from_row(row)
-        else:
-            rec = UserRecord(id=user_id)
+        return user, created
 
-        rec.mode_key = mode_key
-        self._upsert_user(rec)
+    def save_user(self, user: UserRecord) -> None:
+        self._upsert_user(user)
 
-    def apply_usage(self, rec: UserRecord, tokens: int) -> None:
-        rec.total_requests += 1
-        rec.total_tokens += max(0, tokens)
-        rec.daily_used += 1
-        rec.monthly_used += 1
-        self._upsert_user(rec)
+    # --- лимиты и план ---
 
-    def is_admin(self, user_id: int) -> bool:
-        return user_id in ADMIN_IDS
-
-    def effective_plan(self, rec: UserRecord, is_admin: bool) -> str:
+    def effective_plan(self, user: UserRecord, is_admin: bool) -> str:
+        """
+        Возвращает фактический код плана:
+        - 'admin'  если is_admin True
+        - 'premium' если premium_until >= сегодня
+        - иначе 'free'
+        """
         if is_admin:
             return "admin"
-        self._refresh_plan_from_premium(rec)
-        return rec.plan_type or "basic"
 
-    def apply_referral(self, new_user_id: int, ref_code: str) -> None:
-        """
-        Логика та же, но через SQLite + отдельная таблица referrals.
-        """
-        cur = self._conn.cursor()
+        if user.premium_until:
+            # premium_until в формате YYYY-MM-DD
+            try:
+                today = self._today_key()
+                if user.premium_until >= today:
+                    return "premium"
+            except Exception:
+                logger.debug("Invalid premium_until value: %r", user.premium_until)
 
-        # Находим владельца рефкода
-        cur.execute("SELECT * FROM users WHERE ref_code = ?", (ref_code,))
-        owner_row = cur.fetchone()
-        if owner_row is None:
+        # fallback — план из поля, либо free
+        return user.plan_code or "free"
+
+    def apply_usage(self, user: UserRecord, tokens_used: int) -> None:
+        """
+        Обновляет счётчики использования.
+        """
+        user.total_requests += 1
+        user.total_tokens += int(tokens_used or 0)
+
+        # гарантируем актуальные дата/месяц
+        today = self._today_key()
+        month = self._month_key()
+        if user.daily_date != today:
+            user.daily_date = today
+            user.daily_used = 0
+        if user.monthly_month != month:
+            user.monthly_month = month
+            user.monthly_used = 0
+
+        user.daily_used += 1
+        user.monthly_used += 1
+
+        self._upsert_user(user)
+
+    # --- режимы ---
+
+    def set_mode(self, user_id: int, mode_key: str) -> None:
+        row = self._fetch_user_row(user_id)
+        if not row:
             return
+        user = UserRecord.from_row(row)
+        user.mode_key = mode_key
+        self._upsert_user(user)
 
-        owner_rec = UserRecord.from_row(owner_row)
-        owner_rec.referrals_count += 1
-        self._upsert_user(owner_rec, commit=False)
+    # --- логирование сообщений ---
 
-        # Новый пользователь
-        new_rec, _ = self.get_or_create_user(new_user_id)
-        if not new_rec.referred_by:
-            new_rec.referred_by = ref_code
-        self._upsert_user(new_rec, commit=False)
-
-        # Лог в таблицу referrals
-        now = time.time()
-        cur.execute(
-            """
-            INSERT INTO referrals (owner_id, referred_user_id, ref_code, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (owner_rec.id, new_rec.id, ref_code, now),
-        )
-
-        self._conn.commit()
-
-    def store_invoice(self, rec: UserRecord, invoice_id: int, tariff_key: str) -> None:
-        """
-        Сохраняем последний инвойс пользователя + логируем в payments.
-        """
-        rec.last_invoice_id = invoice_id
-        rec.last_tariff_key = tariff_key
-        self._upsert_user(rec, commit=False)
-
-        # Лог в payments (status по умолчанию pending)
-        now = time.time()
-        cur = self._conn.cursor()
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO payments (
-                user_id, invoice_id, tariff_key, status, created_at
-            )
-            VALUES (?, ?, ?, 'pending', ?)
-            """,
-            (rec.id, invoice_id, tariff_key, now),
-        )
-        self._conn.commit()
-
-    def get_last_invoice(self, rec: UserRecord) -> Tuple[Optional[int], Optional[str]]:
-        return rec.last_invoice_id, rec.last_tariff_key
-
-    def activate_premium(self, rec: UserRecord, months: int) -> None:
-        now = time.time()
-        base = rec.premium_until if rec.premium_until and rec.premium_until > now else now
-        # грубо считаем месяц как 30 дней
-        rec.premium_until = base + 30 * 24 * 3600 * months
-        rec.plan_type = "premium"
-        self._upsert_user(rec, commit=False)
-
-        # Если есть последний инвойс — помечаем его как оплаченный
-        if rec.last_invoice_id is not None:
-            cur = self._conn.cursor()
-            cur.execute(
-                """
-                UPDATE payments
-                SET status = 'paid', paid_at = ?
-                WHERE invoice_id = ?
-                """,
-                (time.time(), rec.last_invoice_id),
-            )
-
-        self._conn.commit()
-
-    # ------------------------------------------------------------------
-    # Доп. методы под будущее (messages / summaries) — пока просто база
-    # ------------------------------------------------------------------
     def log_message(self, user_id: int, role: str, content: str) -> None:
-        """Записать сообщение в историю (для аналитики/памяти)."""
         cur = self._conn.cursor()
         cur.execute(
             """
             INSERT INTO messages (user_id, role, content, created_at)
             VALUES (?, ?, ?, ?)
             """,
-            (user_id, role, content, time.time()),
+            (user_id, role, content, self._now_ts()),
         )
         self._conn.commit()
 
+    # --- дневной дневник / summary ---
+
     def add_daily_summary(self, user_id: int, date_str: str, summary: str) -> None:
-        """Сохранить/обновить дневной summary (под отчёты)."""
         cur = self._conn.cursor()
         cur.execute(
             """
@@ -579,6 +430,132 @@ class Storage:
                 summary = excluded.summary,
                 created_at = excluded.created_at
             """,
-            (user_id, date_str, summary, time.time()),
+            (user_id, date_str, summary, self._now_ts()),
         )
         self._conn.commit()
+
+    def get_daily_summary(self, user_id: int, date_str: str) -> Optional[str]:
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT summary
+            FROM daily_summaries
+            WHERE user_id = ? AND date = ?
+            """,
+            (user_id, date_str),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row["summary"]
+
+    def get_messages_for_date(self, user_id: int, date_str: str) -> List[str]:
+        # date_str: YYYY-MM-DD
+        # считаем границы дня в timestamp
+        try:
+            import datetime as _dt
+
+            dt_start = _dt.datetime.strptime(date_str, "%Y-%m-%d")
+            dt_end = dt_start + _dt.timedelta(days=1)
+            start_ts = dt_start.timestamp()
+            end_ts = dt_end.timestamp()
+        except Exception:
+            # если вдруг формат странный — просто ничего не вернём
+            return []
+
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT content
+            FROM messages
+            WHERE user_id = ?
+              AND created_at >= ?
+              AND created_at < ?
+              AND role = 'user'
+            ORDER BY created_at ASC
+            """,
+            (user_id, start_ts, end_ts),
+        )
+        rows = cur.fetchall()
+        return [r["content"] for r in rows]
+
+    # --- рефералка ---
+
+    def apply_referral(self, new_user_id: int, ref_code: str) -> None:
+        """
+        Привязать нового пользователя к реф-коду, если такой есть.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT * FROM users WHERE ref_code = ?",
+            (ref_code,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+
+        referrer_id = row["id"]
+        if referrer_id == new_user_id:
+            return
+
+        # обновляем счётчик у реферера
+        referrer = UserRecord.from_row(row)
+        referrer.referrals_count += 1
+        self._upsert_user(referrer)
+
+        # и сохраняем referrer_user_id у нового пользователя, если он уже есть
+        row_new = self._fetch_user_row(new_user_id)
+        if row_new:
+            new_user = UserRecord.from_row(row_new)
+            if not new_user.referrer_user_id:
+                new_user.referrer_user_id = referrer_id
+                self._upsert_user(new_user)
+
+    # --- подписка и оплаты ---
+
+    def store_invoice(self, user: UserRecord, invoice_id: int, tariff_key: str) -> None:
+        user.last_invoice_id = int(invoice_id)
+        user.last_tariff_key = tariff_key
+        self._upsert_user(user)
+
+    def get_last_invoice(self, user: UserRecord) -> Tuple[Optional[int], Optional[str]]:
+        return user.last_invoice_id, user.last_tariff_key
+
+    def activate_premium(self, user: UserRecord, months: int) -> None:
+        """
+        Активирует/продлевает premium на N месяцев.
+        premium_until — YYYY-MM-DD
+        """
+        import datetime as _dt
+
+        today = _dt.date.today()
+        if user.premium_until:
+            try:
+                current = _dt.datetime.strptime(user.premium_until, "%Y-%m-%d").date()
+            except Exception:
+                current = today
+        else:
+            current = today
+
+        base = max(today, current)
+        # грубо: месяц = 30 дней, чтобы не тащить relativedelta
+        new_date = base + _dt.timedelta(days=30 * max(1, months))
+        user.premium_until = new_date.strftime("%Y-%m-%d")
+        user.plan_code = "premium"
+        self._upsert_user(user)
+
+    # --- админы ---
+
+    def is_admin(self, user_id: int) -> bool:
+        """
+        Проверка админов через переменную окружения ADMIN_USER_IDS="1,2,3".
+        Чтобы не тащить config и не создавать циклических импортов.
+        """
+        raw = os.getenv("ADMIN_USER_IDS", "")
+        if not raw:
+            return False
+        try:
+            ids = {int(x.strip()) for x in raw.split(",") if x.strip()}
+        except ValueError:
+            return False
+        return user_id in ids
