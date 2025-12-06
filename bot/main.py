@@ -2,442 +2,452 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.default import DefaultBotProperties
-
-from bot.config import (
-    BOT_TOKEN,
-    ASSISTANT_MODES,
-    DEFAULT_MODE_KEY,
-    FREE_DAILY_LIMIT,
-    FREE_MONTHLY_LIMIT,
-    PREMIUM_DAILY_LIMIT,
-    PREMIUM_MONTHLY_LIMIT,
-    MAX_INPUT_TOKENS,
-    SUBSCRIPTION_TARIFFS,
-    REF_BASE_URL,
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
-from services.llm import ask_llm_stream
-from services.storage import Storage, UserRecord
-from services.payments import create_cryptobot_invoice, get_invoice_status
-from services import texts as txt  # ВАЖНО: services.texts, а не bot.text
 
-logger = logging.getLogger(__name__)
+from bot import config as bot_config
+from services.llm import Answer, generate_answer, DEFAULT_MODE_KEY
+
+# ==============================
+#   Логирование
+# ==============================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
-# --- Текст кнопок таскбара / режимов / подписки ---
+# ==============================
+#   Сессии пользователя и история
+# ==============================
 
-BTN_MODES = "🧠 Режимы"
-BTN_PROFILE = "👤 Профиль"
-BTN_SUBSCRIPTION = "💎 Подписка"
-BTN_REFERRALS = "👥 Рефералы"
 
-BTN_MODE_UNIVERSAL = "🧠 Универсальный"
-BTN_MODE_MEDICINE = "🩺 Медицина"
-BTN_MODE_COACH = "🔥 Наставник"
-BTN_MODE_BUSINESS = "💼 Бизнес"
-BTN_MODE_CREATIVE = "🎨 Креатив"
+@dataclass
+class UserSession:
+    user_id: int
+    active_mode: str = DEFAULT_MODE_KEY
+    history: List[Dict[str, str]] = field(default_factory=list)
 
-BTN_BACK_MAIN = "⬅️ Назад"
 
-BTN_SUB_1M = "💎 Premium · 1 месяц"
-BTN_SUB_3M = "💎 Premium · 3 месяца"
-BTN_SUB_12M = "💎 Premium · 12 месяцев"
-BTN_SUB_CHECK = "🔁 Проверить оплату"
+USER_SESSIONS: Dict[int, UserSession] = {}
 
-# --- Разметка клавиатур ---
+# Последний ответ для "✏️ Продолжить"
+LAST_ANSWERS: Dict[int, Answer] = {}
+# Запросы на "🔍 Раскрыть подробнее"
+EXPAND_REQUESTS: Dict[int, Dict[str, Any]] = {}
 
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_MODES), KeyboardButton(text=BTN_PROFILE)],
-        [KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_REFERRALS)],
-    ],
-    resize_keyboard=True,
-)
 
-MODES_KB = ReplyKeyboardMarkup(
-    keyboard=[
+def get_session(user_id: int) -> UserSession:
+    session = USER_SESSIONS.get(user_id)
+    if session is None:
+        session = UserSession(user_id=user_id, active_mode=DEFAULT_MODE_KEY)
+        USER_SESSIONS[user_id] = session
+    return session
+
+
+def update_history(
+    session: UserSession,
+    user_prompt: str,
+    assistant_text: str,
+    max_turns: int = 8,
+) -> None:
+    """Добавляем в историю пользователю пару user/assistant и подрезаем до последних N оборотов."""
+    session.history.append({"role": "user", "content": user_prompt})
+    session.history.append({"role": "assistant", "content": assistant_text})
+
+    max_len = max_turns * 2
+    if len(session.history) > max_len:
+        session.history = session.history[-max_len:]
+
+
+# ==============================
+#   Клавиатуры (таскбар)
+# ==============================
+
+
+def build_main_menu_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
         [
-            KeyboardButton(text=BTN_MODE_UNIVERSAL),
-            KeyboardButton(text=BTN_MODE_MEDICINE),
+            InlineKeyboardButton(text="🧠 Режимы", callback_data="menu:modes"),
+            InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
         ],
         [
-            KeyboardButton(text=BTN_MODE_COACH),
-            KeyboardButton(text=BTN_MODE_BUSINESS),
+            InlineKeyboardButton(text="💎 Подписка", callback_data="menu:subscription"),
+            InlineKeyboardButton(text="👥 Рефералы", callback_data="menu:referrals"),
         ],
-        [KeyboardButton(text=BTN_MODE_CREATIVE)],
-        [KeyboardButton(text=BTN_BACK_MAIN)],
-    ],
-    resize_keyboard=True,
-)
-
-SUB_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_SUB_1M)],
-        [KeyboardButton(text=BTN_SUB_3M)],
-        [KeyboardButton(text=BTN_SUB_12M)],
-        [KeyboardButton(text=BTN_SUB_CHECK)],
-        [KeyboardButton(text=BTN_BACK_MAIN)],
-    ],
-    resize_keyboard=True,
-)
-
-REF_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_BACK_MAIN)],
-    ],
-    resize_keyboard=True,
-)
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
-)
-dp = Dispatcher()
-router = Router()
-storage = Storage()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# --- Вспомогательные функции ---
+def build_modes_keyboard(active_mode: str) -> InlineKeyboardMarkup:
+    def mode_button(label: str, key: str) -> InlineKeyboardButton:
+        prefix = "✅ " if key == active_mode else ""
+        return InlineKeyboardButton(text=prefix + label, callback_data=f"mode:{key}")
 
-def _plan_title(plan_code: str, is_admin: bool) -> str:
-    if is_admin or plan_code == "admin":
-        return "Admin"
-    if plan_code == "premium":
-        return "Premium"
-    return "Базовый"
+    rows = [
+        [
+            mode_button("🧠 Универсальный", "universal"),
+            mode_button("🩺 Медицина", "medical"),
+        ],
+        [
+            mode_button("🔥 Наставник", "mentor"),
+            mode_button("💼 Бизнес", "business"),
+        ],
+        [
+            mode_button("🎨 Креатив", "creative"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:root"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _mode_title(mode_key: str) -> str:
-    cfg: Dict[str, Any] = ASSISTANT_MODES.get(mode_key) or ASSISTANT_MODES[DEFAULT_MODE_KEY]
-    return cfg["title"]
+# ==============================
+#   Живое печатание 2.0
+# ==============================
 
 
-def _estimate_prompt_tokens(text: str) -> int:
-    # Грубая оценка: 1 токен ~ 4 символа
-    return max(1, len(text) // 4)
+async def stream_answer(
+    message: Message,
+    mode_key: str,
+    user_text: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    style_hint: Optional[str] = None,
+    force_mode: Optional[str] = None,  # "quick" | "deep"
+    edit_message: Optional[Message] = None,
+) -> Answer:
+    """
+    Рендерит ответ с "живым печатанием" и возвращает Answer (для истории).
 
+    - Если edit_message не задан → создаёт новое сообщение "…" и редактирует его.
+    - Если передан edit_message (например, из callback) → перезаписывает его содержимое.
+    """
+    chat_id = message.chat.id
 
-def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[str]:
-    """Проверка лимитов по тарифу. Возвращает причину блокировки или None."""
-    if is_admin or plan_code == "admin":
-        return None
-
-    if plan_code == "premium":
-        daily_max = PREMIUM_DAILY_LIMIT
-        monthly_max = PREMIUM_MONTHLY_LIMIT
+    if edit_message is None:
+        msg = await message.answer("…")
     else:
-        daily_max = FREE_DAILY_LIMIT
-        monthly_max = FREE_MONTHLY_LIMIT
+        msg = edit_message
 
-    if user.daily_used >= daily_max:
-        return "Достигнут дневной лимит запросов для текущего тарифа."
+    msg_id = msg.message_id
 
-    if user.monthly_used >= monthly_max:
-        return "Достигнут месячный лимит запросов для текущего тарифа."
+    # Вызываем LLM-ядро
+    answer = await generate_answer(
+        mode_key=mode_key,
+        user_prompt=user_text,
+        history=history,
+        style_hint=style_hint,
+        force_mode=force_mode,
+    )
 
-    return None
+    # Сохраняем последний ответ для "✏️ Продолжить"
+    LAST_ANSWERS[chat_id] = answer
+
+    text_acc = ""
+    keyboard: Optional[InlineKeyboardMarkup] = None
+
+    for idx, ch in enumerate(answer.chunks):
+        sep = "\n\n" if text_acc else ""
+        text_acc += sep + ch.text
+
+        text_to_show = text_acc
+        keyboard = None
+        is_last = idx == len(answer.chunks) - 1
+
+        if is_last:
+            buttons = []
+
+            # Короткий ответ → можно раскрыть
+            if answer.meta.get("can_expand") and answer.meta.get("answer_mode") == "quick":
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="🔍 Раскрыть подробнее",
+                            callback_data="expand_answer",
+                        )
+                    ]
+                )
+                EXPAND_REQUESTS[chat_id] = {
+                    "mode_key": mode_key,
+                    "user_text": user_text,
+                    "style_hint": style_hint,
+                }
+
+            # Ответ обрезан по длине → добавляем текстовый триггер
+            if answer.has_more:
+                text_to_show = text_acc + "\n\n✏️ Продолжить"
+
+            if buttons:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text_to_show,
+                reply_markup=keyboard,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to edit message: %s", e)
+
+        await asyncio.sleep(0.03 if answer.meta.get("answer_mode") == "quick" else 0.06)
+
+    # На всякий случай, если чанков нет
+    if not answer.chunks:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=answer.full_text or "Что-то пошло не так, попробуй ещё раз.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to edit message (empty answer): %s", e)
+
+    return answer
 
 
-async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
-    """
-    Реальное «живое» печатание:
-    - сначала отправляем заглушку «Думаю…»
-    - затем постепенно редактируем одно сообщение по мере прихода чанков от LLM
-    """
-    typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
+# ==============================
+#   Router и хендлеры
+# ==============================
 
-    style_hint = user.style_hint or ""
-    try:
-        last_chunk: Dict[str, Any] | None = None
+router = Router()
 
-        async for chunk in ask_llm_stream(
-            mode_key=user.mode_key or DEFAULT_MODE_KEY,
-            user_prompt=text,
-            style_hint=style_hint,
-        ):
-            last_chunk = chunk
-            full = chunk["full"]
-
-            # защита от переполнения Телеграма
-            if len(full) > 4000:
-                full = full[:3990] + "…"
-
-            try:
-                await typing_msg.edit_text(full)
-            except Exception as e:
-                logger.debug("Failed to edit message while streaming: %s", e)
-                break
-
-        tokens = last_chunk.get("tokens", 0) if last_chunk else 0
-        storage.apply_usage(user, tokens)
-
-    except Exception as e:
-        logger.exception("LLM error: %s", e)
-        await typing_msg.edit_text(txt.render_generic_error())
-
-
-def _tariff_key_by_button(button_text: str) -> Optional[str]:
-    """Маппинг текста кнопки → tariff_key из SUBSCRIPTION_TARIFFS."""
-    mapping = {
-        BTN_SUB_1M: "month_1",
-        BTN_SUB_3M: "month_3",
-        BTN_SUB_12M: "month_12",
-    }
-    return mapping.get(button_text)
-
-
-# --- Хендлеры ---
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def on_start(message: Message) -> None:
     user_id = message.from_user.id
-    full_text = message.text or ""
-    parts = full_text.split(maxsplit=1)
-    start_param = parts[1].strip() if len(parts) > 1 else ""
+    session = get_session(user_id)
+    session.active_mode = DEFAULT_MODE_KEY
+    session.history.clear()
 
-    user, created = storage.get_or_create_user(user_id, message.from_user)
-
-    # Реферальный старт
-    if start_param.startswith("ref_") and created:
-        ref_code = start_param.replace("ref_", "", 1)
-        storage.apply_referral(user_id, ref_code)
-        user, _ = storage.get_or_create_user(user_id, message.from_user)
-
-    is_admin = storage.is_admin(user_id)
-    plan_code = storage.effective_plan(user, is_admin)
-    plan_title = _plan_title(plan_code, is_admin)
-    mode_title = _mode_title(user.mode_key)
-
-    text_body = txt.render_onboarding(
-        first_name=message.from_user.first_name,
-        is_new=created,
-        plan_title=plan_title,
-        mode_title=mode_title,
+    text = (
+        "Привет! Я BlackBox GPT — твой универсальный ИИ-ассистент.\n\n"
+        "Минимализм, максимум мозга. Пиши любой запрос — от медицины до бизнеса и "
+        "личного развития.\n\n"
+        "Выбери режим в нижнем меню или просто задай вопрос."
     )
-
-    await message.answer(text_body, reply_markup=MAIN_KB)
-
-    logger.info(
-        "User %s started bot (created=%s, plan=%s, mode=%s)",
-        user_id,
-        created,
-        plan_code,
-        user.mode_key,
-    )
+    await message.answer(text, reply_markup=build_main_menu_keyboard())
 
 
-@router.message(F.text == BTN_BACK_MAIN)
-async def on_back_main(message: Message) -> None:
-    await message.answer("Возвращаю на главный экран.", reply_markup=MAIN_KB)
-
-
-@router.message(F.text == BTN_PROFILE)
-async def on_profile(message: Message) -> None:
-    user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
-
-    is_admin = storage.is_admin(user_id)
-    plan_code = storage.effective_plan(user, is_admin)
-    plan_title = _plan_title(plan_code, is_admin)
-
-    text_body = txt.render_profile(
-        plan_code=plan_code,
-        plan_title=plan_title,
-        is_admin=is_admin,
-        daily_used=user.daily_used,
-        monthly_used=user.monthly_used,
-        premium_until=user.premium_until,
-        total_requests=user.total_requests,
-        total_tokens=user.total_tokens,
-        ref_code=user.ref_code,
-    )
-
-    await message.answer(text_body, reply_markup=MAIN_KB)
-
-
-@router.message(F.text.contains("Режимы"))
-async def on_modes_root(message: Message) -> None:
-    """
-    Открывает экран выбора режимов.
-    Фильтр по подстроке — чтобы сработало даже если в кнопке есть эмодзи
-    или лишние пробелы.
-    """
-    text_body = txt.render_modes_root()
-    await message.answer(text_body, reply_markup=MODES_KB)
-
-
-@router.message(
-    F.text.in_(
-        {
-            BTN_MODE_UNIVERSAL,
-            BTN_MODE_MEDICINE,
-            BTN_MODE_COACH,
-            BTN_MODE_BUSINESS,
-            BTN_MODE_CREATIVE,
-        }
-    )
-)
-async def on_mode_select(message: Message) -> None:
-    user_id = message.from_user.id
-
-    mapping = {
-        BTN_MODE_UNIVERSAL: "universal",
-        BTN_MODE_MEDICINE: "medicine",
-        BTN_MODE_COACH: "coach",
-        BTN_MODE_BUSINESS: "business",
-        BTN_MODE_CREATIVE: "creative",
-    }
-
-    mode_key = mapping.get(message.text, DEFAULT_MODE_KEY)
-    storage.set_mode(user_id, mode_key)
-
-    mode_title = _mode_title(mode_key)
-    await message.answer(txt.render_mode_switched(mode_title), reply_markup=MAIN_KB)
-
-
-@router.message(F.text == BTN_SUBSCRIPTION)
-async def on_subscription(message: Message) -> None:
-    user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
-
-    is_admin = storage.is_admin(user_id)
-    plan_code = storage.effective_plan(user, is_admin)
-    plan_title = _plan_title(plan_code, is_admin)
-
-    text_body = txt.render_subscription_overview(
-        plan_title,
-        user.premium_until,
-    )
-    await message.answer(text_body, reply_markup=SUB_KB)
-
-
-@router.message(F.text.in_({BTN_SUB_1M, BTN_SUB_3M, BTN_SUB_12M}))
-async def on_subscription_buy(message: Message) -> None:
-    user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
-
-    tariff_key = _tariff_key_by_button(message.text)
-    if not tariff_key:
+@router.callback_query(F.data.startswith("menu:"))
+async def on_menu_callback(cb: CallbackQuery) -> None:
+    if cb.message is None:
+        await cb.answer()
         return
 
-    tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
-    if not tariff:
-        await message.answer(txt.render_payment_error(), reply_markup=SUB_KB)
-        return
+    data = cb.data or ""
+    chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
+    session = get_session(user_id)
 
-    invoice = await create_cryptobot_invoice(tariff_key)
-    if not invoice:
-        await message.answer(txt.render_payment_error(), reply_markup=SUB_KB)
-        return
-
-    invoice_id = invoice["invoice_id"]
-    invoice_url = invoice["bot_invoice_url"]
-
-    storage.store_invoice(user, invoice_id=invoice_id, tariff_key=tariff_key)
-
-    text_body = txt.render_payment_link(
-        tariff_title=tariff["title"],
-        amount=tariff["price_usdt"],
-        invoice_url=invoice_url,
-    )
-    await message.answer(text_body, reply_markup=SUB_KB)
-
-
-@router.message(F.text == BTN_SUB_CHECK)
-async def on_subscription_check(message: Message) -> None:
-    user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
-
-    invoice_id, tariff_key = storage.get_last_invoice(user)
-    if not invoice_id or not tariff_key:
-        await message.answer(
-            txt.render_payment_check_result("not_found"),
-            reply_markup=SUB_KB,
+    if data == "menu:root":
+        await cb.answer()
+        await cb.message.edit_text(
+            "Главное меню. Выбери, что дальше:",
+            reply_markup=build_main_menu_keyboard(),
         )
         return
 
-    status = await get_invoice_status(invoice_id)
-    if not status:
-        await message.answer(
-            txt.render_payment_check_result("not_found"),
-            reply_markup=SUB_KB,
+    if data == "menu:modes":
+        await cb.answer()
+        await cb.message.edit_text(
+            "Выбери режим работы ассистента:",
+            reply_markup=build_modes_keyboard(session.active_mode),
         )
         return
 
-    if status == "paid":
-        tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
-        months = int(tariff.get("months", 1)) if tariff else 1
-        storage.activate_premium(user, months)
+    if data == "menu:profile":
+        await cb.answer("Профиль скоро прокачаем ещё сильнее ⚙️", show_alert=False)
+        await cb.message.edit_text(
+            "Профиль пользователя.\n"
+            f"Текущий режим: <b>{session.active_mode}</b>\n\n"
+            "Здесь в будущем будут храниться твои предпочтения и настройки.",
+            reply_markup=build_main_menu_keyboard(),
+            parse_mode="HTML",
+        )
+        return
 
-    text_body = txt.render_payment_check_result(status)
-    await message.answer(text_body, reply_markup=SUB_KB)
+    if data == "menu:subscription":
+        await cb.answer("Подписка в разработке 💎", show_alert=False)
+        await cb.message.edit_text(
+            "Подписка BlackBox GPT.\n\n"
+            "В будущем здесь появится Premium-доступ к более мощным моделям, "
+            "расширенная память и дополнительные режимы.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    if data == "menu:referrals":
+        await cb.answer("Реферальная система появится позже 👥", show_alert=False)
+        await cb.message.edit_text(
+            "Реферальная программа скоро появится.\n\n"
+            "Ты сможешь приглашать людей и получать бонусы.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    await cb.answer()
+    logger.info("Unknown menu callback from chat %s: %s", chat_id, data)
 
 
-@router.message(F.text == BTN_REFERRALS)
-async def on_referrals(message: Message) -> None:
+@router.callback_query(F.data.startswith("mode:"))
+async def on_mode_change(cb: CallbackQuery) -> None:
+    if cb.message is None:
+        await cb.answer()
+        return
+
+    data = cb.data or ""
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        await cb.answer()
+        return
+
+    mode_key = parts[1]
+    user_id = cb.from_user.id
+    session = get_session(user_id)
+    session.active_mode = mode_key
+
+    await cb.answer("Режим обновлён ✅", show_alert=False)
+
+    await cb.message.edit_text(
+        "Режим обновлён.\n\n"
+        "🧠 Сейчас ты в режиме: "
+        f"<b>{mode_key}</b>\n\n"
+        "Можешь сразу писать запрос или выбрать другой режим.",
+        reply_markup=build_modes_keyboard(session.active_mode),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "expand_answer")
+async def on_expand_answer(cb: CallbackQuery) -> None:
+    message = cb.message
+    if message is None:
+        await cb.answer()
+        return
+
+    chat_id = message.chat.id
+    user_id = cb.from_user.id
+    session = get_session(user_id)
+
+    params = EXPAND_REQUESTS.get(chat_id)
+    if not params:
+        await cb.answer("Не нашёл, что раскрывать 🙃", show_alert=False)
+        return
+
+    await cb.answer()
+
+    mode_key = params.get("mode_key", session.active_mode)
+    user_text = params.get("user_text", "")
+    style_hint = params.get("style_hint")
+
+    # Глубокий разбор того же запроса, в том же контексте
+    answer = await stream_answer(
+        message=message,
+        mode_key=mode_key,
+        user_text=user_text,
+        history=session.history,
+        style_hint=style_hint,
+        force_mode="deep",
+        edit_message=message,
+    )
+
+    assistant_text = answer.meta.get("full_text") or answer.full_text
+    update_history(
+        session,
+        user_prompt="Раскрой подробнее предыдущий ответ.",
+        assistant_text=assistant_text,
+    )
+
+
+@router.message(F.text.regexp(r"(?i)^\s*продолж(и|ить)\s*$"))
+async def on_continue_request(message: Message) -> None:
+    chat_id = message.chat.id
     user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    session = get_session(user_id)
 
-    ref_link = f"{REF_BASE_URL}?start=ref_{user.ref_code}"
+    last = LAST_ANSWERS.get(chat_id)
+    if not last or not last.meta.get("truncated"):
+        await message.answer("Предыдущий ответ уже полный. Пиши новый запрос 🙂")
+        return
 
-    text_body = txt.render_referrals(
-        ref_link=ref_link,
-        total_refs=user.referrals_count,
-    )
-    await message.answer(text_body, reply_markup=REF_KB)
-
-
-@router.message(F.text.startswith("/"))
-async def on_unknown_command(message: Message) -> None:
-    await message.answer(
-        "Команда не распознана.\n\n"
-        "Используй нижние кнопки навигации или просто напиши запрос.",
-        reply_markup=MAIN_KB,
+    # Продолжаем предыдущую мысль, опираясь на текущую историю
+    answer = await stream_answer(
+        message=message,
+        mode_key=session.active_mode,
+        user_text="Продолжи, пожалуйста, предыдущий ответ.",
+        history=session.history,
+        style_hint=None,
     )
 
+    assistant_text = answer.meta.get("full_text") or answer.full_text
+    update_history(
+        session,
+        user_prompt="Продолжи, пожалуйста, предыдущий ответ.",
+        assistant_text=assistant_text,
+    )
 
-@router.message(F.text.len() > 0)
+
+@router.message(F.text)
 async def on_user_message(message: Message) -> None:
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer(txt.render_empty_prompt_error(), reply_markup=MAIN_KB)
-        return
-
-    if len(text) > MAX_INPUT_TOKENS * 4:
-        await message.answer(txt.render_too_long_prompt_error(), reply_markup=MAIN_KB)
+    """
+    Главный диалоговый хендлер:
+    - учитывает текущий режим (универсальный / мед / бизнес / наставник / креатив),
+    - пробрасывает историю в ядро,
+    - запускает "живое печатание".
+    """
+    # Игнорируем команды, их перехватывают отдельные хендлеры
+    if message.text.startswith("/"):
         return
 
     user_id = message.from_user.id
-    user, _ = storage.get_or_create_user(user_id, message.from_user)
+    session = get_session(user_id)
 
-    is_admin = storage.is_admin(user_id)
-    plan_code = storage.effective_plan(user, is_admin)
-
-    reason = _check_limits(user, plan_code, is_admin)
-    if reason:
-        await message.answer(
-            txt.render_limits_warning(reason),
-            reply_markup=MAIN_KB,
-        )
+    user_text = message.text.strip()
+    if not user_text:
+        await message.answer("Напиши что-нибудь содержательное 🙂")
         return
 
-    await _send_streaming_answer(message, user, text)
+    # История диалога и режим уже в session
+    answer = await stream_answer(
+        message=message,
+        mode_key=session.active_mode,
+        user_text=user_text,
+        history=session.history,
+        style_hint=None,
+    )
 
+    assistant_text = answer.meta.get("full_text") or answer.full_text
+    update_history(
+        session,
+        user_prompt=user_text,
+        assistant_text=assistant_text,
+    )
+
+
+# ==============================
+#   Запуск бота
+# ==============================
 
 async def main() -> None:
+    bot = Bot(token=bot_config.BOT_TOKEN)
+    dp = Dispatcher()
     dp.include_router(router)
+
+    logger.info("Starting polling for bot...")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
