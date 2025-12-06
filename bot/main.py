@@ -23,6 +23,8 @@ from bot.config import (
     SUBSCRIPTION_TARIFFS,
     REF_BASE_URL,
 )
+import bot.config as app_config  # для доступа к REFERRAL_DAILY_BONUS
+
 from services.llm import ask_llm_stream, make_daily_summary
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
@@ -129,16 +131,32 @@ def _estimate_prompt_tokens(text: str) -> int:
 
 
 def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[str]:
-    """Проверка лимитов по тарифу. Возвращает причину блокировки или None."""
+    """
+    Проверка лимитов по тарифу. Возвращает причину блокировки или None.
+
+    Логика:
+    - admin → без лимитов;
+    - premium → свои лимиты из конфигурации;
+    - free → базовый лимит + бонус к лимиту за каждого реферала.
+    """
     if is_admin or plan_code == "admin":
         return None
+
+    # бонус сообщений за рефералов (можно задать в bot.config: REFERRAL_DAILY_BONUS = 3)
+    referral_daily_bonus = getattr(app_config, "REFERRAL_DAILY_BONUS", 0)
+    referrals = user.referrals_count or 0
 
     if plan_code == "premium":
         daily_max = PREMIUM_DAILY_LIMIT
         monthly_max = PREMIUM_MONTHLY_LIMIT
     else:
-        daily_max = FREE_DAILY_LIMIT
-        monthly_max = FREE_MONTHLY_LIMIT
+        # базовый free-лимит + бонус за каждого реферала
+        extra_daily = referral_daily_bonus * referrals
+        daily_max = FREE_DAILY_LIMIT + extra_daily
+
+        # для простоты считаем, что месячный бонус = дневной бонус * 30
+        extra_monthly = extra_daily * 30
+        monthly_max = FREE_MONTHLY_LIMIT + extra_monthly
 
     if user.daily_used >= daily_max:
         return "Достигнут дневной лимит запросов для текущего тарифа."
