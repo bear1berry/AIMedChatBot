@@ -264,8 +264,13 @@ async def on_profile(message: Message) -> None:
     await message.answer(text_body, reply_markup=MAIN_KB)
 
 
-@router.message(F.text == BTN_MODES)
+@router.message(F.text.contains("Режимы"))
 async def on_modes_root(message: Message) -> None:
+    """
+    Открывает экран выбора режимов.
+    Фильтр по подстроке — чтобы сработало даже если в кнопке есть эмодзи
+    или лишние пробелы.
+    """
     text_body = txt.render_modes_root()
     await message.answer(text_body, reply_markup=MODES_KB)
 
@@ -435,3 +440,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
