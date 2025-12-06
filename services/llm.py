@@ -105,8 +105,7 @@ def _select_model_for_prompt(intent: Intent, mode_key: str) -> str:
     - лёгкие / small-talk → DEEPSEEK_LIGHT_MODEL
     - длинные, сложные, бизнес/медицина/наставник → DEEPSEEK_HEAVY_MODEL
     """
-    mode_key = mode_key or DEFAULT_MODE_KEY
-    mode_key = mode_key.lower()
+    mode_key = (mode_key or DEFAULT_MODE_KEY).lower()
 
     # тяжелые режимы по умолчанию
     heavy_modes = {"business", "medicine", "coach"}
@@ -122,12 +121,18 @@ def _select_model_for_prompt(intent: Intent, mode_key: str) -> str:
     return DEEPSEEK_LIGHT_MODEL
 
 
-def _build_system_prompt(mode_key: str, style_hint: str, emotion_tag: str) -> str:
+def _build_system_prompt(
+    mode_key: str,
+    style_hint: str,
+    emotion_tag: str,
+    is_premium: bool = False,
+) -> str:
     """
     Собираем системный промпт на основе:
     - выбранного режима (медицина, бизнес, наставник и т.д.)
     - стилистики (ты/вы, формальность, плотность структуры)
     - эмоционального состояния (чуть больше мягкости/структуры и т.п.)
+    - премиум-режима «стратегический мозг»
     """
     mode_key = mode_key or DEFAULT_MODE_KEY
     mode = ASSISTANT_MODES.get(mode_key, ASSISTANT_MODES.get(DEFAULT_MODE_KEY, {}))
@@ -170,7 +175,17 @@ def _build_system_prompt(mode_key: str, style_hint: str, emotion_tag: str) -> st
             f"{style_hint.strip()}"
         )
 
-    parts = [base_prompt, behavior_rules, style_suffix, emotion_suffix]
+    premium_suffix = ""
+    if is_premium:
+        premium_suffix = (
+            "\n\nПремиум-режим «стратегический мозг»:\n"
+            "- давай более глубокие ответы с чёткой структурой (заголовки, списки, блоки);\n"
+            "- предлагай несколько вариантов, гипотез и сценариев, а не один очевидный путь;\n"
+            "- иллюстрируй ключевые идеи короткими, но ёмкими примерами из жизни/бизнеса;\n"
+            "- не растекайся: максимум смысла на единицу текста, минимум воды."
+        )
+
+    parts = [base_prompt, behavior_rules, style_suffix, emotion_suffix, premium_suffix]
     final = "\n\n".join(p for p in parts if p)
     if not final:
         final = (
@@ -270,12 +285,13 @@ async def ask_llm_stream(
     mode_key: str,
     user_prompt: str,
     style_hint: str = "",
+    is_premium: bool = False,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
     Главный метод для ядра:
     - анализирует интент и эмоцию,
     - выбирает модель,
-    - собирает системный промпт,
+    - собирает системный промпт (для премиум — «стратегический мозг»),
     - делает один запрос к DeepSeek,
     - режет ответ на чанки и стримит их наружу.
     Каждая итерация возвращает dict:
@@ -288,14 +304,23 @@ async def ask_llm_stream(
     intent = analyze_intent(user_prompt)
     emotion_tag = _detect_emotion(user_prompt)
     model_name = _select_model_for_prompt(intent, mode_key)
-    system_prompt = _build_system_prompt(mode_key, style_hint, emotion_tag)
+
+    system_prompt = _build_system_prompt(
+        mode_key=mode_key,
+        style_hint=style_hint,
+        emotion_tag=emotion_tag,
+        is_premium=is_premium,
+    )
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
-    result = await _call_deepseek(messages, model=model_name)
+    # Премиум получает больший лимит токенов на ответ
+    max_tokens = 2048 if is_premium else 1024
+
+    result = await _call_deepseek(messages, model=model_name, max_tokens=max_tokens)
     full_text = result["content"]
     total_tokens = result["total_tokens"]
 
