@@ -28,7 +28,7 @@ DEEPSEEK_API_URL: str = getattr(
 ASSISTANT_MODES: Dict[str, Dict[str, Any]] = getattr(bot_config, "ASSISTANT_MODES", {})
 DEFAULT_MODE_KEY: str = getattr(bot_config, "DEFAULT_MODE_KEY", "universal")
 
-TELEGRAM_SAFE_LIMIT = 3800  # чуть меньше лимита по длине сообщения
+TELEGRAM_SAFE_LIMIT = 3800  # немного ниже лимита Telegram
 
 
 # ==============================
@@ -54,7 +54,7 @@ class Intent:
 
 def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     """
-    Лёгкий интент-детектор: без вызова LLM, только эвристики.
+    Лёгкий интент-детектор: без LLM, только эвристики.
     """
     if not message_text:
         return Intent(IntentType.OTHER)
@@ -155,7 +155,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
     ):
         return Intent(IntentType.QA)
 
-    # Лёгкий байас по режиму
+    # Подстройка по режиму
     if mode_key:
         mk = mode_key.lower()
         if "mentor" in mk or "nastav" in mk or "coach" in mk:
@@ -168,7 +168,7 @@ def analyze_intent(message_text: str, mode_key: Optional[str] = None) -> Intent:
 
 def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
     """
-    Заворачиваем запрос пользователя под нужную "форму мысли" для модели.
+    Оборачиваем запрос в подсказку под нужный тип ответа.
     """
     base = user_prompt.strip()
 
@@ -240,7 +240,7 @@ def _apply_intent_to_prompt(user_prompt: str, intent: Intent) -> str:
 
 
 # ==============================
-#   Поведение режимов (коуч / бизнес / медицина)
+#   Поведение режимов
 # ==============================
 
 @dataclass
@@ -272,7 +272,6 @@ MODE_BEHAVIORS: Dict[str, ModeBehavior] = {
     "medical": ModeBehavior(
         system_suffix=(
             "\n\nРЕЖИМ: ОСТОРОЖНЫЙ МЕДИЦИНСКИЙ АССИСТЕНТ.\n"
-            "Строго соблюдай принципы безопасности.\n"
             "Всегда:\n"
             "- не ставь диагнозы и не замещай очную консультацию врача;\n"
             "- отвечай по структуре: кратко, возможные причины, что можно сделать, "
@@ -363,7 +362,7 @@ def _normalize_text_for_telegram(text: str) -> str:
 
 def _split_into_semantic_chunks(text: str) -> List[AnswerChunk]:
     """
-    Делим текст на смысловые чанки: абзацы, списки, "кратко".
+    Делим текст на смысловые чанки: абзацы, списки, первый блок "кратко".
     """
     text = text.strip()
     if not text:
@@ -476,7 +475,10 @@ async def generate_answer(
     style_hint: Optional[str] = None,
     force_mode: Optional[str] = None,  # "quick" | "deep"
 ) -> Answer:
-    # Быстрый / глубокий режим: по длине запроса или явно
+    """
+    Высокоуровневая точка входа: строит промпт, зовёт DeepSeek,
+    режет ответ на чанки, возвращает Answer.
+    """
     if force_mode in ("quick", "deep"):
         answer_mode = force_mode
     else:
@@ -543,7 +545,7 @@ async def _ask_llm_stream_impl(
     )
 
     assembled = ""
-    base_sleep = 0.03 if answer.meta.get("answer_mode") == "quick" else 0.06
+    base_sleep = 0.02 if answer.meta.get("answer_mode") == "quick" else 0.04
 
     for ch in answer.chunks:
         sep = "\n\n" if assembled else ""
