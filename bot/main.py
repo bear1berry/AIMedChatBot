@@ -7,11 +7,8 @@ from typing import Optional, Dict, Any
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.client.default import DefaultBotProperties
 
 from bot.config import (
     BOT_TOKEN,
@@ -30,11 +27,13 @@ from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
 from services import texts as txt  # ВАЖНО: services.texts, а не bot.text
 
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
 
 # --- Текст кнопок таскбара ---
 
@@ -55,6 +54,7 @@ BTN_SUB_1M = "💎 Premium · 1 месяц"
 BTN_SUB_3M = "💎 Premium · 3 месяца"
 BTN_SUB_12M = "💎 Premium · 12 месяцев"
 BTN_SUB_CHECK = "🔄 Проверить оплату"
+
 
 # --- Разметка клавиатур ---
 
@@ -94,7 +94,11 @@ REF_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+)
 dp = Dispatcher()
 router = Router()
 storage = Storage()
@@ -117,7 +121,7 @@ def _mode_title(mode_key: str) -> str:
 
 
 def _estimate_prompt_tokens(text: str) -> int:
-    # Грубая оценка: 1 токен ≈ 4 символа
+    # Грубая оценка: 1 токен ~ 4 символа
     return max(1, len(text) // 4)
 
 
@@ -141,7 +145,11 @@ def _check_limits(user: UserRecord, plan_code: str, is_admin: bool) -> Optional[
 
 
 async def _send_streaming_answer(message: Message, user: UserRecord, text: str) -> None:
-    """Реальное «живое» печатание: редактируем одно сообщение по мере прихода чанков."""
+    """
+    Реальное «живое» печатание:
+    - сначала отправляем заглушку «Думаю…»
+    - затем постепенно редактируем одно сообщение по мере прихода чанков от LLM
+    """
     typing_msg = await message.answer("⌛ Думаю...", reply_markup=MAIN_KB)
 
     style_hint = user.style_hint or ""
@@ -157,6 +165,7 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
             last_chunk = chunk
             full = chunk["full"]
 
+            # защита от переполнения Телеграма
             if len(full) > 4000:
                 full = full[:3990] + "…"
 
