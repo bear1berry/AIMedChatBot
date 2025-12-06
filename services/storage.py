@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,12 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "aimedbot.db"
+
+# Реферальные бонусы (можно переопределить через переменные окружения)
+REFERRAL_BONUS_DAYS = int(os.getenv("REFERRAL_BONUS_DAYS", "7"))       # сколько дней премиума за реферала
+REFERRAL_VOICE_WEEKS = int(os.getenv("REFERRAL_VOICE_WEEKS", "1"))     # на будущее: голосовой коуч
+# Бонус к лимиту сообщений за каждого реферала (используется в main.py через config, но оставим тут как инфо)
+# REFERRAL_DAILY_BONUS читается в main.py из bot.config или через getattr
 
 
 @dataclass
@@ -42,6 +50,9 @@ class UserRecord:
     ref_code: Optional[str] = None
     referrals_count: int = 0
     referrer_user_id: Optional[int] = None
+
+    # дополнительные данные по наградам за реферал (JSON-строка)
+    referral_rewards: Optional[str] = None
 
     # последняя оплата
     last_invoice_id: Optional[int] = None
@@ -76,6 +87,7 @@ class UserRecord:
             ref_code=row["ref_code"],
             referrals_count=row["referrals_count"],
             referrer_user_id=row["referrer_user_id"],
+            referral_rewards=row["referral_rewards"],
             last_invoice_id=row["last_invoice_id"],
             last_tariff_key=row["last_tariff_key"],
             style_hint=row["style_hint"],
@@ -124,6 +136,8 @@ class Storage:
                 referrals_count  INTEGER DEFAULT 0,
                 referrer_user_id INTEGER,
 
+                referral_rewards TEXT,
+
                 last_invoice_id  INTEGER,
                 last_tariff_key  TEXT,
 
@@ -135,6 +149,20 @@ class Storage:
             )
             """
         )
+
+        # Лёгкая миграция: гарантируем наличие новых колонок в уже существующей БД
+        cur.execute("PRAGMA table_info(users)")
+        cols = [r["name"] for r in cur.fetchall()]
+        if "last_summary_date" not in cols:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN last_summary_date TEXT")
+            except Exception:
+                logger.exception("Failed to add last_summary_date column to users")
+        if "referral_rewards" not in cols:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN referral_rewards TEXT")
+            except Exception:
+                logger.exception("Failed to add referral_rewards column to users")
 
         # Сообщения
         cur.execute(
@@ -230,6 +258,7 @@ class Storage:
                 total_requests, total_tokens,
                 daily_date, monthly_month,
                 ref_code, referrals_count, referrer_user_id,
+                referral_rewards,
                 last_invoice_id, last_tariff_key,
                 style_hint,
                 last_summary_date,
@@ -244,6 +273,7 @@ class Storage:
                 :total_requests, :total_tokens,
                 :daily_date, :monthly_month,
                 :ref_code, :referrals_count, :referrer_user_id,
+                :referral_rewards,
                 :last_invoice_id, :last_tariff_key,
                 :style_hint,
                 :last_summary_date,
@@ -266,6 +296,7 @@ class Storage:
                 ref_code         = excluded.ref_code,
                 referrals_count  = excluded.referrals_count,
                 referrer_user_id = excluded.referrer_user_id,
+                referral_rewards = excluded.referral_rewards,
                 last_invoice_id  = excluded.last_invoice_id,
                 last_tariff_key  = excluded.last_tariff_key,
                 style_hint       = excluded.style_hint,
@@ -290,6 +321,7 @@ class Storage:
                 "ref_code": user.ref_code,
                 "referrals_count": user.referrals_count,
                 "referrer_user_id": user.referrer_user_id,
+                "referral_rewards": user.referral_rewards,
                 "last_invoice_id": user.last_invoice_id,
                 "last_tariff_key": user.last_tariff_key,
                 "style_hint": user.style_hint,
@@ -453,10 +485,8 @@ class Storage:
         # date_str: YYYY-MM-DD
         # считаем границы дня в timestamp
         try:
-            import datetime as _dt
-
-            dt_start = _dt.datetime.strptime(date_str, "%Y-%m-%d")
-            dt_end = dt_start + _dt.timedelta(days=1)
+            dt_start = datetime.strptime(date_str, "%Y-%m-%d")
+            dt_end = dt_start + timedelta(days=1)
             start_ts = dt_start.timestamp()
             end_ts = dt_end.timestamp()
         except Exception:
@@ -479,11 +509,31 @@ class Storage:
         rows = cur.fetchall()
         return [r["content"] for r in rows]
 
+    # --- вспомогательные функции по referral_rewards ---
+
+    def _get_referral_rewards_dict(self, user: UserRecord) -> Dict[str, Any]:
+        if not user.referral_rewards:
+            return {}
+        try:
+            data = json.loads(user.referral_rewards)
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception:
+            return {}
+
+    def _set_referral_rewards_dict(self, user: UserRecord, data: Dict[str, Any]) -> None:
+        user.referral_rewards = json.dumps(data, ensure_ascii=False)
+
     # --- рефералка ---
 
     def apply_referral(self, new_user_id: int, ref_code: str) -> None:
         """
         Привязать нового пользователя к реф-коду, если такой есть.
+        Начислить реферальные бонусы:
+        - увеличить referrals_count у реферера;
+        - записать referral_rewards;
+        - опционально выдать дни премиума за реферала.
         """
         cur = self._conn.cursor()
         cur.execute(
@@ -501,7 +551,18 @@ class Storage:
         # обновляем счётчик у реферера
         referrer = UserRecord.from_row(row)
         referrer.referrals_count += 1
-        self._upsert_user(referrer)
+
+        rewards = self._get_referral_rewards_dict(referrer)
+        rewards["referrals_total"] = referrer.referrals_count
+        rewards["bonus_premium_days"] = rewards.get("bonus_premium_days", 0) + max(0, REFERRAL_BONUS_DAYS)
+        rewards["bonus_voice_weeks"] = rewards.get("bonus_voice_weeks", 0) + max(0, REFERRAL_VOICE_WEEKS)
+        self._set_referral_rewards_dict(referrer, rewards)
+
+        # Начисляем премиум-дни за реферала (если >0)
+        if REFERRAL_BONUS_DAYS > 0:
+            self.add_premium_days(referrer, REFERRAL_BONUS_DAYS)
+        else:
+            self._upsert_user(referrer)
 
         # и сохраняем referrer_user_id у нового пользователя, если он уже есть
         row_new = self._fetch_user_row(new_user_id)
@@ -521,28 +582,41 @@ class Storage:
     def get_last_invoice(self, user: UserRecord) -> Tuple[Optional[int], Optional[str]]:
         return user.last_invoice_id, user.last_tariff_key
 
-    def activate_premium(self, user: UserRecord, months: int) -> None:
+    def add_premium_days(self, user: UserRecord, days: int) -> None:
         """
-        Активирует/продлевает premium на N месяцев.
+        Добавляет пользователю N дней премиума (используется тарифами и рефералкой).
         premium_until — YYYY-MM-DD
         """
-        import datetime as _dt
+        if days <= 0:
+            # всё равно сохраним user (например, если только referral_rewards поменялись)
+            self._upsert_user(user)
+            return
 
-        today = _dt.date.today()
+        today = date.today()
         if user.premium_until:
             try:
-                current = _dt.datetime.strptime(user.premium_until, "%Y-%m-%d").date()
+                current = datetime.strptime(user.premium_until, "%Y-%m-%d").date()
             except Exception:
                 current = today
         else:
             current = today
 
         base = max(today, current)
-        # грубо: месяц = 30 дней, чтобы не тащить relativedelta
-        new_date = base + _dt.timedelta(days=30 * max(1, months))
+        new_date = base + timedelta(days=days)
         user.premium_until = new_date.strftime("%Y-%m-%d")
-        user.plan_code = "premium"
+        if user.plan_code != "admin":
+            user.plan_code = "premium"
+
         self._upsert_user(user)
+
+    def activate_premium(self, user: UserRecord, months: int) -> None:
+        """
+        Активирует/продлевает premium на N месяцев.
+        Реализация через add_premium_days (1 мес = 30 дней).
+        """
+        months = max(1, months)
+        days = 30 * months
+        self.add_premium_days(user, days)
 
     # --- админы ---
 
