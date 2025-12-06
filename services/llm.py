@@ -297,21 +297,21 @@ def _build_system_prompt(mode_key: str, style_hint: Optional[str]) -> str:
     if behavior and behavior.system_suffix:
         base_system_prompt = base_system_prompt.rstrip() + "\n" + behavior.system_suffix
 
-    # Глобальный стиль: премиальный, без Markdown-мусора
+    # Глобальный стиль: премиальный Markdown
     base_system_prompt += (
-        "\n\nСтиль ответа:\n"
-        "- используй чистый текст без Markdown-разметки (*, **, • и подобное);\n"
-        "- пиши ёмко, без воды и канцелярита;\n"
-        "- используй короткие абзацы и нумерованные списки только там, "
-        "где они реально помогают структуре;\n"
-        "- не злоупотребляй эмодзи и восклицательными знаками.\n"
+        "\n\nСтиль ответа (Markdown):\n"
+        "- заголовки и ключевые блоки выделяй **жирным**;\n"
+        "- важные уточнения можешь выделять _курсивом_;\n"
+        "- для структуры используй аккуратные списки с «- » или «• »;\n"
+        "- избегай визуального шума и лишних эмодзи (1–3 уместных символа максимум);\n"
+        "- не используй CAPS LOCK и крикливый стиль.\n"
     )
 
     if mode_key != "medical":
         base_system_prompt += (
             "\nСтруктура ответа по умолчанию:\n"
-            "- сначала короткий блок с ключевыми тезисами;\n"
-            "- затем более подробное раскрытие по пунктам.\n"
+            "- сначала короткие ключевые тезисы;\n"
+            "- далее подробное раскрытие по пунктам.\n"
         )
 
     if style_hint:
@@ -329,7 +329,7 @@ def _build_system_prompt(mode_key: str, style_hint: Optional[str]) -> str:
 
 @dataclass
 class AnswerChunk:
-    kind: str  # outline / heading / paragraph / list
+    kind: str  # outline / paragraph / list
     text: str
 
 
@@ -348,21 +348,16 @@ def _estimate_tokens(*texts: str) -> int:
 
 def _normalize_text_for_telegram(text: str) -> str:
     """
-    Чистим текст от Markdown-символов и лишних пустых строк.
+    Нормализуем для Telegram:
+    - чистим хвостовые пробелы;
+    - убираем лишние пустые строки.
+    Markdown-разметку НЕ трогаем.
     """
     if not text:
         return ""
 
-    # убираем **жирный**, оставляем ровный текст
-    text = text.replace("**", "")
-    # превращаем • в обычный дефис
-    text = text.replace("•", "-")
-
-    # убираем лишние пробелы в конце строк
     text = re.sub(r"[ \t]+\n", "\n", text)
-    # сокращаем слишком длинные блоки пустых строк
     text = re.sub(r"\n{3,}", "\n\n", text)
-
     return text.strip()
 
 
@@ -388,7 +383,7 @@ def _split_into_semantic_chunks(text: str) -> List[AnswerChunk]:
 
         first = lines[0].strip()
 
-        # Первый блок с "кратко", "тезисы", "итог" → outline
+        # Первый блок с "кратко" / "итог" → outline
         if i == 0 and any(
             kw in first.lower()
             for kw in ("кратко", "тезисы", "итог", "оглавление")
@@ -396,7 +391,7 @@ def _split_into_semantic_chunks(text: str) -> List[AnswerChunk]:
             kind = "outline"
         # Списки
         elif all(
-            ln.lstrip().startswith(("-", "—", "–"))
+            ln.lstrip().startswith(("-", "—", "–", "•"))
             or re.match(r"^\d+[\.\)]\s+", ln.lstrip())
             for ln in lines
         ):
@@ -423,7 +418,7 @@ def _prepare_messages(
     if answer_mode == "quick":
         transformed_user_prompt = (
             "РЕЖИМ ОТВЕТА: КОРОТКИЙ.\n"
-            "Дай краткий, ёмкий ответ (до трёх абзацев, без лишних деталей).\n\n"
+            "Дай краткий, ёмкий ответ (до трёх абзацев без лишних деталей).\n\n"
             + transformed_user_prompt
         )
     elif answer_mode == "deep":
