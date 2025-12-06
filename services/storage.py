@@ -1,3 +1,4 @@
+# services/storage.py
 from __future__ import annotations
 
 import json
@@ -5,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram.types import User as TgUser
 
@@ -18,34 +19,81 @@ from bot.config import (
 logger = logging.getLogger(__name__)
 
 
+# ====== Проекты / устойчивые темы диалога ======
+
+
+@dataclass
+class ProjectRecord:
+    """
+    Устойчивый «проект» / тема пользователя.
+
+    Примеры:
+    - «Telegram-бот BlackBox»
+    - «Отношения с девушкой»
+    - «Форма и тренировки»
+    """
+
+    id: str
+    title: str
+    description: str = ""
+    tags: List[str] = field(default_factory=list)
+    last_used_ts: float = field(default_factory=lambda: time.time())
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProjectRecord":
+        return cls(
+            id=str(data.get("id", "")),
+            title=str(data.get("title", "")),
+            description=str(data.get("description", "")),
+            tags=list(data.get("tags") or []),
+            last_used_ts=float(data.get("last_used_ts", time.time())),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ====== Пользователь ======
+
+
 @dataclass
 class UserRecord:
     id: int
+
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
 
+    # активный режим (универсальный / медицина / коуч / бизнес / креатив)
     mode_key: str = DEFAULT_MODE_KEY
 
+    # тариф
     plan_type: str = "basic"  # basic | premium
     premium_until: Optional[float] = None
 
+    # лимиты по запросам
     daily_used: int = 0
     monthly_used: int = 0
     last_daily_reset: Optional[str] = None  # YYYY-MM-DD
     last_monthly_reset: Optional[str] = None  # YYYY-MM
 
+    # суммарная статистика
     total_requests: int = 0
     total_tokens: int = 0
 
+    # реферальная система
     ref_code: Optional[str] = None
     referred_by: Optional[str] = None
     referrals_count: int = 0
 
+    # подписка / оплаты
     last_invoice_id: Optional[int] = None
     last_tariff_key: Optional[str] = None
 
-    style_hint: Optional[str] = None
+    # стиль и профиль
+    style_hint: Optional[str] = None  # общий стиль общения пользователя
+    profile: Dict[str, Any] = field(default_factory=dict)  # «досье»: привычки, цели
+    projects: Dict[str, Any] = field(default_factory=dict)  # id -> ProjectRecord dict
 
     created_at: float = field(default_factory=lambda: time.time())
     updated_at: float = field(default_factory=lambda: time.time())
@@ -54,6 +102,7 @@ class UserRecord:
     def from_dict(cls, data: Dict[str, Any]) -> "UserRecord":
         """
         Аккуратно восстанавливаем запись, игнорируя лишние поля из старых версий.
+        Всем новым полям даём дефолты.
         """
         return cls(
             id=int(data.get("id")),
@@ -76,6 +125,8 @@ class UserRecord:
             # поддержка старого имени поля, если оно было
             last_tariff_key=data.get("last_tariff_key") or data.get("last_invoice_code"),
             style_hint=data.get("style_hint"),
+            profile=data.get("profile") or {},
+            projects=data.get("projects") or {},
             created_at=float(data.get("created_at", time.time())),
             updated_at=float(data.get("updated_at", time.time())),
         )
@@ -84,7 +135,22 @@ class UserRecord:
         return asdict(self)
 
 
+# ====== Хранилище ======
+
+
 class Storage:
+    """
+    Простое файловое хранилище в JSON.
+
+    Схема (новая):
+      {
+        "<user_id>": { ... UserRecord.to_dict() ... },
+        "<user_id2>": { ... }
+      }
+
+    При загрузке понимает и старую схему вида {"users": {...}} и мигрирует.
+    """
+
     def __init__(self, path: Path = USERS_FILE_PATH):
         self.path = path
         self._data: Dict[str, Dict[str, Any]] = {}
@@ -96,10 +162,17 @@ class Storage:
         if not self.path.exists():
             self._data = {}
             return
+
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
-            if isinstance(raw, dict):
+
+            if isinstance(raw, dict) and "users" in raw and isinstance(
+                raw.get("users"), dict
+            ):
+                # старая схема: {"users": {...}}
+                self._data = raw["users"]
+            elif isinstance(raw, dict):
                 self._data = raw
             else:
                 logger.warning("Unexpected users.json format, resetting")
@@ -146,11 +219,20 @@ class Storage:
             rec.monthly_used = 0
             rec.last_monthly_reset = month_key
 
-    # --- public API ---
+    def _ensure_profile_projects_dicts(self, rec: UserRecord) -> None:
+        if not isinstance(rec.profile, dict):
+            rec.profile = {}
+        if not isinstance(rec.projects, dict):
+            rec.projects = {}
 
-    def get_or_create_user(self, user_id: int, tg_user: Optional[TgUser] = None) -> Tuple[UserRecord, bool]:
+    # --- public API: базовый пользователь / тарифы / лимиты ---
+
+    def get_or_create_user(
+        self, user_id: int, tg_user: Optional[TgUser] = None
+    ) -> Tuple[UserRecord, bool]:
         key = self._key(user_id)
         created = False
+
         if key in self._data:
             try:
                 rec = UserRecord.from_dict(self._data[key])
@@ -168,6 +250,7 @@ class Storage:
             rec.first_name = tg_user.first_name
             rec.last_name = tg_user.last_name
 
+        self._ensure_profile_projects_dicts(rec)
         self._ensure_ref_code(rec)
         self._refresh_plan_from_premium(rec)
         self._refresh_limits_dates(rec)
@@ -179,6 +262,7 @@ class Storage:
 
     def save_user(self, rec: UserRecord) -> None:
         key = self._key(rec.id)
+        self._ensure_profile_projects_dicts(rec)
         self._ensure_ref_code(rec)
         self._refresh_plan_from_premium(rec)
         self._refresh_limits_dates(rec)
@@ -211,9 +295,11 @@ class Storage:
         self._refresh_plan_from_premium(rec)
         return rec.plan_type or "basic"
 
+    # --- public API: рефералка ---
+
     def apply_referral(self, new_user_id: int, ref_code: str) -> None:
         # находим владельца ref_code
-        owner_id = None
+        owner_id: Optional[int] = None
         for key, value in self._data.items():
             try:
                 if value.get("ref_code") == ref_code:
@@ -221,6 +307,7 @@ class Storage:
                     break
             except Exception:
                 continue
+
         if not owner_id:
             return
 
@@ -238,12 +325,16 @@ class Storage:
         rec.referred_by = ref_code
         self.save_user(rec)
 
+    # --- public API: подписка / оплаты ---
+
     def store_invoice(self, rec: UserRecord, invoice_id: int, tariff_key: str) -> None:
         rec.last_invoice_id = invoice_id
         rec.last_tariff_key = tariff_key
         self.save_user(rec)
 
-    def get_last_invoice(self, rec: UserRecord) -> Tuple[Optional[int], Optional[str]]:
+    def get_last_invoice(
+        self, rec: UserRecord
+    ) -> Tuple[Optional[int], Optional[str]]:
         return rec.last_invoice_id, rec.last_tariff_key
 
     def activate_premium(self, rec: UserRecord, months: int) -> None:
@@ -253,3 +344,119 @@ class Storage:
         rec.premium_until = base + 30 * 24 * 3600 * months
         rec.plan_type = "premium"
         self.save_user(rec)
+
+    # --- public API: профиль / стиль ---
+
+    def get_profile(self, user_id: int) -> Dict[str, Any]:
+        """
+        Возвращает копию профиля пользователя (чтобы снаружи его не портили напрямую).
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        if not isinstance(rec.profile, dict):
+            rec.profile = {}
+            self.save_user(rec)
+        return dict(rec.profile)
+
+    def update_profile(self, user_id: int, fields: Dict[str, Any]) -> None:
+        """
+        Мягкое обновление профиля: просто мержим словари.
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        if not isinstance(rec.profile, dict):
+            rec.profile = {}
+        rec.profile.update(fields)
+        self.save_user(rec)
+
+    def update_style_hint(self, user_id: int, style_hint: Optional[str]) -> None:
+        """
+        Обновление текстовой подсказки по стилю общения пользователя.
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        rec.style_hint = style_hint
+        self.save_user(rec)
+
+    # --- public API: проекты / рабочие темы ---
+
+    def get_projects(self, user_id: int) -> Dict[str, ProjectRecord]:
+        """
+        Возвращает словарь {project_id: ProjectRecord}.
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        self._ensure_profile_projects_dicts(rec)
+
+        projects: Dict[str, ProjectRecord] = {}
+        raw = rec.projects or {}
+
+        if isinstance(raw, dict):
+            for pid, pdata in raw.items():
+                try:
+                    pdata_dict = dict(pdata or {})
+                    pdata_dict.setdefault("id", pid)
+                    proj = ProjectRecord.from_dict(pdata_dict)
+                    projects[pid] = proj
+                except Exception:
+                    logger.exception(
+                        "Failed to restore project %s for user %s", pid, rec.id
+                    )
+
+        return projects
+
+    def upsert_project(self, user_id: int, project: ProjectRecord) -> None:
+        """
+        Добавить/обновить один проект.
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        self._ensure_profile_projects_dicts(rec)
+        rec.projects[project.id] = project.to_dict()
+        self.save_user(rec)
+
+    def replace_projects(
+        self, user_id: int, projects: Dict[str, ProjectRecord]
+    ) -> None:
+        """
+        Полностью заменить список проектов (удобно для LLM-снэпшота).
+        """
+        rec, _ = self.get_or_create_user(user_id)
+        self._ensure_profile_projects_dicts(rec)
+        rec.projects = {pid: p.to_dict() for pid, p in projects.items()}
+        self.save_user(rec)
+
+    def delete_project(self, user_id: int, project_id: str) -> None:
+        rec, _ = self.get_or_create_user(user_id)
+        self._ensure_profile_projects_dicts(rec)
+        if project_id in rec.projects:
+            rec.projects.pop(project_id, None)
+            self.save_user(rec)
+
+    def apply_projects_snapshot(
+        self, user_id: int, snapshot: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Обновление проектов по снэпшоту от LLM.
+
+        Ожидаемый формат элемента snapshot:
+        {
+          "id": "blackbox_bot",
+          "title": "Telegram-бот BlackBox",
+          "description": "...",
+          "tags": ["бот", "telegram", "проект"]
+        }
+        """
+        projects: Dict[str, ProjectRecord] = {}
+
+        for item in snapshot:
+            if not item:
+                continue
+            pid = str(item.get("id") or item.get("title") or "").strip()
+            if not pid:
+                continue
+            data = dict(item)
+            data["id"] = pid
+            try:
+                proj = ProjectRecord.from_dict(data)
+            except Exception:
+                logger.exception("Failed to build ProjectRecord from %s", item)
+                continue
+            projects[pid] = proj
+
+        self.replace_projects(user_id, projects)
