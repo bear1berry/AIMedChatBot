@@ -17,7 +17,7 @@ def _headers() -> Dict[str, str]:
     }
 
 
-async def create_cryptobot_invoice(tariff_code: str, user_id: int) -> Optional[Tuple[int, str]]:
+async def create_cryptobot_invoice(tariff_code: str, user_id: int) -> Optional[Dict[str, Any]]:
     """
     Создаёт инвойс в Crypto Bot и возвращает (invoice_id, invoice_url).
 
@@ -56,7 +56,7 @@ async def create_cryptobot_invoice(tariff_code: str, user_id: int) -> Optional[T
         if invoice_id is None or not url:
             log.error("Crypto Pay createInvoice missing fields: %s", invoice)
             return None
-        return int(invoice_id), str(url)
+        return {"id": int(invoice_id), "url": str(url)}
 
 
 async def get_invoice_status(invoice_id: int) -> Optional[str]:
@@ -82,8 +82,3 @@ async def get_invoice_status(invoice_id: int) -> Optional[str]:
         if not data.get("ok"):
             log.error("Crypto Pay getInvoices error: %s", data)
             return None
-        invoices = data.get("result") or []
-        if not invoices:
-            return None
-        invoice = invoices[0]
-        return invoice.get("status")
