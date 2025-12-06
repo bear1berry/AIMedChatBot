@@ -7,7 +7,7 @@ import math
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -179,6 +179,37 @@ BASE_SYSTEM_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
+# Style Engine 2.0 — профиль стиля пользователя
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StyleProfile:
+    """
+    Профиль стиля общения конкретного пользователя.
+
+    Все параметры в диапазоне 0..1, где 0 — один полюс, 1 — другой.
+    """
+
+    # 'ty' / 'vy'
+    address: str = "ty"
+
+    # 0 — разговорный, 0.5 — нейтральный, 1 — деловой
+    formality: float = 0.5
+
+    # плотность структуры: 0 — «полотно», 1 — много списков и заголовков
+    structure_density: float = 0.5
+
+    # глубина объяснений: 0 — очень кратко, 1 — максимально развёрнуто
+    explanation_depth: float = 0.5
+
+    # уровень «огня»: 0 — очень мягко, 1 — максимально прямолинейно и жёстко
+    fire_level: float = 0.3
+
+    updated_at_ts: float = field(default_factory=lambda: time.time())
+
+
+# ---------------------------------------------------------------------------
 # Тарифы (подписка)
 # ---------------------------------------------------------------------------
 
@@ -250,13 +281,22 @@ def init_db() -> None:
         """
     )
 
+    # Гарантируем, что в таблице есть колонка для StyleProfile
+    try:
+        cur.execute("PRAGMA table_info(users_v2)")
+        cols = [row["name"] for row in cur.fetchall()]
+        if "style_profile_json" not in cols:
+            cur.execute("ALTER TABLE users_v2 ADD COLUMN style_profile_json TEXT")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to ensure style_profile_json column: %r", e)
+
     # История сообщений
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER NOT NULL,
-            role TEXT NOT NULL,          -- 'user' / 'assistant'
+            role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at_ts INTEGER NOT NULL
         )
@@ -513,39 +553,6 @@ def get_recent_dialog_history(telegram_id: int, limit: int = 12) -> List[Dict[st
     return history
 
 
-def describe_communication_style(telegram_id: int) -> str:
-    texts = get_recent_user_messages(telegram_id, limit=30)
-    if not texts:
-        return "Пока мало данных — подстраиваюсь под тебя по ходу диалога."
-
-    joined = " ".join(texts)
-    total_len = sum(len(t) for t in texts if t)
-    avg_len = total_len / max(len(texts), 1)
-
-    if avg_len < 80:
-        length_desc = "короткие, ёмкие сообщения"
-    elif avg_len < 220:
-        length_desc = "средний объём без перегруза"
-    else:
-        length_desc = "развёрнутые, подробные сообщения"
-
-    lower = joined.lower()
-    formal_markers = ["здравствуйте", "добрый день", "добрый вечер", "уважаем", "будьте добры"]
-    uses_vy = any(m in lower for m in formal_markers) or " вы " in lower
-    tone_desc = (
-        "общение на «Вы», аккуратный тон"
-        if uses_vy
-        else "общение на «ты», живой и прямой тон"
-    )
-
-    if any(ch in joined for ch in ["\n- ", "\n•", "1.", "2)"]):
-        struct_desc = "любишь структуру и списки"
-    else:
-        struct_desc = "чаще используешь свободный формат без жёсткой структуры"
-
-    return f"{length_desc}; {tone_desc}; {struct_desc}."
-
-
 def get_user_stats(telegram_id: int) -> Dict[str, Optional[int]]:
     conn = _get_conn()
     cur = conn.cursor()
@@ -580,6 +587,324 @@ def get_user_stats(telegram_id: int) -> Dict[str, Optional[int]]:
         "free_used": free_used,
         "message_count": message_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# Стиль общения: загрузка/сохранение StyleProfile
+# ---------------------------------------------------------------------------
+
+
+def _style_profile_from_dict(data: Dict[str, Any]) -> StyleProfile:
+    return StyleProfile(
+        address=str(data.get("address", "ty")) if data.get("address") in {"ty", "vy"} else "ty",
+        formality=float(data.get("formality", 0.5)),
+        structure_density=float(data.get("structure_density", 0.5)),
+        explanation_depth=float(data.get("explanation_depth", 0.5)),
+        fire_level=float(data.get("fire_level", 0.3)),
+        updated_at_ts=float(data.get("updated_at_ts", time.time())),
+    )
+
+
+def _load_style_profile(telegram_id: int) -> Optional[StyleProfile]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT style_profile_json FROM users_v2 WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        row = cur.fetchone()
+    except sqlite3.OperationalError:
+        conn.close()
+        return None
+    conn.close()
+
+    if not row:
+        return None
+
+    raw = row["style_profile_json"]
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+        return _style_profile_from_dict(data)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to parse style_profile_json for %s: %r", telegram_id, e)
+        return None
+
+
+def _save_style_profile(telegram_id: int, profile: StyleProfile) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    data_json = json.dumps(asdict(profile), ensure_ascii=False)
+    cur.execute(
+        """
+        UPDATE users_v2
+        SET style_profile_json = ?, updated_at_ts = ?
+        WHERE telegram_id = ?
+        """,
+        (data_json, int(time.time()), telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _instant_style_from_messages(messages: List[str]) -> StyleProfile:
+    """
+    Быстрая оценка стиля по последним сообщениям.
+    Это «моментальный снимок», который потом смешиваем с уже накопленным профилем.
+    """
+    if not messages:
+        return StyleProfile()
+
+    joined = " ".join(messages)
+    lower = joined.lower()
+
+    # Обращение / формальность
+    formal_markers = ["здравствуйте", "добрый день", "добрый вечер", "уважаем", "будьте добры"]
+    slang_markers = ["чувак", "бро", "фигня", "жесть", "капец"]
+
+    uses_vy = any(m in lower for m in formal_markers) or " вы " in lower
+    uses_ty_slang = any(m in lower for m in slang_markers) or " ты " in lower
+
+    if uses_vy and not uses_ty_slang:
+        address = "vy"
+        formality = 0.85
+    elif uses_ty_slang and not uses_vy:
+        address = "ty"
+        formality = 0.25
+    else:
+        address = "ty"
+        formality = 0.5
+
+    # Структура
+    has_lists = any(
+        marker in joined
+        for marker in ["\n- ", "\n•", "\n1.", "\n1)", "1) ", "1. "]
+    )
+    structure_density = 0.75 if has_lists else 0.35
+
+    # Глубина объяснений
+    lengths = [len(m) for m in messages if m.strip()]
+    avg_len = sum(lengths) / len(lengths) if lengths else 0
+    if avg_len < 80:
+        explanation_depth = 0.25
+    elif avg_len < 220:
+        explanation_depth = 0.5
+    else:
+        explanation_depth = 0.8
+
+    # Уровень «огня»
+    fire_level = 0.3
+    strong_words = [
+        "нах",
+        "хрен",
+        "черт",
+        "чёрт",
+        "дерьмо",
+        "сраная",
+        "сраный",
+        "жестко",
+        "жёстко",
+        "рубить правду",
+        "по-жёсткому",
+    ]
+    soft_words = ["помягче", "бережно", "аккуратнее"]
+
+    if any(w in lower for w in strong_words):
+        fire_level = 0.7
+    if any(w in lower for w in soft_words):
+        fire_level = 0.2
+
+    return StyleProfile(
+        address=address,
+        formality=formality,
+        structure_density=structure_density,
+        explanation_depth=explanation_depth,
+        fire_level=fire_level,
+    )
+
+
+def build_style_profile_from_history(
+    telegram_id: int,
+) -> StyleProfile:
+    """
+    Строим/обновляем StyleProfile по последним сообщениям пользователя,
+    используя скользящее среднее относительно предыдущего профиля.
+    """
+    messages = get_recent_user_messages(telegram_id, limit=30)
+    snapshot = _instant_style_from_messages(messages)
+    prev = _load_style_profile(telegram_id)
+
+    if not prev:
+        profile = snapshot
+    else:
+        alpha = 0.25  # вес нового поведения
+        profile = StyleProfile(
+            address=snapshot.address if snapshot.address != prev.address else prev.address,
+            formality=prev.formality * (1 - alpha) + snapshot.formality * alpha,
+            structure_density=prev.structure_density * (1 - alpha)
+            + snapshot.structure_density * alpha,
+            explanation_depth=prev.explanation_depth * (1 - alpha)
+            + snapshot.explanation_depth * alpha,
+            fire_level=prev.fire_level * (1 - alpha) + snapshot.fire_level * alpha,
+            updated_at_ts=time.time(),
+        )
+
+    _save_style_profile(telegram_id, profile)
+    return profile
+
+
+def style_profile_to_hint(profile: StyleProfile) -> str:
+    """
+    Превращаем StyleProfile в текстовую подсказку для LLM.
+    """
+    parts: List[str] = ["Адаптируй стиль под пользователя."]
+
+    # Обращение
+    if profile.address == "vy":
+        parts.append("Обращайся к пользователю на «Вы», без фамильярности.")
+    else:
+        parts.append("Обращайся к пользователю на «ты», живо, но без панибратства.")
+
+    # Формальность
+    if profile.formality > 0.7:
+        parts.append("Стиль ближе к деловому: аккуратные формулировки, минимум сленга.")
+    elif profile.formality < 0.3:
+        parts.append("Стиль ближе к разговорному: допускается живой язык, но без грубостей.")
+    else:
+        parts.append("Стиль нейтральный: можно чуть живого языка, но без канцелярита и без жаргона.")
+
+    # Структура
+    if profile.structure_density > 0.65:
+        parts.append(
+            "Структуруй ответы: используй подзаголовки и списки там, где это помогает быстро считывать смысл."
+        )
+    elif profile.structure_density < 0.35:
+        parts.append(
+            "Можно отвечать цельным текстом, без избытка списков, главное — логика и плавность."
+        )
+    else:
+        parts.append(
+            "Комбинируй абзацы и короткие списки так, чтобы текст был и живым, и читаемым."
+        )
+
+    # Глубина объяснений
+    if profile.explanation_depth < 0.35:
+        parts.append(
+            "Даёшь суть кратко: 2–4 абзаца или список до 7 пунктов, без повторов и воды."
+        )
+    elif profile.explanation_depth > 0.7:
+        parts.append(
+            "Пользователь нормально воспринимает развёрнутые ответы — можно углубляться, но держи структуру."
+        )
+    else:
+        parts.append(
+            "Держи баланс: достаточно деталей, чтобы было понятно, но без перегруза техническими тонкостями."
+        )
+
+    # Уровень «огня»
+    if profile.fire_level > 0.7:
+        parts.append(
+            "Можно быть довольно прямым и жёстким, но не переходи на личности и не используй агрессию."
+        )
+    elif profile.fire_level < 0.25:
+        parts.append(
+            "Формулируй мягко и поддерживающе, без морализаторства и давления, особенно в личных темах."
+        )
+    else:
+        parts.append(
+            "Позволяй себе честную прямоту, но обрамляй её в уважительный и конструктивный тон."
+        )
+
+    return " ".join(parts)
+
+
+def style_profile_to_summary(profile: StyleProfile) -> str:
+    """
+    Краткое описание стиля, которое показываем в профиле.
+    """
+    addr = "общение на «Вы»" if profile.address == "vy" else "общение на «ты»"
+
+    if profile.formality > 0.7:
+        frm = "деловой, аккуратный тон"
+    elif profile.formality < 0.3:
+        frm = "разговорный, свободный тон"
+    else:
+        frm = "нейтральный стиль общения"
+
+    if profile.structure_density > 0.65:
+        struct = "любит списки и чёткую структуру"
+    elif profile.structure_density < 0.35:
+        struct = "чаще пишет «полотном» без жёстких списков"
+    else:
+        struct = "комбинирует абзацы и списки по ситуации"
+
+    if profile.explanation_depth < 0.35:
+        depth = "предпочитает, когда всё максимально кратко"
+    elif profile.explanation_depth > 0.7:
+        depth = "нормально воспринимает развёрнутые объяснения"
+    else:
+        depth = "оптимален средний уровень деталей"
+
+    if profile.fire_level > 0.7:
+        fire = "можно говорить довольно жёстко и прямо"
+    elif profile.fire_level < 0.25:
+        fire = "важна бережная, мягкая подача"
+    else:
+        fire = "честность окей, но без перегибов"
+
+    return f"{addr}; {frm}; {struct}; {depth}; {fire}."
+
+
+def describe_communication_style(telegram_id: int) -> str:
+    """
+    Описание того, как бот чувствует стиль пользователя.
+    Использует StyleProfile; если его нет, даёт базовый эвристический текст.
+    """
+    profile = _load_style_profile(telegram_id)
+    if profile:
+        return style_profile_to_summary(profile)
+
+    texts = get_recent_user_messages(telegram_id, limit=30)
+    if not texts:
+        return "Пока мало данных — подстраиваюсь под тебя по ходу диалога."
+
+    joined = " ".join(texts)
+    total_len = sum(len(t) for t in texts if t)
+    avg_len = total_len / max(len(texts), 1)
+
+    if avg_len < 80:
+        length_desc = "короткие, ёмкие сообщения"
+    elif avg_len < 220:
+        length_desc = "средний объём без перегруза"
+    else:
+        length_desc = "развёрнутые, подробные сообщения"
+
+    lower = joined.lower()
+    formal_markers = ["здравствуйте", "добрый день", "добрый вечер", "уважаем", "будьте добры"]
+    uses_vy = any(m in lower for m in formal_markers) or " вы " in lower
+    tone_desc = (
+        "общение на «Вы», аккуратный тон"
+        if uses_vy
+        else "общение на «ты», живой и прямой тон"
+    )
+
+    if any(ch in joined for ch in ["\n- ", "\n•", "1.", "2)"]):
+        struct_desc = "любишь структуру и списки"
+    else:
+        struct_desc = "чаще используешь свободный формат без жёсткой структуры"
+
+    return f"{length_desc}; {tone_desc}; {struct_desc}."
+
+
+def build_style_hint(telegram_id: int) -> str:
+    """
+    Внешний интерфейс для LLM: обновляем StyleProfile и выдаём текстовую подсказку.
+    """
+    profile = build_style_profile_from_history(telegram_id)
+    return style_profile_to_hint(profile)
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +1036,7 @@ def update_invoice_status(invoice_id: int, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Интенты, стиль и эмоциональный радар
+# Интенты, эмоциональный радар и промпты
 # ---------------------------------------------------------------------------
 
 
@@ -761,42 +1086,6 @@ def detect_intent(user_text: str) -> str:
         return "analysis"
 
     return "other"
-
-
-def build_style_hint(telegram_id: int) -> str:
-    messages = get_recent_user_messages(telegram_id, limit=30)
-    if not messages:
-        return ""
-
-    joined = " ".join(messages)
-    lower = joined.lower()
-
-    formal_markers = ["здравствуйте", "добрый день", "добрый вечер", "уважаем", "будьте добры"]
-    is_formal = any(m in lower for m in formal_markers) or " вы " in lower
-
-    lengths = [len(m) for m in messages if m.strip()]
-    avg_len = sum(lengths) / len(lengths) if lengths else 0
-
-    if avg_len < 80:
-        length_hint = (
-            "Отвечай компактно: 3–6 ёмких абзацев или список до 9 пунктов без лишней воды."
-        )
-    elif avg_len > 220:
-        length_hint = (
-            "Пользователь нормально воспринимает развёрнутые ответы — можно объяснять глубоко, "
-            "но с чёткой структурой."
-        )
-    else:
-        length_hint = (
-            "Держи баланс между краткостью и глубиной: объясняй понятно, без воды и повторов."
-        )
-
-    if is_formal:
-        tone_hint = "Обращайся к пользователю на «Вы», стиль спокойный и уважительный."
-    else:
-        tone_hint = "Обращайся к пользователю на «ты», стиль живой, но без панибратства."
-
-    return f"Адаптируй стиль под пользователя. {tone_hint} {length_hint}"
 
 
 # ---------- ЭМОЦИОНАЛЬНЫЙ РАДАР ----------
@@ -872,7 +1161,7 @@ def detect_emotion(user_text: str) -> str:
 def build_emotion_hint(emotion: str) -> str:
     """
     Превращаем тег состояния в подсказку для LLM.
-    ВАЖНО: не просим напрямую озвучивать диагноз/эмоцию пользователю.
+    Важно: не просим модель озвучивать диагноз/эмоцию пользователю.
     """
     if emotion == "overload":
         return (
@@ -1711,13 +2000,15 @@ async def handle_private_chat(message: Message) -> None:
     telegram_id = message.from_user.id
     save_message(telegram_id, "user", text)
 
-    # Базовый стиль + эмоциональный радар
-    style_hint = build_style_hint(telegram_id)
+    # --- стиль + эмоции ---
+    base_style_hint = build_style_hint(telegram_id)
 
     emotion = detect_emotion(text)
     emotion_hint = build_emotion_hint(emotion)
     if emotion_hint:
-        style_hint = (style_hint + "\n\n" if style_hint else "") + emotion_hint
+        style_hint = f"{base_style_hint}\n\n{emotion_hint}"
+    else:
+        style_hint = base_style_hint
 
     history = get_recent_dialog_history(telegram_id, limit=12)
 
