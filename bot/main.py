@@ -25,7 +25,8 @@ from bot.config import (
 from services.llm import ask_llm_stream
 from services.storage import Storage, UserRecord
 from services.payments import create_cryptobot_invoice, get_invoice_status
-from services import texts as txt  # ВАЖНО: services.texts, а не bot.text
+from services import texts as txt
+from services import metrics  # <<< новый импорт
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -189,6 +190,17 @@ async def _send_streaming_answer(message: Message, user: UserRecord, text: str) 
                 storage.log_message(user.id, "assistant", final_full_text)
             except Exception as log_err:
                 logger.exception("Failed to log assistant message: %s", log_err)
+
+        # Метрики: один ход диалога
+        try:
+            metrics.log_chat_turn(
+                user_id=user.id,
+                mode_key=user.mode_key or DEFAULT_MODE_KEY,
+                request_text=text,
+                response_text=final_full_text or "",
+            )
+        except Exception as m_err:
+            logger.exception("Failed to log chat_turn metrics: %s", m_err)
 
     except Exception as e:
         logger.exception("LLM error: %s", e)
@@ -360,6 +372,17 @@ async def on_subscription_buy(message: Message) -> None:
 
     storage.store_invoice(user, invoice_id=invoice_id, tariff_key=tariff_key)
 
+    # Метрики: создание инвойса
+    try:
+        metrics.log_invoice_created(
+            user_id=user.id,
+            tariff_key=tariff_key,
+            invoice_id=invoice_id,
+            amount_usdt=float(tariff["price_usdt"]),
+        )
+    except Exception as m_err:
+        logger.exception("Failed to log invoice_created metrics: %s", m_err)
+
     text_body = txt.render_payment_link(
         tariff_title=tariff["title"],
         amount=tariff["price_usdt"],
@@ -393,6 +416,17 @@ async def on_subscription_check(message: Message) -> None:
         tariff = SUBSCRIPTION_TARIFFS.get(tariff_key)
         months = int(tariff.get("months", 1)) if tariff else 1
         storage.activate_premium(user, months)
+
+    # Метрики: статус инвойса
+    try:
+        metrics.log_invoice_status(
+            user_id=user.id,
+            tariff_key=tariff_key,
+            invoice_id=invoice_id,
+            status=status,
+        )
+    except Exception as m_err:
+        logger.exception("Failed to log invoice_status metrics: %s", m_err)
 
     text_body = txt.render_payment_check_result(status)
     await message.answer(text_body, reply_markup=SUB_KB)
@@ -445,6 +479,17 @@ async def on_user_message(message: Message) -> None:
             txt.render_limits_warning(reason),
             reply_markup=MAIN_KB,
         )
+        # Метрики: ударились в лимит
+        try:
+            metrics.log_limit_hit(
+                user_id=user.id,
+                plan_code=plan_code,
+                reason=reason,
+                daily_used=user.daily_used,
+                monthly_used=user.monthly_used,
+            )
+        except Exception as m_err:
+            logger.exception("Failed to log limit_hit metrics: %s", m_err)
         return
 
     # Логируем входящее сообщение пользователя
